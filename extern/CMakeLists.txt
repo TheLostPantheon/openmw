@@ -74,10 +74,17 @@ if(NOT OPENMW_USE_SYSTEM_MYGUI)
     endif()
 
     include(FetchContent)
+    # Vita-only MyGUI patch: ILayer::isOutOfDate for clean-frame render skip.
+    if(VITA)
+        set(_mygui_patch_cmd PATCH_COMMAND patch -p1 -N -r- --input=${CMAKE_SOURCE_DIR}/patches/mygui/vita-gui-dirty.patch || true)
+    else()
+        set(_mygui_patch_cmd "")
+    endif()
     FetchContent_Declare(mygui
         URL https://github.com/MyGUI/mygui/archive/refs/tags/MyGUI3.4.3.zip
         URL_HASH SHA512=c804ef665e786076582367f171082cd2181fdbd214300ddcca4a4245c5a0f45e62e72778ee2d96ec46b393e22477dd729f9bb3006e6eecbf536674e34a057721
         SOURCE_DIR fetched/mygui
+        ${_mygui_patch_cmd}
     )
     FetchContent_MakeAvailable(mygui)
 
@@ -171,9 +178,13 @@ if(NOT OPENMW_USE_SYSTEM_OSG)
 
     # OSGoS branch 3.6
     include(FetchContent)
-    # Vita-only OSG compatibility patches.
+    # Vita-only OSG patches. vita-combined.patch is the single source of
+    # truth: generated pristine->working-tree, so it cannot suffer the
+    # hunk-ordering failures the old per-feature patch stack silently
+    # swallowed via `|| true`. The per-feature patches remain in patches/osg/
+    # as documentation only. (-N || true keeps re-populate idempotent.)
     if(VITA)
-        set(_osg_patch_cmd PATCH_COMMAND patch -p1 -N -r- --input=${CMAKE_SOURCE_DIR}/patches/osg/vita-compat.patch && patch -p1 -N -r- --input=${CMAKE_SOURCE_DIR}/patches/osg/vita-perf.patch && patch -p1 -N -r- --input=${CMAKE_SOURCE_DIR}/patches/osg/vita-epoch.patch || true)
+        set(_osg_patch_cmd PATCH_COMMAND patch -p1 -N -r- --input=${CMAKE_SOURCE_DIR}/patches/osg/vita-combined.patch || true)
     else()
         set(_osg_patch_cmd "")
     endif()
