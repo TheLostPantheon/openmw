@@ -1191,6 +1191,7 @@ namespace MWWorld
 
     void CellPreloader::vitaRelievePressure()
     {
+        vitaMainPhase("relief");
         // Stepwise relief: stalest biome, then all region refs, then the
         // general pool only as a last resort. Paced so each step (and the
         // store eviction that precedes it) can land before the next.
