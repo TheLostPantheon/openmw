@@ -1,0 +1,1618 @@
+diff -ruN '--exclude=.git' pristine-osg/include/osg/Geometry b/include/osg/Geometry
+--- a/include/osg/Geometry	2022-01-11 08:08:55.000000000 -0700
++++ b/include/osg/Geometry	2026-07-30 18:48:05.860397635 -0600
+@@ -212,6 +212,36 @@
+         virtual void accept(PrimitiveIndexFunctor& pf) const;
+ 
+ 
++#ifdef __vita__
++    public:
++        // Draw-dispatch replay cache: resolved buffer bindings + pointer
++        // params captured on first draw of static single-primset geometry;
++        // replay skips the VAS/dispatcher machinery (~28-38us -> ~10us).
++        struct VitaDrawCache
++        {
++            bool valid = false;
++            unsigned int epoch = 0; // vita_replay_epoch at capture time
++            osg::ref_ptr<osg::Referenced> vboRef; // GLBufferObject keep-alive
++            osg::ref_ptr<osg::Referenced> eboRef;
++            unsigned int vboID = 0, eboID = 0;
++            // Channels: 0=vertex 1=normal 2=color 3=texcoord0
++            struct Chan
++            {
++                bool on = false;
++                int slot = -1; // aliased generic attribute location
++                int size = 0;
++                unsigned int type = 0;
++                unsigned char normalized = 0;
++                const unsigned char* ptr = nullptr; // VBO offset
++            } chan[4];
++            unsigned int primMode = 0, primType = 0;
++            int primCount = 0;
++            const unsigned char* primIndices = nullptr; // EBO offset
++        };
++        mutable VitaDrawCache _vitaDrawCache;
++        bool vitaFastDraw(RenderInfo& renderInfo) const; // false = use normal path
++#endif
++
+     protected:
+ 
+         Geometry& operator = (const Geometry&) { return *this;}
+diff -ruN '--exclude=.git' pristine-osg/include/osg/Program b/include/osg/Program
+--- a/include/osg/Program	2022-01-11 08:08:55.000000000 -0700
++++ b/include/osg/Program	2026-08-05 00:16:51.117806942 -0600
+@@ -31,6 +31,14 @@
+ #include <osg/Shader>
+ #include <osg/StateAttribute>
+ 
++#ifdef __vita__
++extern "C" {
++extern unsigned int osgapply_unif_n;
++extern unsigned int osgapply_unif_up;
++}
++void osgapply_unif_note(const osg::Uniform& u, const osg::Uniform* prev);
++#endif
++
+ namespace osg {
+ 
+ class State;
+@@ -234,6 +242,7 @@
+             GLint _location;
+             GLenum _type;
+             GLint _size;
++            unsigned int _denseIndex{ 0 };
+         };
+         typedef std::map< unsigned int, ActiveVarInfo > ActiveUniformMap;
+         typedef std::map< std::string, ActiveVarInfo > ActiveVarInfoMap;
+@@ -296,11 +305,63 @@
+                 void resetAppliedUniforms() const
+                 {
+                     _lastAppliedUniformList.clear();
++#ifdef __vita__
++                    for (LastAppliedUniformVec::iterator itr = _lastAppliedUniformVec.begin();
++                         itr != _lastAppliedUniformVec.end(); ++itr)
++                    {
++                        itr->first = 0;
++                        itr->second = 0;
++                    }
++#endif
+                 }
+ 
+ 
+                 inline void apply(const Uniform& uniform) const
+                 {
++#ifdef __vita__
++                    // O(1) path: location + dense slot cached per program.
++                    GLint location = -1;
++                    unsigned int idx = 0;
++                    int slot = -1;
++                    for (int i = 0; i < 4; ++i)
++                        if (uniform._vitaLocPCP[i] == this)
++                        {
++                            slot = i;
++                            break;
++                        }
++                    if (slot >= 0)
++                    {
++                        location = uniform._vitaLoc[slot];
++                        idx = uniform._vitaIdx[slot];
++                    }
++                    else
++                    {
++                        ActiveUniformMap::const_iterator itr = _uniformInfoMap.find(uniform.getNameID());
++                        if (itr != _uniformInfoMap.end())
++                        {
++                            location = itr->second._location;
++                            idx = itr->second._denseIndex;
++                        }
++                        const unsigned char w = uniform._vitaLocNext;
++                        uniform._vitaLocNext = (w + 1) & 3;
++                        uniform._vitaLocPCP[w] = this;
++                        uniform._vitaLoc[w] = location;
++                        uniform._vitaIdx[w] = idx;
++                    }
++                    if (location >= 0 && idx < _lastAppliedUniformVec.size())
++                    {
++                        ++osgapply_unif_n;
++                        UniformModifiedCountPair& slot = _lastAppliedUniformVec[idx];
++                        if (slot.first.get() != &uniform || slot.second != uniform.getModifiedCount())
++                        {
++                            ++osgapply_unif_up;
++                            osgapply_unif_note(uniform, slot.first.get());
++                            uniform.apply(_extensions.get(), location);
++                            slot.first = &uniform;
++                            slot.second = uniform.getModifiedCount();
++                        }
++                    }
++#else
+                     GLint location = getUniformLocation(uniform.getNameID());
+                     if (location>=0)
+                     {
+@@ -320,6 +381,7 @@
+                             _lastAppliedUniformList[location].second = uniform.getModifiedCount();
+                         }
+                     }
++#endif
+                 }
+ 
+                 const ActiveUniformMap& getActiveUniforms() const {return _uniformInfoMap;}
+@@ -382,6 +444,10 @@
+ 
+                 typedef std::pair<osg::ref_ptr<const osg::Uniform>, unsigned int> UniformModifiedCountPair;
+                 typedef std::map<unsigned int, UniformModifiedCountPair> LastAppliedUniformList;
++#ifdef __vita__
++                typedef std::vector<UniformModifiedCountPair> LastAppliedUniformVec;
++                mutable LastAppliedUniformVec _lastAppliedUniformVec;
++#endif
+                 mutable LastAppliedUniformList _lastAppliedUniformList;
+ 
+                 typedef std::vector< ref_ptr<Shader> > ShaderList;
+diff -ruN '--exclude=.git' pristine-osg/include/osg/State b/include/osg/State
+--- a/include/osg/State	2022-01-11 08:08:55.000000000 -0700
++++ b/include/osg/State	2026-08-01 13:18:57.712302321 -0600
+@@ -33,6 +33,7 @@
+ #include <osg/GraphicsCostEstimator>
+ 
+ #include <iosfwd>
++#include <cstdint>
+ #include <vector>
+ #include <map>
+ #include <set>
+@@ -468,9 +469,60 @@
+             AttributeMap& attributeMap = getOrCreateTextureAttributeMap(unit);
+             AttributeStack& as = attributeMap[attribute->getTypeMemberPair()];
+             as.changed = true;
++#ifdef __vita__
++            // Direct binds (ICO compiles, GUI) must refresh the flat cache.
++            if (attribute->getType() == StateAttribute::TEXTURE)
++                vitaNoteTexture(unit, attribute);
++#endif
+             return applyAttributeOnTexUnit(unit,attribute,as);
+         }
+ 
++#ifdef __vita__
++        // Vita fast path: texture-unit state is just the bound texture
++        // (TexEnv/TexGen/modes are ignored by the FFP-replacement shaders).
++        // Sentinel (const StateAttribute*)-1 = unknown, forces an apply.
++        mutable std::vector<const StateAttribute*> _vitaLastTexture;
++        inline void vitaNoteTexture(unsigned int unit, const StateAttribute* attribute) const
++        {
++            if (_vitaLastTexture.size() <= unit)
++                _vitaLastTexture.resize(unit + 1, reinterpret_cast<const StateAttribute*>(~uintptr_t(0)));
++            _vitaLastTexture[unit] = attribute;
++        }
++
++        // Flat-state replay: composed stateset-chain state cached per
++        // StateGraph node (built in RenderLeaf.cpp). vitaApplyFlat diffs
++        // against the State's own last-applied trackers, so mixing with the
++        // normal path stays coherent; flat-applied entries are marked
++        // changed so a following normal apply() resets them.
++        struct VitaFlatState : public osg::Referenced
++        {
++            unsigned int sig = 0;
++            unsigned int frameStamp = ~0u;
++            bool usable = false;
++            typedef std::pair<StateAttribute::TypeMemberPair, const StateAttribute*> AttrEntry;
++            std::vector<AttrEntry> attrs; // sorted by key
++            typedef std::pair<StateAttribute::GLMode, bool> ModeEntry;
++            std::vector<ModeEntry> modes; // sorted by mode
++            std::vector<const Uniform*> uniforms;
++            const StateAttribute* texture[2] = { 0, 0 };
++            unsigned int textureCount = 0;
++        };
++        void vitaApplyFlat(const VitaFlatState& fs);
++        // Depth of the stage-level base stacks per key, snapshotted at
++        // stage start; flat diffs reset missing keys to base, not default.
++        std::map<StateAttribute::TypeMemberPair, unsigned int> _vitaBaseAttrDepth;
++        std::map<StateAttribute::GLMode, unsigned int> _vitaBaseModeDepth;
++        void vitaSnapshotBase();
++
++        // Scene-stack uniforms need a full re-apply only when the program,
++        // the uniform stacks, or the frame changes; otherwise each state
++        // change only applies the leaf stateset's own uniform list.
++        mutable const void* _vitaUnifFullPCP = 0;
++        mutable unsigned int _vitaUnifFullFrame = ~0u;
++        mutable unsigned int _vitaUnifFullStackGen = ~0u;
++        mutable unsigned int _vitaUniformStackGen = 0;
++#endif
++
+         /** Mode has been set externally, update state to reflect this setting.*/
+         void haveAppliedMode(StateAttribute::GLMode mode,StateAttribute::GLModeValue value);
+ 
+@@ -1471,6 +1523,10 @@
+ 
+ inline void State::pushUniformList(UniformMap& uniformMap,const StateSet::UniformList& uniformList)
+ {
++#ifdef __vita__
++    // Composition signature: balanced push/pop restores the memo stamp.
++    _vitaUniformStackGen += (unsigned int)(uintptr_t)&uniformList;
++#endif
+     for(StateSet::UniformList::const_iterator aitr=uniformList.begin();
+         aitr!=uniformList.end();
+         ++aitr)
+@@ -1569,6 +1625,9 @@
+ 
+ inline void State::popUniformList(UniformMap& uniformMap,const StateSet::UniformList& uniformList)
+ {
++#ifdef __vita__
++    _vitaUniformStackGen -= (unsigned int)(uintptr_t)&uniformList;
++#endif
+     for(StateSet::UniformList::const_iterator aitr=uniformList.begin();
+         aitr!=uniformList.end();
+         ++aitr)
+diff -ruN '--exclude=.git' pristine-osg/include/osg/Uniform b/include/osg/Uniform
+--- a/include/osg/Uniform	2022-01-11 08:08:55.000000000 -0700
++++ b/include/osg/Uniform	2026-08-01 13:49:06.467260016 -0600
+@@ -874,6 +874,15 @@
+           * you must call if modifying the internal data array directly. */
+         inline void dirty() { ++_modifiedCount; }
+ 
++#ifdef __vita__
++        // Per-program location cache; kills map lookups in the apply path.
++        // 4 slots: shader variants + GUI alternate per leaf.
++        mutable const void* _vitaLocPCP[4]{ nullptr, nullptr, nullptr, nullptr };
++        mutable GLint _vitaLoc[4]{ -1, -1, -1, -1 };
++        mutable unsigned int _vitaIdx[4]{ 0, 0, 0, 0 };
++        mutable unsigned char _vitaLocNext{ 0 };
++#endif
++
+         /** Set the internal data array for a osg::Uniform */
+         bool setArray( FloatArray* array );
+         bool setArray( DoubleArray* array );
+diff -ruN '--exclude=.git' pristine-osg/include/osgUtil/StateGraph b/include/osgUtil/StateGraph
+--- a/include/osgUtil/StateGraph	2022-01-11 08:08:55.000000000 -0700
++++ b/include/osgUtil/StateGraph	2026-07-26 10:01:16.938320009 -0600
+@@ -26,6 +26,10 @@
+ #include <vector>
+ #include <algorithm>
+ 
++#ifdef __vita__
++extern "C" unsigned int cullprof_sg;
++#endif
++
+ namespace osgUtil {
+ 
+ struct LessDepthSortFunctor
+@@ -65,6 +69,12 @@
+ 
+         bool                                _dynamic;
+ 
++#ifdef __vita__
++        // Flat-state replay cache for this node's stateset chain
++        // (osg::State::VitaFlatState, built lazily in RenderLeaf.cpp).
++        osg::ref_ptr<osg::Referenced>       _vitaFlat;
++#endif
++
+         StateGraph():
+             _parent(NULL),
+             _stateset(NULL),
+@@ -214,6 +224,9 @@
+ 
+         inline StateGraph* find_or_insert(const osg::StateSet* stateset)
+         {
++#ifdef __vita__
++            ++cullprof_sg;
++#endif
+             // search for the appropriate state group, return it if found.
+             ChildList::iterator itr = _children.find(stateset);
+             if (itr!=_children.end()) return itr->second.get();
+diff -ruN '--exclude=.git' pristine-osg/src/osg/GLExtensions.cpp b/src/osg/GLExtensions.cpp
+--- a/src/osg/GLExtensions.cpp	2022-01-11 08:08:55.000000000 -0700
++++ b/src/osg/GLExtensions.cpp	2026-04-29 15:22:14.714508746 -0600
+@@ -316,6 +316,13 @@
+ 
+ OSG_INIT_SINGLETON_PROXY(GLExtensionDisableStringInitializationProxy, osg::getGLExtensionDisableString())
+ 
++#if defined(__vita__)
++// vitaGL's proctable lookup; declared here (namespace scope) to avoid pulling
++// vitaGL.h into OSG's translation unit (its macros collide with OSG's types).
++extern "C" void *vglGetProcAddress(const char *name);
++#endif
++
++
+ #ifdef OSG_GL_LIBRARY_STATIC
+ 
+     #include "GLStaticLibrary.h"
+@@ -330,7 +337,11 @@
+     void* osg::getGLExtensionFuncPtr(const char *funcName)
+     {
+         // OSG_NOTICE<<"osg::getGLExtensionFuncPtr("<<funcName<<")"<<std::endl;
+-    #if defined(__ANDROID__)
++    #if defined(__vita__)
++        // newlib's dlsym is non-functional on Vita; the generic Unix fallback
++        // below returns NULL. Route through vitaGL's static proctable.
++        return vglGetProcAddress(funcName);
++    #elif defined(__ANDROID__)
+         #if defined(OSG_GLES1_AVAILABLE)
+             static void *handle = dlopen("libGLESv1_CM.so", RTLD_NOW);
+         #elif defined(OSG_GLES2_AVAILABLE)
+@@ -1145,7 +1156,9 @@
+         glFramebufferTexture2D != 0 &&
+         glFramebufferRenderbuffer != 0 &&
+         glGenerateMipmap != 0 &&
++#ifndef __vita__
+         glGetRenderbufferParameteriv != 0 &&
++#endif
+     ( OSG_GLES2_FEATURES || OSG_GLES1_FEATURES || isGLExtensionOrVersionSupported(contextID, "GL_EXT_framebuffer_object",3.0f) );
+ 
+ 
+diff -ruN '--exclude=.git' pristine-osg/src/osg/Geometry.cpp b/src/osg/Geometry.cpp
+--- a/src/osg/Geometry.cpp	2022-01-11 08:08:55.000000000 -0700
++++ b/src/osg/Geometry.cpp	2026-07-30 18:48:05.860397635 -0600
+@@ -1913,3 +1913,152 @@
+ 
+     _containsDeprecatedData = false;
+ }
++
++#ifdef __vita__
++// Draw-dispatch replay: capture resolved GL bindings once for static
++// single-primset VBO geometry, then draw with ~8 direct GL calls instead
++// of the VAS/dispatcher machinery. The VAS is marked dirty afterwards so
++// the next normal-path draw rebuilds its cached bindings.
++extern "C" { extern uint32_t osgprof_replayed; }
++
++namespace
++{
++    bool vitaCaptureChan(osg::Geometry::VitaDrawCache::Chan& c, const osg::Array* array, unsigned int contextID,
++        osg::ref_ptr<osg::Referenced>& keepAlive, unsigned int& vboID)
++    {
++        if (!array)
++        {
++            c.on = false;
++            return true;
++        }
++        const osg::BufferObject* bo = array->getBufferObject();
++        if (!bo)
++            return false;
++        osg::GLBufferObject* glbo = bo->getGLBufferObject(contextID);
++        if (!glbo || glbo->getGLObjectID() == 0)
++            return false;
++        if (vboID == 0)
++        {
++            vboID = glbo->getGLObjectID();
++            keepAlive = glbo;
++        }
++        else if (vboID != glbo->getGLObjectID())
++            return false; // multi-VBO geometry: keep normal path
++        c.on = true;
++        c.size = array->getDataSize();
++        c.type = array->getDataType();
++        c.normalized = array->getNormalize() ? 1 : 0;
++        c.ptr = reinterpret_cast<const unsigned char*>(0) + glbo->getOffset(array->getBufferIndex());
++        return true;
++    }
++}
++
++extern "C" uint32_t vita_replay_epoch; // osgUtil/RenderLeaf.cpp
++
++bool osg::Geometry::vitaFastDraw(osg::RenderInfo& renderInfo) const
++{
++    osg::State& state = *renderInfo.getState();
++    VitaDrawCache& dc = _vitaDrawCache;
++
++    // The app bumped the epoch after releasing GL objects: every cached
++    // buffer id is suspect. Drop the cache; the normal path draws (and
++    // recompiles buffers as needed) until re-capture next frame.
++    if (dc.valid && dc.epoch != vita_replay_epoch)
++        dc.valid = false;
++
++    if (!dc.valid)
++    {
++        // Qualify + capture. Failure leaves valid=false: retried next frame
++        // (buffer objects exist only after the first normal draw).
++        if (_primitives.size() != 1 || _containsDeprecatedData || !_vertexArray.valid())
++            return false;
++        if (!_vertexAttribList.empty() || _secondaryColorArray.valid() || _fogCoordArray.valid())
++            return false;
++        if (_texCoordList.size() > 1)
++            return false;
++        if (_normalArray.valid() && _normalArray->getBinding() != osg::Array::BIND_PER_VERTEX)
++            return false;
++        if (_colorArray.valid() && _colorArray->getBinding() != osg::Array::BIND_PER_VERTEX)
++            return false;
++        const osg::PrimitiveSet* ps = _primitives[0].get();
++        unsigned int primGLType = 0;
++        switch (ps->getType())
++        {
++            case osg::PrimitiveSet::DrawElementsUBytePrimitiveType: primGLType = GL_UNSIGNED_BYTE; break;
++            case osg::PrimitiveSet::DrawElementsUShortPrimitiveType: primGLType = GL_UNSIGNED_SHORT; break;
++            case osg::PrimitiveSet::DrawElementsUIntPrimitiveType: primGLType = GL_UNSIGNED_INT; break;
++            default:
++                return false;
++        }
++        const unsigned int contextID = state.getContextID();
++        const osg::BufferObject* ebo = ps->getBufferObject();
++        if (!ebo)
++            return false;
++        osg::GLBufferObject* glebo = ebo->getGLBufferObject(contextID);
++        if (!glebo || glebo->getGLObjectID() == 0)
++            return false;
++
++        unsigned int vboID = 0;
++        VitaDrawCache tmp;
++        if (!vitaCaptureChan(tmp.chan[0], _vertexArray.get(), contextID, tmp.vboRef, vboID))
++            return false;
++        if (!vitaCaptureChan(tmp.chan[1],
++                (_normalArray.valid() && _normalArray->getBinding() == osg::Array::BIND_PER_VERTEX)
++                    ? _normalArray.get()
++                    : nullptr,
++                contextID, tmp.vboRef, vboID))
++            return false;
++        if (!vitaCaptureChan(tmp.chan[2],
++                (_colorArray.valid() && _colorArray->getBinding() == osg::Array::BIND_PER_VERTEX)
++                    ? _colorArray.get()
++                    : nullptr,
++                contextID, tmp.vboRef, vboID))
++            return false;
++        if (!vitaCaptureChan(tmp.chan[3], _texCoordList.empty() ? nullptr : _texCoordList[0].get(), contextID,
++                tmp.vboRef, vboID))
++            return false;
++
++        // Aliased generic attribute locations (the port renders with
++        // vertex attribute aliasing on; classic gl*Pointer feeds nothing).
++        tmp.chan[0].slot = state.getVertexAlias()._location;
++        tmp.chan[1].slot = state.getNormalAlias()._location;
++        tmp.chan[2].slot = state.getColorAlias()._location;
++        tmp.chan[3].slot = state.getTexCoordAliasList().empty() ? -1 : state.getTexCoordAliasList()[0]._location;
++        if (tmp.chan[3].on && tmp.chan[3].slot < 0)
++            return false;
++
++        tmp.vboID = vboID;
++        tmp.eboRef = glebo;
++        tmp.eboID = glebo->getGLObjectID();
++        tmp.primMode = ps->getMode();
++        tmp.primType = primGLType;
++        tmp.primCount = ps->getNumIndices();
++        tmp.primIndices = reinterpret_cast<const unsigned char*>(0) + glebo->getOffset(ps->getBufferIndex());
++        tmp.epoch = vita_replay_epoch;
++        tmp.valid = true;
++        dc = tmp;
++    }
++
++    osg::GLExtensions* ext = state.get<osg::GLExtensions>();
++    ext->glBindBuffer(GL_ARRAY_BUFFER, dc.vboID);
++    for (int i = 0; i < 4; ++i)
++    {
++        const VitaDrawCache::Chan& c = dc.chan[i];
++        if (c.slot < 0)
++            continue;
++        if (c.on)
++        {
++            ext->glEnableVertexAttribArray(c.slot);
++            ext->glVertexAttribPointer(c.slot, c.size, c.type, c.normalized, 0, c.ptr);
++        }
++        else
++            ext->glDisableVertexAttribArray(c.slot);
++    }
++
++    ext->glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, dc.eboID);
++    glDrawElements(dc.primMode, dc.primCount, dc.primType, dc.primIndices);
++
++    ++osgprof_replayed;
++    return true;
++}
++#endif
+diff -ruN '--exclude=.git' pristine-osg/src/osg/Image.cpp b/src/osg/Image.cpp
+--- a/src/osg/Image.cpp	2022-01-11 08:08:55.000000000 -0700
++++ b/src/osg/Image.cpp	2026-07-07 14:19:52.099840508 -0600
+@@ -1959,6 +1959,16 @@
+ 
+ bool Image::supportsTextureSubloading() const
+ {
++#if defined(__vita__)
++    // vitaGL has no glCompressedTexSubImage2D (the app links a no-op stub),
++    // so a recycled texture object subloading a compressed image leaves
++    // uninitialized VRAM (solid green). Refuse subloading for compressed
++    // images entirely: Texture2D::apply then re-specifies via the full
++    // glCompressedTexImage2D path, which vitaGL implements natively for
++    // DXT1/3/5.
++    if (isCompressed())
++        return false;
++#endif
+     switch(_internalTextureFormat)
+     {
+         case GL_ETC1_RGB8_OES:
+diff -ruN '--exclude=.git' pristine-osg/src/osg/Program.cpp b/src/osg/Program.cpp
+--- a/src/osg/Program.cpp	2022-01-11 08:08:55.000000000 -0700
++++ b/src/osg/Program.cpp	2026-07-22 07:50:11.450682078 -0600
+@@ -929,6 +929,16 @@
+         delete [] name;
+     }
+ 
++#ifdef __vita__
++    // Dense indices enable O(1) last-applied tracking in apply().
++    {
++        unsigned int denseIdx = 0;
++        for (ActiveUniformMap::iterator uitr = _uniformInfoMap.begin(); uitr != _uniformInfoMap.end(); ++uitr)
++            uitr->second._denseIndex = denseIdx++;
++        _lastAppliedUniformVec.assign(denseIdx, UniformModifiedCountPair());
++    }
++#endif
++
+     // print atomic counter
+ 
+     if (_extensions->isShaderAtomicCountersSupported && !atomicCounterMap.empty())
+diff -ruN '--exclude=.git' pristine-osg/src/osg/State.cpp b/src/osg/State.cpp
+--- a/src/osg/State.cpp	2022-01-11 08:08:55.000000000 -0700
++++ b/src/osg/State.cpp	2026-08-05 00:17:15.329908133 -0600
+@@ -23,6 +23,7 @@
+ 
+ #include <sstream>
+ #include <algorithm>
++#include <cstdint>
+ 
+ #ifndef GL_MAX_TEXTURE_COORDS
+ #define GL_MAX_TEXTURE_COORDS 0x8871
+@@ -37,6 +38,87 @@
+ #endif
+ 
+ using namespace std;
++
++#ifdef __vita__
++#include <psp2/kernel/processmgr.h>
++#include <cstdio>
++extern "C" {
++uint32_t osgapply_calls = 0;
++uint32_t osgapply_tex_us = 0;
++uint32_t osgapply_mode_us = 0;
++uint32_t osgapply_attr_us = 0;
++uint32_t osgapply_unif_us = 0;
++uint32_t osgapply_unif_n = 0;
++uint32_t osgapply_unif_up = 0;
++void vitaBreadcrumb(const char*);
++uint32_t osgapply_push = 0;
++uint32_t osgapply_pop = 0;
++uint32_t osgapply_unif_rup = 0;
++}
++
++// Upload histogram by nameID; rup = value-identical upload
++// (pointer differs) — the share uniform interning would erase.
++namespace
++{
++    struct VitaUnifStat
++    {
++        std::string name;
++        uint32_t up = 0;
++        uint32_t rup = 0;
++    };
++    std::vector<VitaUnifStat> sVitaUnifHist;
++}
++
++void osgapply_unif_note(const osg::Uniform& u, const osg::Uniform* prev)
++{
++    const bool redundant = prev && prev != &u && prev->getType() == u.getType()
++        && prev->getNumElements() == u.getNumElements() && u.compareData(*prev) == 0;
++    if (redundant)
++        ++osgapply_unif_rup;
++    const unsigned int id = u.getNameID();
++    if (id >= 160)
++        return;
++    if (sVitaUnifHist.size() <= id)
++        sVitaUnifHist.resize(id + 1);
++    VitaUnifStat& s = sVitaUnifHist[id];
++    if (s.name.empty() && !u.getName().empty())
++        s.name = u.getName();
++    ++s.up;
++    if (redundant)
++        ++s.rup;
++}
++
++extern "C" int osgapply_unif_hist_report(char* buf, unsigned int buflen)
++{
++    // Top 8 by uploads, then reset. Returns chars written (0 = quiet window).
++    int written = 0;
++    for (int rank = 0; rank < 8; ++rank)
++    {
++        VitaUnifStat* best = 0;
++        for (std::vector<VitaUnifStat>::iterator it = sVitaUnifHist.begin(); it != sVitaUnifHist.end(); ++it)
++            if (it->up > 0 && (!best || it->up > best->up))
++                best = &*it;
++        if (!best)
++            break;
++        int n = snprintf(buf + written, buflen - written, "%s%s=%u/%u", written ? " " : "",
++            best->name.empty() ? "?" : best->name.c_str(), (unsigned)best->up, (unsigned)best->rup);
++        best->up = best->rup = 0;
++        if (n < 0 || (unsigned)n >= buflen - written)
++            break;
++        written += n;
++    }
++    for (std::vector<VitaUnifStat>::iterator it = sVitaUnifHist.begin(); it != sVitaUnifHist.end(); ++it)
++        it->up = it->rup = 0;
++    return written;
++}
++#define OSGAP_T() sceKernelGetProcessTimeLow()
++#define OSGAP_ADD(var, a, b) var += (b) - (a);
++#define OSGAP_CNT(var) var++;
++#else
++#define OSGAP_T() 0
++#define OSGAP_ADD(var, a, b)
++#define OSGAP_CNT(var)
++#endif
+ using namespace osg;
+ 
+ static ApplicationUsageProxy State_e0(ApplicationUsage::ENVIRONMENTAL_VARIABLE,"OSG_GL_ERROR_CHECKING <type>","ONCE_PER_ATTRIBUTE | ON | on enables fine grained checking,  ONCE_PER_FRAME enables coarse grained checking");
+@@ -501,6 +583,7 @@
+ 
+ void State::pushStateSet(const StateSet* dstate)
+ {
++    OSGAP_CNT(osgapply_push)
+ 
+     _stateStateStack.push_back(dstate);
+     if (dstate)
+@@ -547,6 +630,7 @@
+ 
+ void State::popStateSet()
+ {
++    OSGAP_CNT(osgapply_pop)
+     // OSG_NOTICE<<"State::popStateSet()"<<_stateStateStack.size()<<std::endl;
+ 
+     if (_stateStateStack.empty()) return;
+@@ -680,6 +764,9 @@
+ 
+     if (dstate)
+     {
++        OSGAP_CNT(osgapply_calls)
++        uint32_t ap0 = OSGAP_T();
++
+         // push the stateset on the stack so it can be querried from within StateAttribute
+         _stateStateStack.push_back(dstate);
+ 
+@@ -690,6 +777,39 @@
+         const StateSet::TextureAttributeList& ds_textureAttributeList = dstate->getTextureAttributeList();
+ 
+         unsigned int unit;
++#ifdef __vita__
++        // Flat last-bound cache instead of per-unit map merge-walks; modes and
++        // non-Texture attributes are no-ops under the FFP-replacement shaders.
++        const StateAttribute* const kVitaTexUnknown = reinterpret_cast<const StateAttribute*>(~uintptr_t(0));
++        unsigned int unitMax = maximum(static_cast<unsigned int>(ds_textureAttributeList.size()),
++            static_cast<unsigned int>(_vitaLastTexture.size()));
++        for(unit=0;unit<unitMax;++unit)
++        {
++            const StateAttribute* tex = 0;
++            if (unit<ds_textureAttributeList.size())
++            {
++                const StateSet::AttributeList& al = ds_textureAttributeList[unit];
++                for(StateSet::AttributeList::const_iterator itr=al.begin(); itr!=al.end(); ++itr)
++                {
++                    if (itr->first.first==StateAttribute::TEXTURE)
++                    {
++                        tex = itr->second.first.get();
++                        break;
++                    }
++                }
++            }
++            const StateAttribute* last = unit<_vitaLastTexture.size() ? _vitaLastTexture[unit] : kVitaTexUnknown;
++            if (tex!=last)
++            {
++                setActiveTextureUnit(unit);
++                if (tex)
++                    tex->apply(*this);
++                else if (last!=kVitaTexUnknown && last!=0)
++                    glBindTexture(GL_TEXTURE_2D, 0);
++                vitaNoteTexture(unit, tex);
++            }
++        }
++#else
+         unsigned int unitMax = maximum(static_cast<unsigned int>(ds_textureModeList.size()),static_cast<unsigned int>(ds_textureAttributeList.size()));
+         unitMax = maximum(static_cast<unsigned int>(unitMax),static_cast<unsigned int>(_textureModeMapList.size()));
+         unitMax = maximum(static_cast<unsigned int>(unitMax),static_cast<unsigned int>(_textureAttributeMapList.size()));
+@@ -701,6 +821,10 @@
+             if (unit<ds_textureAttributeList.size()) applyAttributeListOnTexUnit(unit,getOrCreateTextureAttributeMap(unit),ds_textureAttributeList[unit]);
+             else if (unit<_textureAttributeMapList.size()) applyAttributeMapOnTexUnit(unit,_textureAttributeMapList[unit]);
+         }
++#endif
++
++        uint32_t ap1 = OSGAP_T();
++        OSGAP_ADD(osgapply_tex_us, ap0, ap1)
+ 
+         const Program::PerContextProgram* previousLastAppliedProgramObject = _lastAppliedProgramObject;
+ 
+@@ -711,6 +835,9 @@
+         applyDefineList(_defineMap, dstate->getDefineList());
+ #endif
+ 
++        uint32_t ap2 = OSGAP_T();
++        OSGAP_ADD(osgapply_mode_us, ap1, ap2)
++
+         applyAttributeList(_attributeMap,dstate->getAttributeList());
+ 
+         // Checking if there is no program on the stack or the program is not applied from the AttributeStack (StateSet core mechanism)
+@@ -728,6 +855,48 @@
+             _lastAppliedProgramObject->getProgram()->apply(*this);
+         }
+ 
++        uint32_t ap3 = OSGAP_T();
++        OSGAP_ADD(osgapply_attr_us, ap2, ap3)
++
++
++#ifdef __vita__
++
++        // Scene-stack uniforms are already resident in this program if the
++        // program, uniform stacks and frame are unchanged (values update
++        // once per frame): only the leaf list needs applying then.
++        const unsigned int vitaFrame = getFrameStamp() ? (unsigned int)getFrameStamp()->getFrameNumber() : 0u;
++        if (_lastAppliedProgramObject && _lastAppliedProgramObject == _vitaUnifFullPCP
++            && vitaFrame == _vitaUnifFullFrame && _vitaUniformStackGen == _vitaUnifFullStackGen
++            && _currentShaderCompositionUniformList.empty())
++        {
++            const StateSet::UniformList& ul = dstate->getUniformList();
++            for (StateSet::UniformList::const_iterator it = ul.begin(); it != ul.end(); ++it)
++                _lastAppliedProgramObject->apply(*it->second.first);
++        }
++        else
++        {
++            if (dstate->getUniformList().empty())
++            {
++                if (_currentShaderCompositionUniformList.empty()) applyUniformMap(_uniformMap);
++                else applyUniformList(_uniformMap, _currentShaderCompositionUniformList);
++            }
++            else
++            {
++                if (_currentShaderCompositionUniformList.empty()) applyUniformList(_uniformMap, dstate->getUniformList());
++                else
++                {
++                    _currentShaderCompositionUniformList.insert(dstate->getUniformList().begin(), dstate->getUniformList().end());
++                    applyUniformList(_uniformMap, _currentShaderCompositionUniformList);
++                }
++            }
++            if (_lastAppliedProgramObject)
++            {
++                _vitaUnifFullPCP = _lastAppliedProgramObject;
++                _vitaUnifFullFrame = vitaFrame;
++                _vitaUnifFullStackGen = _vitaUniformStackGen;
++            }
++        }
++#else
+         if (dstate->getUniformList().empty())
+         {
+             if (_currentShaderCompositionUniformList.empty()) applyUniformMap(_uniformMap);
+@@ -743,6 +912,10 @@
+                 applyUniformList(_uniformMap, _currentShaderCompositionUniformList);
+             }
+         }
++#endif
++
++        uint32_t ap4 = OSGAP_T();
++        OSGAP_ADD(osgapply_unif_us, ap3, ap4)
+ 
+ #if 1
+         popDefineList(_defineMap, dstate->getDefineList());
+@@ -774,6 +947,11 @@
+         if (unit<_textureModeMapList.size()) applyModeMapOnTexUnit(unit,_textureModeMapList[unit]);
+         if (unit<_textureAttributeMapList.size()) applyAttributeMapOnTexUnit(unit,_textureAttributeMapList[unit]);
+     }
++#ifdef __vita__
++    // Bindings may have been restored behind the flat cache; force rebinds.
++    std::fill(_vitaLastTexture.begin(), _vitaLastTexture.end(),
++        reinterpret_cast<const StateAttribute*>(~uintptr_t(0)));
++#endif
+ 
+     // go through all active OpenGL modes, enabling/disable where
+     // appropriate.
+@@ -1796,3 +1974,103 @@
+     const StateSet::DefineList& currentDefines = _defineMap.currentDefines;
+     return (currentDefines.find(shaderRequirement)!=currentDefines.end());
+ }
++
++#ifdef __vita__
++// Flat-state replay (M3 phase 2): apply a composed stateset-chain state by
++// diffing directly against the last-applied trackers, skipping the
++// moveStateGraph push/pop walks and the stack-merge machinery entirely.
++void State::vitaSnapshotBase()
++{
++    _vitaBaseAttrDepth.clear();
++    _vitaBaseModeDepth.clear();
++    for (AttributeMap::const_iterator it = _attributeMap.begin(); it != _attributeMap.end(); ++it)
++        if (!it->second.attributeVec.empty())
++            _vitaBaseAttrDepth[it->first] = static_cast<unsigned int>(it->second.attributeVec.size());
++    for (ModeMap::const_iterator it = _modeMap.begin(); it != _modeMap.end(); ++it)
++        if (!it->second.valueVec.empty())
++            _vitaBaseModeDepth[it->first] = static_cast<unsigned int>(it->second.valueVec.size());
++}
++
++void State::vitaApplyFlat(const VitaFlatState& fs)
++{
++    // Modes: apply desired values, then reset map entries missing from the
++    // flat to their stage-base value (or global default).
++    for (std::vector<VitaFlatState::ModeEntry>::const_iterator it = fs.modes.begin(); it != fs.modes.end(); ++it)
++    {
++        ModeStack& ms = _modeMap[it->first]; // fresh entries default valid
++        applyMode(it->first, it->second, ms);
++        ms.changed = true;
++    }
++    {
++        std::vector<VitaFlatState::ModeEntry>::const_iterator fit = fs.modes.begin();
++        for (ModeMap::iterator it = _modeMap.begin(); it != _modeMap.end(); ++it)
++        {
++            while (fit != fs.modes.end() && fit->first < it->first)
++                ++fit;
++            if (fit != fs.modes.end() && fit->first == it->first)
++                continue; // handled above
++            ModeStack& ms = it->second;
++            bool desired = ms.global_default_value;
++            std::map<StateAttribute::GLMode, unsigned int>::const_iterator bit = _vitaBaseModeDepth.find(it->first);
++            if (bit != _vitaBaseModeDepth.end() && ms.valueVec.size() >= bit->second && bit->second > 0)
++                desired = (ms.valueVec[bit->second - 1] & StateAttribute::ON) != 0;
++            applyMode(it->first, desired, ms);
++        }
++    }
++
++    // Attributes (program included): same pattern.
++    for (std::vector<VitaFlatState::AttrEntry>::const_iterator it = fs.attrs.begin(); it != fs.attrs.end(); ++it)
++    {
++        AttributeStack& as = _attributeMap[it->first];
++        applyAttribute(it->second, as);
++        as.changed = true;
++    }
++    {
++        std::vector<VitaFlatState::AttrEntry>::const_iterator fit = fs.attrs.begin();
++        for (AttributeMap::iterator it = _attributeMap.begin(); it != _attributeMap.end(); ++it)
++        {
++            while (fit != fs.attrs.end() && fit->first < it->first)
++                ++fit;
++            if (fit != fs.attrs.end() && fit->first == it->first)
++                continue;
++            AttributeStack& as = it->second;
++            std::map<StateAttribute::TypeMemberPair, unsigned int>::const_iterator bit
++                = _vitaBaseAttrDepth.find(it->first);
++            if (bit != _vitaBaseAttrDepth.end() && as.attributeVec.size() >= bit->second && bit->second > 0)
++                applyAttribute(as.attributeVec[bit->second - 1].first, as);
++            else
++                applyGlobalDefaultAttribute(as);
++        }
++    }
++
++    // Textures: bound texture per unit via the existing flat cache.
++    const StateAttribute* const kUnknown = reinterpret_cast<const StateAttribute*>(~uintptr_t(0));
++    unsigned int unitMax = fs.textureCount;
++    if (_vitaLastTexture.size() > unitMax)
++        unitMax = static_cast<unsigned int>(_vitaLastTexture.size());
++    if (unitMax > 2)
++        unitMax = 2;
++    for (unsigned int unit = 0; unit < unitMax; ++unit)
++    {
++        const StateAttribute* tex = unit < fs.textureCount ? fs.texture[unit] : 0;
++        const StateAttribute* last = unit < _vitaLastTexture.size() ? _vitaLastTexture[unit] : kUnknown;
++        if (tex != last)
++        {
++            setActiveTextureUnit(unit);
++            if (tex)
++                tex->apply(*this);
++            else if (last != kUnknown && last != 0)
++                glBindTexture(GL_TEXTURE_2D, 0);
++            vitaNoteTexture(unit, tex);
++        }
++    }
++
++    // Uniforms: value/generation changes are caught inside the program's
++    // per-uniform fast path.
++    if (_lastAppliedProgramObject)
++    {
++        for (std::vector<const Uniform*>::const_iterator it = fs.uniforms.begin(); it != fs.uniforms.end(); ++it)
++            _lastAppliedProgramObject->apply(*(*it));
++    }
++}
++#endif
+diff -ruN '--exclude=.git' pristine-osg/src/osg/Texture.cpp b/src/osg/Texture.cpp
+--- a/src/osg/Texture.cpp	2022-01-11 08:08:55.000000000 -0700
++++ b/src/osg/Texture.cpp	2026-08-05 16:09:59.269480001 -0600
+@@ -882,7 +882,16 @@
+     OSG_NOTICE<<"    before to->_next = "<<to->_next<<std::endl;
+ #endif
+ 
+-    to->_frameLastUsed = _parent->getFrameNumber();
++    const unsigned int frameNow = _parent->getFrameNumber();
++#ifdef __vita__
++    // The LRU only needs frame granularity, but this ran on EVERY bind —
++    // a scattered pointer chase on the hottest path in the draw loop.
++    // First bind of a frame still moves the object to the tail, so
++    // eviction from the head never sees anything used this frame.
++    if (to->_frameLastUsed == frameNow)
++        return;
++#endif
++    to->_frameLastUsed = frameNow;
+ 
+     // nothing to do if we are already tail
+     if (to==_tail) return;
+diff -ruN '--exclude=.git' pristine-osg/src/osgDB/FileNameUtils.cpp b/src/osgDB/FileNameUtils.cpp
+--- a/src/osgDB/FileNameUtils.cpp	2022-01-11 08:08:55.000000000 -0700
++++ b/src/osgDB/FileNameUtils.cpp	2026-04-29 13:23:48.223694800 -0600
+@@ -29,7 +29,7 @@
+     using std::tolower;
+ #endif
+ 
+-#if defined(__GNU__) && !defined(PATH_MAX)
++#ifndef PATH_MAX
+ #define PATH_MAX 4096
+ #endif
+ 
+diff -ruN '--exclude=.git' pristine-osg/src/osgDB/FileUtils.cpp b/src/osgDB/FileUtils.cpp
+--- a/src/osgDB/FileUtils.cpp	2022-01-11 08:08:55.000000000 -0700
++++ b/src/osgDB/FileUtils.cpp	2026-04-29 13:23:48.223694800 -0600
+@@ -99,6 +99,10 @@
+     #define stat64 stat
+ #endif
+ 
++#if defined(__vita__)
++    #define stat64 stat
++#endif
++
+     // set up _S_ISDIR()
+ #if !defined(S_ISDIR)
+ #  if defined( _S_IFDIR) && !defined( __S_IFDIR)
+diff -ruN '--exclude=.git' pristine-osg/src/osgShadow/MinimalCullBoundsShadowMap.cpp b/src/osgShadow/MinimalCullBoundsShadowMap.cpp
+--- a/src/osgShadow/MinimalCullBoundsShadowMap.cpp	2022-01-11 08:08:55.000000000 -0700
++++ b/src/osgShadow/MinimalCullBoundsShadowMap.cpp	2026-04-29 15:22:14.718508834 -0600
+@@ -75,7 +75,9 @@
+             *_cv->getModelViewMatrix() * *_cv->getProjectionMatrix() );
+ 
+     osg::BoundingBox bb;
+-    if( *_cv->getProjectionMatrix() != _clampedProjection ) {
++    // Vita: OSG_USE_FLOAT_MATRIX makes RefMatrix = Matrixf, but
++    // _clampedProjection is Matrixd. Cast to disambiguate the comparison.
++    if( osg::Matrixd(*_cv->getProjectionMatrix()) != _clampedProjection ) {
+ 
+         osg::Polytope polytope;
+ #if 1
+diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUtil/CullVisitor.cpp
+--- a/src/osgUtil/CullVisitor.cpp	2022-01-11 08:08:55.000000000 -0700
++++ b/src/osgUtil/CullVisitor.cpp	2026-08-05 17:31:37.419330115 -0600
+@@ -38,6 +38,74 @@
+ using namespace osg;
+ using namespace osgUtil;
+ 
++#ifdef __vita__
++#include <psp2/kernel/processmgr.h>
++extern "C" {
++    unsigned int cullprof_node = 0, cullprof_group = 0, cullprof_transform = 0, cullprof_geode = 0,
++        cullprof_drawable = 0, cullprof_dcull = 0, cullprof_leaves = 0, cullprof_sg = 0;
++    // Set by SceneUtil::Skeleton around its cull traverse; counts bone visits.
++    int cullprof_in_skeleton = 0;
++    unsigned int cullprof_xf_bone = 0;
++    // Time buckets: drawable-apply total, cull-callback share, pre-traverse
++    // exclusive cost of Transform/Group applies.
++    unsigned int cullprof_drw_us = 0, cullprof_cb_us = 0, cullprof_xf_us = 0, cullprof_grp_us = 0;
++}
++#include <cstdio>
++namespace
++{
++    // Per-class callback cost; className() literals are pointer-stable.
++    struct VitaCbStat
++    {
++        const char* name;
++        char owner[32];
++        unsigned int us;
++        unsigned int n;
++    };
++    VitaCbStat sVitaCbStats[8] = {};
++
++    void cullprofCbNote(const char* name, const std::string& ownerName, unsigned int us)
++    {
++        for (int i = 0; i < 8; ++i)
++            if (sVitaCbStats[i].name == name || !sVitaCbStats[i].name)
++            {
++                sVitaCbStats[i].name = name;
++                if (!sVitaCbStats[i].owner[0] && !ownerName.empty())
++                    snprintf(sVitaCbStats[i].owner, sizeof(sVitaCbStats[i].owner), "%s", ownerName.c_str());
++                sVitaCbStats[i].us += us;
++                ++sVitaCbStats[i].n;
++                return;
++            }
++    }
++}
++extern "C" int cullprof_cb_report(char* buf, unsigned int buflen)
++{
++    int written = 0;
++    for (int i = 0; i < 8 && sVitaCbStats[i].name; ++i)
++    {
++        int n = snprintf(buf + written, buflen - written, "%s%s(%s)=%u/%uus", written ? " " : "", sVitaCbStats[i].name,
++            sVitaCbStats[i].owner[0] ? sVitaCbStats[i].owner : "?", sVitaCbStats[i].n, sVitaCbStats[i].us);
++        sVitaCbStats[i].us = 0;
++        sVitaCbStats[i].n = 0;
++        if (n < 0 || (unsigned)n >= buflen - written)
++            break;
++        written += n;
++    }
++    return written;
++}
++#define CULLPROF_INC(x) (++x)
++// Timing probes cost ~4 kernel clock reads per node visit — about 4900 per
++// frame — so they inflated the very number they were measuring. Counts are
++// nearly free and stay; the timers are compiled out.
++#define CULLPROF_T() 0
++#define CULLPROF_ADD(var, t0)
++#define CULLPROF_CB_NOTE(name, owner, us)
++#else
++#define CULLPROF_INC(x) ((void)0)
++#define CULLPROF_T() 0
++#define CULLPROF_ADD(var, t0)
++#define CULLPROF_CB_NOTE(name, owner, us)
++#endif
++
+ inline float MAX_F(float a, float b)
+     { return a>b?a:b; }
+ inline int EQUAL_F(float a, float b)
+@@ -861,6 +929,7 @@
+ 
+ void CullVisitor::apply(Node& node)
+ {
++    CULLPROF_INC(cullprof_node);
+     if (isCulled(node)) return;
+ 
+     // push the culling mode.
+@@ -882,6 +951,7 @@
+ 
+ void CullVisitor::apply(Geode& node)
+ {
++    CULLPROF_INC(cullprof_geode);
+     if (isCulled(node)) return;
+ 
+     // push the culling mode.
+@@ -902,24 +972,52 @@
+ 
+ void CullVisitor::apply(osg::Drawable& drawable)
+ {
++    CULLPROF_INC(cullprof_drawable);
++#ifdef __vita__
++    struct DrwTimer
++    {
++        unsigned int mT0;
++        ~DrwTimer() { CULLPROF_ADD(cullprof_drw_us, mT0) }
++    } drwTimer{ CULLPROF_T() };
++#endif
+     RefMatrix& matrix = *getModelViewMatrix();
+ 
+     const BoundingBox &bb =drawable.getBoundingBox();
+ 
+     if( drawable.getCullCallback() )
+     {
++        const unsigned int cb0 = CULLPROF_T();
+         osg::DrawableCullCallback* dcb = drawable.getCullCallback()->asDrawableCullCallback();
+         if (dcb)
+         {
+-            if( dcb->cull( this, &drawable, &_renderInfo ) == true ) return;
++            const bool cbCulled = dcb->cull( this, &drawable, &_renderInfo ) == true;
++            const unsigned int cbe = CULLPROF_T() - cb0;
++            cullprof_cb_us += cbe;
++            CULLPROF_CB_NOTE(drawable.getCullCallback()->className(),
++                !drawable.getName().empty() ? drawable.getName()
++                    : std::string(drawable.className()) + "<"
++                        + (drawable.getNumParents() ? drawable.getParent(0)->getName() : "") + ">",
++                cbe)
++            if (cbCulled) return;
+         }
+         else
+         {
+             drawable.getCullCallback()->run(&drawable,this);
++            const unsigned int cbe = CULLPROF_T() - cb0;
++            cullprof_cb_us += cbe;
++            CULLPROF_CB_NOTE(drawable.getCullCallback()->className(),
++                !drawable.getName().empty() ? drawable.getName()
++                    : std::string(drawable.className()) + "<"
++                        + (drawable.getNumParents() ? drawable.getParent(0)->getName() : "") + ">",
++                cbe)
+         }
+     }
+ 
+-    if (drawable.isCullingActive() && isCulled(bb)) return;
++    if (drawable.isCullingActive() && isCulled(bb))
++    {
++        CULLPROF_INC(cullprof_dcull);
++        return;
++    }
+ 
+ 
+     if (_computeNearFar && bb.valid())
+@@ -969,6 +1067,7 @@
+     }
+     else
+     {
++        CULLPROF_INC(cullprof_leaves);
+         addDrawableAndDepth(&drawable,&matrix,depth);
+     }
+ 
+@@ -1136,7 +1235,13 @@
+ 
+ void CullVisitor::apply(Group& node)
+ {
+-    if (isCulled(node)) return;
++    CULLPROF_INC(cullprof_group);
++    const unsigned int grp0 = CULLPROF_T();
++    if (isCulled(node))
++    {
++        CULLPROF_ADD(cullprof_grp_us, grp0)
++        return;
++    }
+ 
+     // push the culling mode.
+     pushCurrentMask();
+@@ -1145,18 +1250,31 @@
+     StateSet* node_state = node.getStateSet();
+     if (node_state) pushStateSet(node_state);
+ 
++    CULLPROF_ADD(cullprof_grp_us, grp0)
+     handle_cull_callbacks_and_traverse(node);
+ 
++    const unsigned int grp1 = CULLPROF_T();
+     // pop the node's state off the render graph stack.
+     if (node_state) popStateSet();
+ 
+     // pop the culling mode.
+     popCurrentMask();
++    CULLPROF_ADD(cullprof_grp_us, grp1)
+ }
+ 
+ void CullVisitor::apply(Transform& node)
+ {
+-    if (isCulled(node)) return;
++    CULLPROF_INC(cullprof_transform);
++#ifdef __vita__
++    if (cullprof_in_skeleton)
++        ++cullprof_xf_bone;
++#endif
++    const unsigned int xf0 = CULLPROF_T();
++    if (isCulled(node))
++    {
++        CULLPROF_ADD(cullprof_xf_us, xf0)
++        return;
++    }
+ 
+     // push the culling mode.
+     pushCurrentMask();
+@@ -1169,8 +1287,10 @@
+     node.computeLocalToWorldMatrix(*matrix,this);
+     pushModelViewMatrix(matrix, node.getReferenceFrame());
+ 
++    CULLPROF_ADD(cullprof_xf_us, xf0)
+     handle_cull_callbacks_and_traverse(node);
+ 
++    const unsigned int xf1 = CULLPROF_T();
+     popModelViewMatrix();
+ 
+     // pop the node's state off the render graph stack.
+@@ -1178,6 +1298,7 @@
+ 
+     // pop the culling mode.
+     popCurrentMask();
++    CULLPROF_ADD(cullprof_xf_us, xf1)
+ }
+ 
+ void CullVisitor::apply(Projection& node)
+@@ -1747,3 +1868,4 @@
+     popCurrentMask();
+ }
+ 
++
+diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/RenderLeaf.cpp b/src/osgUtil/RenderLeaf.cpp
+--- a/src/osgUtil/RenderLeaf.cpp	2022-01-11 08:08:55.000000000 -0700
++++ b/src/osgUtil/RenderLeaf.cpp	2026-08-06 09:17:42.810662710 -0600
+@@ -13,10 +13,242 @@
+ #include <osgUtil/RenderLeaf>
+ #include <osgUtil/StateGraph>
+ #include <osg/Notify>
++#ifdef __vita__
++#include <osg/Geometry>
++#include <osg/GLExtensions>
++#include <osg/VertexArrayState>
++#endif
+ 
+ using namespace osg;
+ using namespace osgUtil;
+ 
++#ifdef __vita__
++#include <psp2/kernel/processmgr.h>
++extern "C" {
++uint32_t osgprof_mat_us = 0;
++uint32_t osgprof_state_us = 0;
++uint32_t osgprof_unif_us = 0;
++uint32_t osgprof_draw_us = 0;
++uint32_t osgprof_leaves = 0;
++uint32_t osgprof_replayable = 0;
++uint32_t osgprof_replayed = 0;
++uint32_t osgprof_streplayed = 0;
++int vita_draw_replay = 0; // set from engine settings at boot
++int vita_state_replay = 0;
++// Bumped by the app after it releases GL objects belonging to live
++// drawables (CDRAM shedding). Draw-replay caches capture raw GL buffer
++// ids; a stale id replayed after deletion is a GPU fault. Each cache
++// entry stamps the epoch at capture and re-qualifies when it changes.
++uint32_t vita_replay_epoch = 1;
++    uint32_t osgprof_dyn_leaves = 0, osgprof_dyn_verts = 0, osgprof_dyn_us = 0;
++}
++
++namespace
++{
++    bool s_vitaLastWasReplay = false;
++
++    // After replay draws, the VAS caches are stale: null them and force
++    // known GL client state so the next normal-path draw rebinds cleanly.
++    void vitaResyncVAS(osg::State& state)
++    {
++        // The replay path binds generic attributes + buffers directly;
++        // disable what it may have left on and null the VAS caches so the
++        // next normal-path draw rebuilds from scratch.
++        osg::GLExtensions* ext = state.get<osg::GLExtensions>();
++        const int slots[4] = { state.getVertexAlias()._location, state.getNormalAlias()._location,
++            state.getColorAlias()._location,
++            state.getTexCoordAliasList().empty() ? -1 : state.getTexCoordAliasList()[0]._location };
++        for (int i = 0; i < 4; ++i)
++            if (slots[i] >= 0)
++                ext->glDisableVertexAttribArray(slots[i]);
++        ext->glBindBuffer(GL_ARRAY_BUFFER, 0);
++        ext->glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
++        osg::VertexArrayState* vas = state.getCurrentVertexArrayState();
++        if (!vas)
++            return;
++        const auto reset = [](osg::VertexArrayState::ArrayDispatch* d) {
++            if (d)
++            {
++                d->array = 0;
++                d->modifiedCount = 0xffffffff;
++                d->active = false;
++            }
++        };
++        reset(vas->_vertexArray.get());
++        reset(vas->_normalArray.get());
++        reset(vas->_colorArray.get());
++        for (unsigned i = 0; i < vas->_texCoordArrays.size(); ++i)
++            reset(vas->_texCoordArrays[i].get());
++        for (unsigned i = 0; i < vas->_vertexAttribArrays.size(); ++i)
++            reset(vas->_vertexAttribArrays[i].get());
++        vas->_activeDispatchers.clear();
++        vas->_previous_activeDispatchers.clear();
++        vas->setCurrentVertexBufferObject(0);
++        vas->setCurrentElementBufferObject(0);
++    }
++
++    // ---- Flat-state replay (M3 phase 2) ----
++    // State stacks currently represent this graph node's chain. Normal-path
++    // leaves keep it current; flat replays freeze it (stacks untouched).
++    StateGraph* s_vitaChainNode = 0;
++    StateGraph* s_vitaAppliedNode = 0; // node of last state application
++    bool s_vitaFlatMode = false;
++
++    // Build (or revalidate) the composed chain state for a graph node.
++    // Returns null if the chain is dynamic or uses features the flat
++    // path doesn't model (TexMat/TexGen, >2 texture units).
++    osg::State::VitaFlatState* vitaGetFlat(StateGraph* rg, unsigned int frame)
++    {
++        osg::State::VitaFlatState* fs = static_cast<osg::State::VitaFlatState*>(rg->_vitaFlat.get());
++        if (fs && fs->frameStamp == frame)
++            return fs->usable ? fs : 0;
++
++        unsigned int sig = 0;
++        for (StateGraph* g = rg; g; g = g->_parent)
++        {
++            const osg::StateSet* ss = g->getStateSet();
++            if (!ss)
++                continue;
++            if (ss->getDataVariance() == osg::Object::DYNAMIC)
++                return 0; // don't cache: variance can flip back
++            sig = sig * 31u + (unsigned int)(uintptr_t)ss
++                + (unsigned int)(ss->getAttributeList().size() * 8191 + ss->getModeList().size() * 127
++                    + ss->getUniformList().size())
++                    * 2654435761u;
++        }
++
++        if (!fs)
++        {
++            fs = new osg::State::VitaFlatState;
++            rg->_vitaFlat = fs;
++            fs->sig = sig + 1; // force build
++        }
++        if (fs->sig != sig)
++        {
++            fs->sig = sig;
++            fs->usable = false;
++            fs->attrs.clear();
++            fs->modes.clear();
++            fs->uniforms.clear();
++            fs->texture[0] = fs->texture[1] = 0;
++            fs->textureCount = 0;
++
++            // Chain root -> leaf.
++            StateGraph* chain[64];
++            int n = 0;
++            for (StateGraph* g = rg; g && n < 64; g = g->_parent)
++                chain[n++] = g;
++            bool ok = (n < 64);
++
++            typedef std::pair<const osg::StateAttribute*, unsigned int> AV; // attr, override flags
++            std::map<osg::StateAttribute::TypeMemberPair, AV> attrs;
++            std::map<osg::StateAttribute::GLMode, std::pair<bool, unsigned int>> modes;
++            std::map<std::string, std::pair<const osg::Uniform*, unsigned int>> uniforms;
++            std::pair<const osg::StateAttribute*, unsigned int> tex[2] = { { 0, 0 }, { 0, 0 } };
++
++            for (int i = n - 1; i >= 0 && ok; --i)
++            {
++                const osg::StateSet* ss = chain[i]->getStateSet();
++                if (!ss)
++                    continue;
++                const osg::StateSet::AttributeList& al = ss->getAttributeList();
++                for (osg::StateSet::AttributeList::const_iterator it = al.begin(); it != al.end(); ++it)
++                {
++                    std::map<osg::StateAttribute::TypeMemberPair, AV>::iterator ex = attrs.find(it->first);
++                    const unsigned int ov = it->second.second;
++                    if (ex != attrs.end() && (ex->second.second & osg::StateAttribute::OVERRIDE)
++                        && !(ov & osg::StateAttribute::PROTECTED))
++                        continue;
++                    attrs[it->first] = AV(it->second.first.get(), ov);
++                }
++                const osg::StateSet::ModeList& ml = ss->getModeList();
++                for (osg::StateSet::ModeList::const_iterator it = ml.begin(); it != ml.end(); ++it)
++                {
++                    const unsigned int v = it->second;
++                    if (v & osg::StateAttribute::INHERIT)
++                        continue;
++                    std::map<osg::StateAttribute::GLMode, std::pair<bool, unsigned int>>::iterator ex
++                        = modes.find(it->first);
++                    if (ex != modes.end() && (ex->second.second & osg::StateAttribute::OVERRIDE)
++                        && !(v & osg::StateAttribute::PROTECTED))
++                        continue;
++                    modes[it->first] = std::make_pair((v & osg::StateAttribute::ON) != 0, v);
++                }
++                const osg::StateSet::UniformList& ul = ss->getUniformList();
++                for (osg::StateSet::UniformList::const_iterator it = ul.begin(); it != ul.end(); ++it)
++                {
++                    std::map<std::string, std::pair<const osg::Uniform*, unsigned int>>::iterator ex
++                        = uniforms.find(it->first);
++                    const unsigned int ov = it->second.second;
++                    if (ex != uniforms.end() && (ex->second.second & osg::StateAttribute::OVERRIDE)
++                        && !(ov & osg::StateAttribute::PROTECTED))
++                        continue;
++                    uniforms[it->first] = std::make_pair(it->second.first.get(), ov);
++                }
++                const osg::StateSet::TextureAttributeList& tl = ss->getTextureAttributeList();
++                if (tl.size() > 2)
++                {
++                    ok = false;
++                    break;
++                }
++                for (unsigned int u = 0; u < tl.size() && ok; ++u)
++                {
++                    for (osg::StateSet::AttributeList::const_iterator it = tl[u].begin(); it != tl[u].end(); ++it)
++                    {
++                        const osg::StateAttribute::Type t = it->first.first;
++                        if (t == osg::StateAttribute::TEXTURE)
++                        {
++                            const unsigned int ov = it->second.second;
++                            if (tex[u].first && (tex[u].second & osg::StateAttribute::OVERRIDE)
++                                && !(ov & osg::StateAttribute::PROTECTED))
++                                continue;
++                            tex[u] = std::make_pair(it->second.first.get(), ov);
++                            if (fs->textureCount < u + 1)
++                                fs->textureCount = u + 1;
++                        }
++                        else if (t == osg::StateAttribute::TEXMAT || t == osg::StateAttribute::TEXGEN
++                            || t == osg::StateAttribute::POINTSPRITE)
++                        {
++                            ok = false; // functional texture state we don't model
++                            break;
++                        }
++                        // TexEnv etc: ignored by the FFP-replacement shaders.
++                    }
++                }
++            }
++
++            if (ok)
++            {
++                for (std::map<osg::StateAttribute::TypeMemberPair, AV>::const_iterator it = attrs.begin();
++                     it != attrs.end(); ++it)
++                    fs->attrs.push_back(osg::State::VitaFlatState::AttrEntry(it->first, it->second.first));
++                for (std::map<osg::StateAttribute::GLMode, std::pair<bool, unsigned int>>::const_iterator it
++                     = modes.begin();
++                     it != modes.end(); ++it)
++                    fs->modes.push_back(osg::State::VitaFlatState::ModeEntry(it->first, it->second.first));
++                for (std::map<std::string, std::pair<const osg::Uniform*, unsigned int>>::const_iterator it
++                     = uniforms.begin();
++                     it != uniforms.end(); ++it)
++                    fs->uniforms.push_back(it->second.first);
++                fs->texture[0] = tex[0].first;
++                fs->texture[1] = tex[1].first;
++                fs->usable = true;
++            }
++        }
++        fs->frameStamp = frame;
++        return fs->usable ? fs : 0;
++    }
++}
++// Timers compiled out (counts kept): 4 syscalls per leaf ~= 400/frame on
++// the dispatch path, and they inflate every us/leaf reading -- same lesson
++// as the CullProf timers. Re-enable locally when sizing leaf-cost work.
++#define OSGPROF_T() 0
++#define OSGPROF_ACC(a, b, c, d, e) osgprof_leaves++;
++#else
++#define OSGPROF_T() 0
++#define OSGPROF_ACC(a, b, c, d, e)
++#endif
++
+ void RenderLeaf::render(osg::RenderInfo& renderInfo,RenderLeaf* previous)
+ {
+     osg::State& state = *renderInfo.getState();
+@@ -28,57 +260,170 @@
+         return;
+     }
+ 
++#ifdef __vita__
++    {
++        // Epoch changed (app released GL objects of live content): the
++        // buffer replay caches self-invalidate via their stamps, but
++        // osg::State's applied-attribute tracking and the frozen flat-state
++        // chains still believe old texture bindings are current — deleted
++        // texture ids get RECYCLED by new uploads, so a stale skip draws
++        // the wrong texture (tree-with-body-texture class). Dirty all
++        // state tracking once per epoch so every attribute re-applies;
++        // Texture::apply recreates released textures correctly.
++        static uint32_t s_vitaSeenEpoch = 0;
++        if (s_vitaSeenEpoch != vita_replay_epoch)
++        {
++            s_vitaSeenEpoch = vita_replay_epoch;
++            state.dirtyAllAttributes();
++            state.dirtyAllModes();
++            state.dirtyAllVertexArrays();
++            s_vitaAppliedNode = 0;
++            s_vitaChainNode = 0;
++            s_vitaFlatMode = false;
++        }
++    }
++#endif
++
+     if (previous)
+     {
++        uint32_t pt0 = OSGPROF_T();
+ 
+         // apply matrices if required.
+         state.applyProjectionMatrix(_projection.get());
+         state.applyModelViewMatrix(_modelview.get());
+ 
+-        // apply state if required.
+-        StateGraph* prev_rg = previous->_parent;
+-        StateGraph* prev_rg_parent = prev_rg->_parent;
++        uint32_t pt1 = OSGPROF_T();
++
++        // apply state if required. Flat replay diffs the composed chain
++        // state directly and leaves the stacks frozen; the normal path
++        // sources moveStateGraph from the tracked chain node so mixing
++        // the two stays coherent.
+         StateGraph* rg = _parent;
+-        if (prev_rg_parent!=rg->_parent)
++        if (rg != s_vitaAppliedNode)
+         {
+-            StateGraph::moveStateGraph(state,prev_rg_parent,rg->_parent);
+-
+-            // send state changes and matrix changes to OpenGL.
+-            state.apply(rg->getStateSet());
+-
++            osg::State::VitaFlatState* fs = 0;
++            if (vita_state_replay)
++                fs = vitaGetFlat(rg, state.getFrameStamp() ? state.getFrameStamp()->getFrameNumber() : 0);
++            if (fs)
++            {
++                state.vitaApplyFlat(*fs);
++                s_vitaAppliedNode = rg;
++                s_vitaFlatMode = true;
++                ++osgprof_streplayed;
++            }
++            else
++            {
++                if (s_vitaChainNode != rg->_parent)
++                {
++                    StateGraph::moveStateGraph(state, s_vitaChainNode, rg->_parent);
++                    state.apply(rg->getStateSet());
++                    s_vitaChainNode = rg->_parent;
++                }
++                else
++                    state.apply(rg->getStateSet());
++                s_vitaAppliedNode = rg;
++                s_vitaFlatMode = false;
++            }
+         }
+-        else if (rg!=prev_rg)
++        else if (s_vitaFlatMode && !vita_state_replay)
+         {
+-
+-            // send state changes and matrix changes to OpenGL.
++            // Gate flipped off mid-run: force a normal re-apply.
++            if (s_vitaChainNode != rg->_parent)
++            {
++                StateGraph::moveStateGraph(state, s_vitaChainNode, rg->_parent);
++                s_vitaChainNode = rg->_parent;
++            }
+             state.apply(rg->getStateSet());
+-
++            s_vitaFlatMode = false;
+         }
+ 
++        uint32_t pt2 = OSGPROF_T();
++
+         // if we are using osg::Program which requires OSG's generated uniforms to track
+         // modelview and projection matrices then apply them now.
+         if (state.getUseModelViewAndProjectionUniforms()) state.applyModelViewAndProjectionUniformsIfRequired();
+ 
+-        // draw the drawable
+-        _drawable->draw(renderInfo);
++        uint32_t pt3 = OSGPROF_T();
++
++        // draw the drawable; static leaves may use draw-dispatch replay.
++        bool replayable = false;
++        {
++            const osg::StateSet* ss = _parent ? _parent->getStateSet() : 0;
++            replayable = _drawable.valid() && _drawable->getDataVariance() != osg::Object::DYNAMIC
++                && (!ss || ss->getDataVariance() != osg::Object::DYNAMIC);
++            if (replayable)
++                ++osgprof_replayable;
++        }
++        const bool vitaIsRig = _drawable.valid() && strcmp(_drawable->className(), "RigGeometry") == 0;
++        if (vitaIsRig)
++        {
++            ++osgprof_dyn_leaves;
++            if (const osg::Geometry* g = _drawable->asGeometry())
++                if (const osg::Array* va = g->getVertexArray())
++                    osgprof_dyn_verts += va->getNumElements();
++        }
++        bool replayed = false;
++        if (replayable && vita_draw_replay)
++        {
++            osg::Geometry* geom = _drawable->asGeometry();
++            if (geom)
++                replayed = geom->vitaFastDraw(renderInfo);
++        }
++        if (!replayed)
++        {
++            if (s_vitaLastWasReplay)
++                vitaResyncVAS(state);
++            if (vitaIsRig)
++            {
++                const uint32_t rt0 = OSGPROF_T();
++                _drawable->draw(renderInfo);
++                osgprof_dyn_us += OSGPROF_T() - rt0;
++            }
++            else
++                _drawable->draw(renderInfo);
++        }
++        s_vitaLastWasReplay = replayed;
++
++        uint32_t pt4 = OSGPROF_T();
++        OSGPROF_ACC(pt0, pt1, pt2, pt3, pt4)
+     }
+     else
+     {
++        uint32_t pt0 = OSGPROF_T();
++
+         // apply matrices if required.
+         state.applyProjectionMatrix(_projection.get());
+         state.applyModelViewMatrix(_modelview.get());
+ 
++        uint32_t pt1 = OSGPROF_T();
++
+         // apply state if required.
++        state.vitaSnapshotBase(); // stage-level stacks below the graph
+         StateGraph::moveStateGraph(state,NULL,_parent->_parent);
+ 
+         state.apply(_parent->getStateSet());
++        s_vitaChainNode = _parent->_parent;
++        s_vitaAppliedNode = _parent;
++        s_vitaFlatMode = false;
++
++        uint32_t pt2 = OSGPROF_T();
+ 
+         // if we are using osg::Program which requires OSG's generated uniforms to track
+         // modelview and projection matrices then apply them now.
+         if (state.getUseModelViewAndProjectionUniforms()) state.applyModelViewAndProjectionUniformsIfRequired();
+ 
++        uint32_t pt3 = OSGPROF_T();
++
+         // draw the drawable
++        if (s_vitaLastWasReplay)
++        {
++            vitaResyncVAS(state);
++            s_vitaLastWasReplay = false;
++        }
+         _drawable->draw(renderInfo);
++
++        uint32_t pt4 = OSGPROF_T();
++        OSGPROF_ACC(pt0, pt1, pt2, pt3, pt4)
+     }
+ 
+     if (_dynamic)

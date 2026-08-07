@@ -741,8 +741,11 @@ namespace MWWorld
                 // Neighborhood-bound the resident cell stores: distant
                 // stores are low-reuse memory better spent on warm assets.
                 // Not idle-gated: eviction is cheap, unlike warming.
-                if (mCurrentCell && mCurrentCell->isExterior()
-                    && mWorld.getWorldModel().vitaCellStoreCount() > 120)
+                // NOT exterior-gated either: interiors are where stores
+                // accumulate (the 18-min session piled 207 while the
+                // exterior-only gate locked this out, then one Housekeep
+                // paid 14.6s of teardown under a screen).
+                if (mCurrentCell && mWorld.getWorldModel().vitaCellStoreCount() > 120)
                     vitaStoreEvictPass(false);
             }
             // State now resurrects correctly, so state-ful stores accumulate
@@ -888,6 +891,7 @@ namespace MWWorld
                         Vita::breadcrumb(evictBuf);
                     }
                 }
+                vitaMainPhase("flush");
                 mRendering.flushUnrefQueueImmediate();
                 mRendering.getResourceSystem()->clearCache();
                 // Static caches that bypass OSG expiry; cleared explicitly.
@@ -903,6 +907,7 @@ namespace MWWorld
                 // walks the heap and merges adjacent free chunks back
                 // into contiguous blocks. Doesn't shrink the heap (fixed
                 // sbrk on Vita) but reclaims contiguous capacity.
+                vitaMainPhase("trim");
                 malloc_trim(0);
                 s_cachesFlushed = true;
                 s_lastFlushTimeUs = nowUs;
@@ -2026,17 +2031,30 @@ namespace MWWorld
     {
         // A loading screen is the safe, free moment for deep cleanup:
         // world draw is quiescent (simFence ran) and the hitch is hidden.
+        // Time-boxed all the same: an unbounded sweep once paid 207 store
+        // teardowns in one 14.6s black screen. The steady evict pass keeps
+        // the pile small; anything past the box waits for the next screen.
+        vitaMainPhase("evict");
         const int beforeMB = Vita::getHeapUsedMBFresh();
         mRendering.flushUnrefQueueImmediate();
         mRendering.getResourceSystem()->updateCache(mRendering.getReferenceTime());
         mRendering.getResourceSystem()->clearCache();
         const auto protectedCells = vitaProtectedCells();
+        const auto hkDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
         int evicted = 0;
-        while (mWorld.getWorldModel().vitaEvictOneDistant(protectedCells, mCurrentGridCenter.x(),
-            mCurrentGridCenter.y(), 2, [this](CellStore& store) { mWorld.purgeCellRefs(store); }))
+        while (std::chrono::steady_clock::now() < hkDeadline
+            && mWorld.getWorldModel().vitaEvictOneDistant(protectedCells, mCurrentGridCenter.x(),
+                mCurrentGridCenter.y(), 2, [this](CellStore& store) { mWorld.purgeCellRefs(store); }))
             ++evicted;
-        int interiors = (int)mWorld.getWorldModel().vitaEvictInteriors(
-            protectedCells, 1000, [this](CellStore& store) { mWorld.purgeCellRefs(store); });
+        int interiors = 0;
+        while (std::chrono::steady_clock::now() < hkDeadline)
+        {
+            const int got = (int)mWorld.getWorldModel().vitaEvictInteriors(
+                protectedCells, 4, [this](CellStore& store) { mWorld.purgeCellRefs(store); });
+            if (got == 0)
+                break;
+            interiors += got;
+        }
         mRendering.flushUnrefQueueImmediate();
         char buf[112];
         std::size_t evRam = 0;
@@ -2051,10 +2069,22 @@ namespace MWWorld
     {
         // Loads are a fresh world: carry nothing across. Contiguous
         // headroom beats warm refs the destination may invalidate.
+        // The general pool goes too (~21MB): a mature save's StateApply
+        // sweep creates stores for every visited cell and OOMed on top of
+        // the warm-resident baseline (user report, Day-109 save).
+        // vitaLoadRefill() re-queues the pool once the load lands.
         mPreloader->clear();
         mPreloader->vitaDropRegionRefs();
+        mPreloader->vitaDropCommonRefs();
         vitaScreenHousekeeping();
         malloc_trim(0);
+    }
+
+    void Scene::vitaLoadRefill()
+    {
+        // Re-queue the cooked general pool dropped by vitaLoadPurge; the
+        // pump re-warms it async exactly like a fresh boot.
+        mPreloader->vitaBootWarm();
     }
 
     void Scene::insertCellLite(
@@ -4243,6 +4273,7 @@ namespace MWWorld
 #ifdef __vita__
         Vita::simFence(); // Scene teardown; wait out overlapped draw.
         Vita::breadcrumb("changeCellGrid() enter");
+        vitaMainPhase("cross");
         const auto vitaCrossT0 = std::chrono::steady_clock::now();
         auto vitaM1 = vitaCrossT0; // after entry flush
         auto vitaM2 = vitaCrossT0; // after load loop + end flush
@@ -4577,7 +4608,9 @@ namespace MWWorld
                     Vita::breadcrumb(mfbuf);
                 }
                 const bool isCenter = (x == playerCellX && y == playerCellY);
-
+                // Re-stamp per cell: housekeeping's "evict" otherwise goes
+                // stale here and the deadman blames the wrong span.
+                vitaMainPhase("loadcells");
 #endif
                 CellStore& cell = mWorld.getWorldModel().getExterior(indexToLoad);
 #ifdef __vita__
@@ -4836,6 +4869,7 @@ namespace MWWorld
             // Hydrate to QUIESCENCE under the screen: it lifts onto a
             // finished disc. Ticks register their own demand (cold models,
             // actor parts) — drain it between passes or "quiescence" lies.
+            vitaMainPhase("quiesce");
             const auto qStart = std::chrono::steady_clock::now();
             for (int pass = 0; pass < 80; ++pass)
             {
@@ -4904,6 +4938,7 @@ namespace MWWorld
             // sync behind the screen like the classic path.
             if (vitaSeamlessMode())
             {
+                vitaMainPhase("guarantee");
                 const auto g0 = std::chrono::steady_clock::now();
                 const osg::Vec3f gp = mWorld.getPlayerPtr().getRefData().getPosition().asVec3();
                 int gWant = 0, gAdds = 0;

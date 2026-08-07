@@ -1,0 +1,17 @@
+--- a/MyGUIEngine/include/MyGUI_ILayer.h
++++ b/MyGUIEngine/include/MyGUI_ILayer.h
+@@ -60,6 +60,14 @@
+ 		// render layer
+ 		virtual void renderToTarget(IRenderTarget* _target, bool _update) = 0;
+ 
++		// Vita: dirty query for render-skip. Default true = always rebuild
++		// (old behaviour) for layer types that don't track dirtiness;
++		// SharedLayer/OverlappedLayer already implement matching overrides.
++		virtual bool isOutOfDate() const
++		{
++			return true;
++		}
++
+ 		virtual void resizeView(const IntSize& _viewSize) = 0;
+ 
+ 	protected:

@@ -458,10 +458,12 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         phase_snd_us = phase_lsync_us = phase_state_us = 0;
         phase_world_us = phase_wm_us = 0;
         vitaFrameT0 = sceKernelGetProcessTimeWide();
+        vitaMainPhase("simjoin");
         // Finish overlapped sim before touching game state.
         if (mSimWorker && mSimOverlap && mSimPrimed)
             mSimWorker->finish();
         phase_fin_us = (uint32_t)(sceKernelGetProcessTimeWide() - vitaFrameT0);
+        vitaMainPhase("input");
 #endif
         // update input
         {
@@ -492,6 +494,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 
 #ifdef __vita__
             const uint64_t sndT0 = sceKernelGetProcessTimeWide();
+            vitaMainPhase("sound");
 #endif
             // sound
             if (mUseSound)
@@ -505,6 +508,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             ScopedProfile<UserStatsType::LuaSyncUpdate> profile(frameStart, frameNumber, *timer, *stats);
 #ifdef __vita__
             const uint64_t lsT0 = sceKernelGetProcessTimeWide();
+            vitaMainPhase("lsync");
 #endif
             // Should be called after input manager update and before any change to the game world.
             // It applies to the game world queued changes from the previous frame.
@@ -519,6 +523,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             ScopedProfile<UserStatsType::State> profile(frameStart, frameNumber, *timer, *stats);
 #ifdef __vita__
             const uint64_t stT0 = sceKernelGetProcessTimeWide();
+            vitaMainPhase("state");
 #endif
             mStateManager->update(frametime);
 #ifdef __vita__
@@ -556,6 +561,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 
 #ifdef __vita__
             const uint64_t wldT0 = sceKernelGetProcessTimeWide();
+            vitaMainPhase("wld");
 #endif
             if (mStateManager->getState() != MWBase::StateManager::State_NoGame)
             {
@@ -571,6 +577,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             ScopedProfile<UserStatsType::Gui> profile(frameStart, frameNumber, *timer, *stats);
 #ifdef __vita__
             const uint64_t wmT0 = sceKernelGetProcessTimeWide();
+            vitaMainPhase("gui");
 #endif
             mWindowManager->update(frametime);
 #ifdef __vita__
@@ -591,6 +598,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 #ifdef __vita__
     {
         const uint64_t unrefT0 = sceKernelGetProcessTimeWide();
+        vitaMainPhase("unref");
         mUnrefQueue->flush(*mWorkQueue);
         phase_unref_us = (uint32_t)(sceKernelGetProcessTimeWide() - unrefT0);
     }

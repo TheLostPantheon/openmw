@@ -62,6 +62,18 @@ __attribute__((used)) extern const char g_vitaSegPad[8192];
 __attribute__((used)) const char g_vitaSegPad[8192] = { 1 };
 unsigned int sceUserMainThreadStackSize = 2 * 1024 * 1024;
 
+// Deadman heartbeat: main stamps once per frame + on phase entry; the log
+// flusher thread reports if it goes silent. Plain volatiles suffice --
+// single writer, monotonic reader, staleness is the signal itself.
+volatile uint64_t vita_main_heartbeat_us = 0;
+const char* volatile vita_main_phase = "boot";
+
+void vitaMainPhase(const char* phase)
+{
+    vita_main_phase = phase;
+    vita_main_heartbeat_us = sceKernelGetProcessTimeWide();
+}
+
 // Default pthread stack is 32KB; Bullet's EPA solver alone needs ~30KB.
 // Linker --wrap gives every attr-less thread 256KB instead.
 int __real_pthread_create(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
@@ -175,6 +187,7 @@ namespace
     size_t s_logHead = 0;
     unsigned s_logDropped = 0;
     std::atomic_flag s_logLock = ATOMIC_FLAG_INIT;
+    void logAppend(const char* data, size_t len);
     std::atomic_flag s_logIoLock = ATOMIC_FLAG_INIT;
     std::atomic<bool> s_logThreadStarted{ false };
     char s_logFlushBuf[kLogRingSize];
@@ -184,6 +197,28 @@ namespace
         for (;;)
         {
             sceKernelDelayThread(250 * 1000);
+            // Deadman: the 18-minute session hard-hang left NO crumbs -- a
+            // silent main-thread stop is invisible to every in-frame probe
+            // by construction. This thread outlives a wedged main, so it can
+            // name the phase the freeze died in. Report-only, never aborts;
+            // long load screens legitimately trip it and that is useful data
+            // (the 14.6s Housekeep avalanche would have self-reported).
+            const uint64_t hb = vita_main_heartbeat_us;
+            if (hb != 0)
+            {
+                const uint64_t now = sceKernelGetProcessTimeWide();
+                static uint64_t sLastReport = 0;
+                if (now - hb > 8000000ULL && now - sLastReport > 4000000ULL)
+                {
+                    sLastReport = now;
+                    const char* ph = vita_main_phase;
+                    char db[112];
+                    int n = snprintf(db, sizeof(db), "[Deadman] main silent %us phase=%s\n",
+                        (unsigned)((now - hb) / 1000000ULL), ph ? ph : "?");
+                    if (n > 0)
+                        logAppend(db, (size_t)n);
+                }
+            }
             vitaLogFlushNow();
         }
         return 0;

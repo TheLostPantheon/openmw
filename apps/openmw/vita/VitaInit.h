@@ -12,6 +12,9 @@ void vitaBreadcrumb(const char* msg);
 void vitaLogFlushNow(void);
 void vitaTimedBreadcrumb(const char* msg);
 void vitaMemBreadcrumb(const char* msg);
+// Deadman heartbeat: stamp the phase the main thread is entering. Pass a
+// string LITERAL (the pointer is read from another thread).
+void vitaMainPhase(const char* phase);
 }
 
 namespace Vita

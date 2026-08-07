@@ -63,9 +63,16 @@ RUN mkdir -p /tmp/fc && cd /tmp/fc \
     && unzip -q icu.zip        && mv icu-release-70-1 icu-src \
     && rm -f *.tar.gz *.zip
 
-# Apply Vita compatibility patches to OSG
+# Apply Vita patches to OSG and MyGUI. FETCHCONTENT_SOURCE_DIR_* bypasses
+# FetchContent's own PATCH_COMMAND, so every patch must be applied here.
+# vita-combined.patch is the full pristine->working-tree delta (validated
+# byte-exact); the per-feature osg patches are documentation only.
 COPY patches/osg /tmp/patches/osg
-RUN cd /tmp/fc/osg-src && patch -p1 < /tmp/patches/osg/vita-compat.patch
+COPY patches/mygui /tmp/patches/mygui
+RUN cd /tmp/fc/osg-src \
+    && patch -p1 < /tmp/patches/osg/vita-combined.patch \
+    && cd /tmp/fc/mygui-src \
+    && patch -p1 < /tmp/patches/mygui/vita-gui-dirty.patch
 
 # Build ICU host tools (needed for data filtering during cross-compile)
 RUN cd /tmp/fc/icu-src/icu4c/source \
