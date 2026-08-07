@@ -265,6 +265,7 @@ namespace MWWorld
 
     public:
         void vitaLoadPurge();
+        void vitaLoadRefill();
 
         Scene(MWWorld::World& world, MWRender::RenderingManager& rendering, MWPhysics::PhysicsSystem* physics,
             DetourNavigator::Navigator& navigator);

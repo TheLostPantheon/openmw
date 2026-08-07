@@ -12,6 +12,7 @@
 #include "../mwrender/animation.hpp"
 #include "../mwmechanics/aipackage.hpp"
 #include <components/resource/resourcesystem.hpp>
+#include <malloc.h>
 #define VITA_CRUMB(msg) Vita::breadcrumb(msg)
 #else
 #define VITA_CRUMB(msg)
@@ -316,6 +317,16 @@ void MWState::StateManager::saveGame(std::string_view description, const Slot* s
 
         // Write to a memory stream first. If there is an exception during the save process, we don't want to trash the
         // existing save file we are overwriting.
+#ifdef __vita__
+        // The stream's buffer doublings need CONTIGUOUS space -- a mature
+        // ~6MB save wants 6-12MB in one piece, and a fragmented late-session
+        // heap OOMs with tens of MB nominally free (user report: Day 109,
+        // 5.64MB save, "33MB free" OOM saving without leaving the cell).
+        // Coalesce first; the save screen hides the trim cost.
+        vitaMainPhase("savetrim");
+        MWBase::Environment::get().getResourceSystem()->clearCache();
+        malloc_trim(0);
+#endif
         std::stringstream stream;
 
         ESM::ESMWriter writer;
@@ -725,10 +736,30 @@ void MWState::StateManager::loadGameFromReader(
             {
                 listener.increaseProgress(progressPercent - currentPercent);
                 currentPercent = progressPercent;
+#ifdef __vita__
+                // Mature saves sweep hundreds of visited-cell records into
+                // fresh stores; without a mid-load valve the spike OOMed at
+                // "33MB free" (fragmentation). Same pattern as the cell-load
+                // loop's midload housekeep, paced by save-file progress.
+                if (Vita::getHeapUsedMBFresh() > 190)
+                {
+                    vitaMainPhase("loadtrim");
+                    MWBase::Environment::get().getResourceSystem()->clearCache();
+                    malloc_trim(0);
+                    char lb[64];
+                    snprintf(lb, sizeof(lb), "[LoadTrim] %d%% heap=%dMB", currentPercent,
+                        Vita::getHeapUsedMBFresh());
+                    Vita::breadcrumb(lb);
+                }
+#endif
             }
         }
         mCharacterManager.setCurrentCharacter(character);
 
+#ifdef __vita__
+        // Re-queue the warm pool vitaLoadPurge dropped for load headroom.
+        MWBase::Environment::get().getWorldScene()->vitaLoadRefill();
+#endif
         mState = State_Running;
 
         if (character)

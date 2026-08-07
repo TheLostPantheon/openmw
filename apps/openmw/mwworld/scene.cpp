@@ -2069,10 +2069,22 @@ namespace MWWorld
     {
         // Loads are a fresh world: carry nothing across. Contiguous
         // headroom beats warm refs the destination may invalidate.
+        // The general pool goes too (~21MB): a mature save's StateApply
+        // sweep creates stores for every visited cell and OOMed on top of
+        // the warm-resident baseline (user report, Day-109 save).
+        // vitaLoadRefill() re-queues the pool once the load lands.
         mPreloader->clear();
         mPreloader->vitaDropRegionRefs();
+        mPreloader->vitaDropCommonRefs();
         vitaScreenHousekeeping();
         malloc_trim(0);
+    }
+
+    void Scene::vitaLoadRefill()
+    {
+        // Re-queue the cooked general pool dropped by vitaLoadPurge; the
+        // pump re-warms it async exactly like a fresh boot.
+        mPreloader->vitaBootWarm();
     }
 
     void Scene::insertCellLite(
