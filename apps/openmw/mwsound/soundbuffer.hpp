@@ -87,6 +87,14 @@ namespace MWSound
         // Lookup for a sound by file name, and ensure it's ready for use.
         SoundBuffer* load(VFS::Path::NormalizedView fileName);
 
+        /// Lookup or insert the entry without loading its buffer.
+        SoundBuffer* getOrInsert(const ESM::RefId& soundId);
+
+#ifdef __vita__
+        /// Bookkeeping tail of loadSfx for a worker-decoded buffer.
+        void vitaFinishLoad(SoundBuffer* sfx, Sound_Handle handle, size_t size);
+#endif
+
         void use(SoundBuffer& sfx)
         {
             if (sfx.mUses++ == 0)

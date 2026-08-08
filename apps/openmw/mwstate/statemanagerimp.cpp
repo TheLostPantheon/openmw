@@ -62,6 +62,87 @@
 
 #include "quicksavemanager.hpp"
 
+#ifdef __vita__
+namespace
+{
+    // Seekable RAM stream in fixed chunks: no contiguous growth.
+    class VitaChunkedBuf final : public std::streambuf
+    {
+        static constexpr std::size_t kChunk = 256 * 1024;
+        std::vector<std::unique_ptr<char[]>> mChunks;
+        std::size_t mPos = 0;
+        std::size_t mSize = 0;
+
+        void ensure(std::size_t pos)
+        {
+            while (mChunks.size() * kChunk < pos + 1)
+                mChunks.emplace_back(new char[kChunk]);
+        }
+
+    protected:
+        std::streamsize xsputn(const char* s, std::streamsize n) override
+        {
+            std::size_t left = static_cast<std::size_t>(n);
+            while (left > 0)
+            {
+                ensure(mPos);
+                const std::size_t inChunk = mPos % kChunk;
+                const std::size_t take = std::min(kChunk - inChunk, left);
+                std::memcpy(mChunks[mPos / kChunk].get() + inChunk, s, take);
+                mPos += take;
+                s += take;
+                left -= take;
+            }
+            mSize = std::max(mSize, mPos);
+            return n;
+        }
+
+        int_type overflow(int_type c) override
+        {
+            if (traits_type::eq_int_type(c, traits_type::eof()))
+                return traits_type::not_eof(c);
+            const char ch = traits_type::to_char_type(c);
+            xsputn(&ch, 1);
+            return c;
+        }
+
+        pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) override
+        {
+            if (!(which & std::ios_base::out))
+                return pos_type(off_type(-1));
+            const off_type base = dir == std::ios_base::beg ? 0
+                : dir == std::ios_base::cur               ? static_cast<off_type>(mPos)
+                                                          : static_cast<off_type>(mSize);
+            const off_type target = base + off;
+            if (target < 0 || static_cast<std::size_t>(target) > mSize)
+                return pos_type(off_type(-1));
+            mPos = static_cast<std::size_t>(target);
+            return pos_type(static_cast<off_type>(mPos));
+        }
+
+        pos_type seekpos(pos_type pos, std::ios_base::openmode which) override
+        {
+            return seekoff(static_cast<off_type>(pos), std::ios_base::beg, which);
+        }
+
+    public:
+        bool writeTo(std::ostream& out) const
+        {
+            std::size_t left = mSize;
+            for (const auto& chunk : mChunks)
+            {
+                const std::size_t take = std::min(left, kChunk);
+                out.write(chunk.get(), static_cast<std::streamsize>(take));
+                left -= take;
+                if (left == 0)
+                    break;
+            }
+            return !out.fail();
+        }
+    };
+}
+#endif
+
 void MWState::StateManager::cleanup(bool force)
 {
     if (mState != State_NoGame || force)
@@ -334,8 +415,10 @@ void MWState::StateManager::saveGame(std::string_view description, const Slot* s
                 }
             }
         } vitaTmpGuard{ &vitaTmpPath };
-        // ESMWriter seeks back per record: must be RAM-backed.
-        std::stringstream stream;
+        // RAM-backed for ESMWriter's seeks; chunked because a growing
+        // stringstream doubles contiguously (sv_splice fragmentation OOM).
+        VitaChunkedBuf vitaSaveBuf;
+        std::ostream stream(&vitaSaveBuf);
         vitaMainPhase("savebody");
 #else
         std::stringstream stream;
@@ -427,8 +510,7 @@ void MWState::StateManager::saveGame(std::string_view description, const Slot* s
         vitaMainPhase("savefile");
         {
             std::ofstream tmpOut(vitaTmpPath, std::ios::binary);
-            tmpOut << stream.rdbuf();
-            if (tmpOut.fail())
+            if (!vitaSaveBuf.writeTo(tmpOut))
                 throw std::runtime_error(
                     "Write operation failed (temp save): " + std::generic_category().message(errno));
         }

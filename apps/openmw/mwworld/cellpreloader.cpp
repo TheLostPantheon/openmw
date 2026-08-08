@@ -209,6 +209,29 @@ namespace MWWorld
         Loading::Reporter mLoadingReporter;
     };
 
+#ifdef __vita__
+    // Warms one cell's terrain chunk off-main; the held view pins it in
+    // cache until the deferred prep adopts it.
+    class VitaTerrainCellItem : public SceneUtil::WorkItem
+    {
+    public:
+        VitaTerrainCellItem(Terrain::World* world, int x, int y)
+            : mWorld(world)
+            , mX(x)
+            , mY(y)
+        {
+            mView = world->createView();
+        }
+
+        void doWork() override { mWorld->cacheCell(mView, mX, mY); }
+
+    private:
+        osg::ref_ptr<Terrain::View> mView;
+        Terrain::World* mWorld;
+        int mX, mY;
+    };
+#endif
+
     /// Worker thread item: update the resource system's cache, effectively deleting unused entries.
     class UpdateCacheItem : public SceneUtil::WorkItem
     {
@@ -1070,11 +1093,7 @@ namespace MWWorld
         // while the player moves. Idle gets full batches; movement small.
         if (!mWorkQueue)
             return;
-        static int sPumpCount = 0;
-        if (idle && ++sPumpCount % 60 == 0)
-            vitaSaveModelFreq(); // idle-time persistence
-        if (idle && sPumpCount % 60 == 30)
-            vitaSaveModelBounds();
+        // Persistence writes moved behind screens: 362ms SD write on main.
         // Worker paces to frame health like every other subsystem.
         using PumpClock = std::chrono::steady_clock;
         static PumpClock::time_point sLastPumpT{};
@@ -1366,6 +1385,36 @@ namespace MWWorld
         vitaBootWarm();
 #endif
     }
+
+#ifdef __vita__
+    void CellPreloader::vitaRequestTerrainCell(int x, int y)
+    {
+        if (!mWorkQueue || !mTerrain)
+            return;
+        const std::pair<int, int> key(x, y);
+        if (mVitaTerrainCells.count(key) > 0)
+            return;
+        osg::ref_ptr<SceneUtil::WorkItem> item = new VitaTerrainCellItem(mTerrain, x, y);
+        mVitaTerrainCells[key] = item;
+        mWorkQueue->addWorkItem(item, true);
+    }
+
+    bool CellPreloader::vitaTerrainCellReady(int x, int y) const
+    {
+        const auto it = mVitaTerrainCells.find({ x, y });
+        return it != mVitaTerrainCells.end() && it->second->isDone();
+    }
+
+    void CellPreloader::vitaReleaseTerrainCell(int x, int y)
+    {
+        mVitaTerrainCells.erase({ x, y });
+    }
+
+    void CellPreloader::vitaReleaseAllTerrainCells()
+    {
+        mVitaTerrainCells.clear();
+    }
+#endif
 
     void CellPreloader::syncTerrainLoad(Loading::Listener& listener)
     {

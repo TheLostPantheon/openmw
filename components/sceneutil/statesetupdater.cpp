@@ -23,7 +23,7 @@ namespace SceneUtil
     {
         if (!mStateSetsUpdate[0])
         {
-            for (int i = 0; i < 2; ++i)
+            for (std::size_t i = 0; i < mStateSetsUpdate.size(); ++i)
             {
                 mStateSetsUpdate[i] = new osg::StateSet(*node->getOrCreateStateSet(),
                     osg::CopyOp::SHALLOW_COPY); // Using SHALLOW_COPY for StateAttributes, if users want to modify it is
@@ -32,7 +32,7 @@ namespace SceneUtil
             }
         }
 
-        osg::ref_ptr<osg::StateSet> stateset = mStateSetsUpdate[nv->getTraversalNumber() % 2];
+        osg::ref_ptr<osg::StateSet> stateset = mStateSetsUpdate[nv->getTraversalNumber() % mStateSetsUpdate.size()];
         apply(stateset, nv);
         node->setStateSet(stateset);
         traverse(node, nv);
@@ -72,8 +72,8 @@ namespace SceneUtil
 
     void StateSetUpdater::reset()
     {
-        mStateSetsUpdate[0] = nullptr;
-        mStateSetsUpdate[1] = nullptr;
+        for (auto& stateset : mStateSetsUpdate)
+            stateset = nullptr;
         mStateSetsCull.clear();
     }
 

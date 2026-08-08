@@ -711,6 +711,8 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                     mVitaWorkerUpdateVisitor = new osgUtil::UpdateVisitor;
                 mVitaWorkerUpdateVisitor->reset();
                 mVitaWorkerUpdateVisitor->setFrameStamp(mViewer->getFrameStamp());
+                // Frame-guarded callbacks skip forever on a stuck number.
+                mVitaWorkerUpdateVisitor->setTraversalNumber(mViewer->getFrameStamp()->getFrameNumber());
                 mVitaWorkerUpdateVisitor->setTraversalMask(mVitaWorkerUpdateMask);
                 mViewer->getSceneData()->accept(*mVitaWorkerUpdateVisitor);
                 mVitaWorkerUpdatePending = false;

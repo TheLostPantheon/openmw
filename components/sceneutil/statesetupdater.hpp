@@ -65,7 +65,12 @@ namespace SceneUtil
         void applyUpdate(osg::Node* node, osg::NodeVisitor* nv);
         osg::StateSet* getCvDependentStateset(osgUtil::CullVisitor* cv);
 
+#ifdef __vita__
+        // 3 deep: spike draws outlive the double buffer.
+        std::array<osg::ref_ptr<osg::StateSet>, 3> mStateSetsUpdate;
+#else
         std::array<osg::ref_ptr<osg::StateSet>, 2> mStateSetsUpdate;
+#endif
         std::map<osgUtil::CullVisitor*, osg::ref_ptr<osg::StateSet>> mStateSetsCull;
     };
 

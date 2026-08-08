@@ -1,5 +1,6 @@
 #include "renderingmanager.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 
@@ -502,12 +503,11 @@ namespace MWRender
             mViewer->setIncrementalCompileOperation(new osgUtil::IncrementalCompileOperation);
             mViewer->getIncrementalCompileOperation()->setTargetFrameRate(Settings::cells().mTargetFramerate);
 #ifdef __vita__
-            // Compiling runs inside the GL worker's draw, where OSG's
-            // "time already spent this frame" reads ~0 — so it believed a
-            // whole 33ms frame was free and took it (28-90ms draws).
+            // Runs inside GL draw; OSG's elapsed-time read is ~0 there.
+            // Small cap; reveal-order priority does the real work.
             auto* vitaIco = mViewer->getIncrementalCompileOperation();
             vitaIco->setTargetFrameRate(120.f);
-            vitaIco->setMaximumNumOfObjectsToCompilePerFrame(4);
+            vitaIco->setMaximumNumOfObjectsToCompilePerFrame(2);
             vitaIco->setMinimumTimeAvailableForGLCompileAndDeletePerFrame(0.002);
 #endif
         }

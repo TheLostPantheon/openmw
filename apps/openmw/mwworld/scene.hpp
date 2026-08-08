@@ -24,6 +24,12 @@ namespace osg
     class Vec3f;
     class Stats;
     class Node;
+    class Object;
+}
+
+namespace osgUtil
+{
+    class IncrementalCompileOperation;
 }
 
 namespace ESM
@@ -177,6 +183,7 @@ namespace MWWorld
         void vitaStoreEvictPass(bool pressure);
         void finishPendingCellLoad(PendingCellLoad& pending);
         void vitaFinalizeDeferredCell(CellStore& cell);
+        void vitaPrioritizeLastCompileSet(osgUtil::IncrementalCompileOperation* ico);
         bool vitaCellStreamable(CellStore& cell, const osg::Vec3f& pos, int x, int y);
         int vitaBubbleTick(int maxMs); // returns hydration ops performed
         std::set<CellStore*, std::less<>> mVitaActorDomain;
@@ -186,6 +193,8 @@ namespace MWWorld
         // Lane B targets whose add produced no base node (nothing-roll LEVC,
         // failed add): skip in the actor scan or it respins every tick.
         std::set<const LiveCellRefBase*> mVitaBareAfterAdd;
+        /// Session pins: purge-proof weather textures + particle templates.
+        std::vector<osg::ref_ptr<const osg::Object>> mVitaWeatherPins;
         float vitaCellEdge2(CellStore& cell, const osg::Vec3f& pp);
         // Every model an actor's construction will actually load beyond its
         // base: x-variant mesh + kf, NPC parts/gear, LEVC candidates.

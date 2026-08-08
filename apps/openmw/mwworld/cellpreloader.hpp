@@ -155,6 +155,11 @@ namespace MWWorld
         void vitaStoreCommonRef(const std::string& path, osg::ref_ptr<const osg::Referenced> tmpl,
             osg::ref_ptr<const osg::Referenced> shape, bool regionTarget = false, unsigned epoch = 0);
         bool vitaIsCommonWarm(const std::string& path) const;
+        /// Worker-side terrain chunk warm for one exterior cell.
+        void vitaRequestTerrainCell(int x, int y);
+        bool vitaTerrainCellReady(int x, int y) const;
+        void vitaReleaseTerrainCell(int x, int y);
+        void vitaReleaseAllTerrainCells();
 #endif
 
         void setWorkQueue(osg::ref_ptr<SceneUtil::WorkQueue> workQueue);
@@ -202,6 +207,11 @@ namespace MWWorld
 
         // Cells that are currently being preloaded, or have already finished preloading
         PreloadMap mPreloadCells;
+
+#ifdef __vita__
+        // View pins the chunk so cache purges can't evict it pre-adopt.
+        std::map<std::pair<int, int>, osg::ref_ptr<SceneUtil::WorkItem>> mVitaTerrainCells;
+#endif
 #ifdef __vita__
         std::map<std::string, unsigned> mVitaModelFreq;
         struct VitaCommonRef

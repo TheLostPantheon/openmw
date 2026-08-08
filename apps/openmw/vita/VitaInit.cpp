@@ -1292,6 +1292,11 @@ namespace Vita
         debugLog(buf);
     }
 
+    // vita-elf-create appends SCE data to segment 0; a layout landing
+    // within ~4KB of segment 1 fails ("segment 1 overlaps"). Tail pad
+    // restores room; resize if it recurs.
+    extern "C" const char g_vitaSegmentPad[8192] = { 1 };
+
     void initialize()
     {
         // Force the linker to keep sceUserMainThreadStackSize — it lives in its
@@ -1300,6 +1305,7 @@ namespace Vita
         // with "m" constraint creates an unoptimizable memory reference that
         // makes the linker treat the section as reachable.
         asm volatile("" :: "m"(sceUserMainThreadStackSize));
+        asm volatile("" :: "m"(g_vitaSegmentPad));
 
         // Environment setup (must be after main, not in constructors)
         setenv("TMPDIR", "ux0:data/openmw/cache", 1);
