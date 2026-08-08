@@ -647,8 +647,11 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         const unsigned int fullMask = uv->getTraversalMask();
         uv->setTraversalMask(kHazardMask);
         mViewer->updateTraversal();
-        uv->setTraversalMask(fullMask & ~kHazardMask);
-        mVitaWorkerUpdateMask = fullMask;
+        uv->setTraversalMask(fullMask);
+        // Hazard pass prunes at Mask_Scene, worker prunes at Mask_Sky:
+        // no traversal reaches the sky (black-sky bug). Run it here.
+        mWorld->vitaUpdateSky(*uv);
+        mVitaWorkerUpdateMask = fullMask & ~kHazardMask;
         mVitaWorkerUpdatePending = true;
     }
     else
@@ -704,9 +707,12 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             if (mVitaWorkerUpdatePending)
             {
                 // Non-hazard update callbacks; must precede cull.
-                osgUtil::UpdateVisitor* uv = mViewer->getUpdateVisitor();
-                mViewer->getSceneData()->accept(*uv);
-                uv->setTraversalMask(mVitaWorkerUpdateMask);
+                if (!mVitaWorkerUpdateVisitor)
+                    mVitaWorkerUpdateVisitor = new osgUtil::UpdateVisitor;
+                mVitaWorkerUpdateVisitor->reset();
+                mVitaWorkerUpdateVisitor->setFrameStamp(mViewer->getFrameStamp());
+                mVitaWorkerUpdateVisitor->setTraversalMask(mVitaWorkerUpdateMask);
+                mViewer->getSceneData()->accept(*mVitaWorkerUpdateVisitor);
                 mVitaWorkerUpdatePending = false;
             }
             renderer->cull();

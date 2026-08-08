@@ -26,6 +26,7 @@ namespace osg
 {
     class Group;
     class Stats;
+    class NodeVisitor;
 }
 
 namespace osgViewer
@@ -195,6 +196,8 @@ namespace MWWorld
         void purgeCellRefs(CellStore& store);
         /// Every weather type's cloud texture + particle effect, for warming.
         void vitaWeatherWarmPaths(std::vector<std::string>& out);
+        /// Split update reaches no sky node; run its subtree on main.
+        void vitaUpdateSky(osg::NodeVisitor& nv);
 #endif
 
         // FIXME

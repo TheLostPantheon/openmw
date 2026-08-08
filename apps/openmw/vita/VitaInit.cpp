@@ -62,9 +62,7 @@ __attribute__((used)) extern const char g_vitaSegPad[8192];
 __attribute__((used)) const char g_vitaSegPad[8192] = { 1 };
 unsigned int sceUserMainThreadStackSize = 2 * 1024 * 1024;
 
-// Deadman heartbeat: main stamps once per frame + on phase entry; the log
-// flusher thread reports if it goes silent. Plain volatiles suffice --
-// single writer, monotonic reader, staleness is the signal itself.
+// Single writer; staleness is the signal.
 volatile uint64_t vita_main_heartbeat_us = 0;
 const char* volatile vita_main_phase = "boot";
 
@@ -197,12 +195,7 @@ namespace
         for (;;)
         {
             sceKernelDelayThread(250 * 1000);
-            // Deadman: the 18-minute session hard-hang left NO crumbs -- a
-            // silent main-thread stop is invisible to every in-frame probe
-            // by construction. This thread outlives a wedged main, so it can
-            // name the phase the freeze died in. Report-only, never aborts;
-            // long load screens legitimately trip it and that is useful data
-            // (the 14.6s Housekeep avalanche would have self-reported).
+            // Deadman: names silent main-thread stalls. Report-only.
             const uint64_t hb = vita_main_heartbeat_us;
             if (hb != 0)
             {
@@ -313,14 +306,11 @@ void vitaTimedBreadcrumb(const char* msg)
 
 void vitaMemBreadcrumb(const char* msg)
 {
-    // RAM ring + background flusher like every other crumb. The old
-    // per-line sceIoOpen/Write/Close on ux0 -- twelve times per report
-    // window, each with its own mallinfo() free-list walk -- was the
-    // recurring ~200ms ghost frame no [Worst] bucket could name.
+    // Ring + flusher; per-line SD IO caused ghost stalls.
     static SceUInt64 s_miAt = 0;
     static unsigned s_usedKB = 0, s_freeKB = 0;
     const SceUInt64 now = sceKernelGetProcessTimeWide();
-    if (now - s_miAt > 100000ULL) // one heap walk per dump burst
+    if (now - s_miAt > 100000ULL) // one walk per burst
     {
         struct mallinfo mi = mallinfo();
         s_usedKB = (unsigned int)(mi.uordblks / 1024);
@@ -426,18 +416,19 @@ namespace Vita
     {
         struct mallinfo mi = mallinfo();
         char buf[192];
+        const char* oomPhase = vita_main_phase ? vita_main_phase : "?";
         if (size > 0)
             snprintf(buf, sizeof(buf),
-                "[%s] malloc(%u) failed | used: %uKB | free: %uKB",
-                prefix, static_cast<unsigned>(size),
+                "[%s] malloc(%u) failed phase=%s | used: %uKB | free: %uKB",
+                prefix, static_cast<unsigned>(size), oomPhase,
                 static_cast<unsigned>(mi.uordblks / 1024),
                 static_cast<unsigned>(mi.fordblks / 1024));
         else
             snprintf(buf, sizeof(buf),
-                "[%s] Heap: %uKB used / %uKB free",
+                "[%s] Heap: %uKB used / %uKB free phase=%s",
                 prefix,
                 static_cast<unsigned>(mi.uordblks / 1024),
-                static_cast<unsigned>(mi.fordblks / 1024));
+                static_cast<unsigned>(mi.fordblks / 1024), oomPhase);
 
         breadcrumb(buf);
 
@@ -481,7 +472,12 @@ namespace Vita
         if (s_emergencyReserve)
         {
             releaseEmergencyReserve();
-            breadcrumb("[OOM_RECOVERY] Released 4MB emergency reserve");
+            {
+                char rb[96];
+                snprintf(rb, sizeof(rb), "[OOM_RECOVERY] Released 4MB emergency reserve phase=%s",
+                    vita_main_phase ? vita_main_phase : "?");
+                breadcrumb(rb);
+            }
             vitaLogFlushNow();
             // Return to let operator new retry the allocation
             return;

@@ -115,10 +115,14 @@ namespace MWGui
     double LoadingScreen::getTargetFrameRate() const
     {
         double frameRateLimit = MWBase::Environment::get().getFrameRateLimit();
+        double rate = mTargetFrameRate;
         if (frameRateLimit > 0)
-            return std::min(frameRateLimit, mTargetFrameRate);
-        else
-            return mTargetFrameRate;
+            rate = std::min(frameRateLimit, rate);
+#ifdef __vita__
+        // Draws cost 60-90ms; 5fps bounds overhead, widens ICO budget.
+        rate = std::min(rate, 5.0);
+#endif
+        return rate;
     }
 
     class CopyFramebufferToTextureCallback : public osg::Camera::DrawCallback

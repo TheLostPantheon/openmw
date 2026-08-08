@@ -156,6 +156,7 @@ namespace OMW
         bool mUpdateOverlap = false;
         bool mVitaWorkerUpdatePending = false;
         unsigned int mVitaWorkerUpdateMask = ~0u;
+        osg::ref_ptr<osgUtil::UpdateVisitor> mVitaWorkerUpdateVisitor;
         bool mCullPrimed = false;
 #endif
         std::unique_ptr<L10n::Manager> mL10nManager;

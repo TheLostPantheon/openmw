@@ -738,13 +738,7 @@ namespace MWWorld
                 if (!indoors && Vita::getHeapUsedMB() < getVitaCellBudgetMB() - kVitaWarmGateMB)
                     mPreloader->vitaPumpWarm(idle);
 
-                // Neighborhood-bound the resident cell stores: distant
-                // stores are low-reuse memory better spent on warm assets.
-                // Not idle-gated: eviction is cheap, unlike warming.
-                // NOT exterior-gated either: interiors are where stores
-                // accumulate (the 18-min session piled 207 while the
-                // exterior-only gate locked this out, then one Housekeep
-                // paid 14.6s of teardown under a screen).
+                // Interiors accumulate stores; never gate this on exterior.
                 if (mCurrentCell && mWorld.getWorldModel().vitaCellStoreCount() > 120)
                     vitaStoreEvictPass(false);
             }
@@ -2029,11 +2023,7 @@ namespace MWWorld
 
     void Scene::vitaScreenHousekeeping()
     {
-        // A loading screen is the safe, free moment for deep cleanup:
-        // world draw is quiescent (simFence ran) and the hitch is hidden.
-        // Time-boxed all the same: an unbounded sweep once paid 207 store
-        // teardowns in one 14.6s black screen. The steady evict pass keeps
-        // the pile small; anything past the box waits for the next screen.
+        // Time-boxed: an unbounded sweep once cost 14.6s.
         vitaMainPhase("evict");
         const int beforeMB = Vita::getHeapUsedMBFresh();
         mRendering.flushUnrefQueueImmediate();
@@ -2067,12 +2057,7 @@ namespace MWWorld
 
     void Scene::vitaLoadPurge()
     {
-        // Loads are a fresh world: carry nothing across. Contiguous
-        // headroom beats warm refs the destination may invalidate.
-        // The general pool goes too (~21MB): a mature save's StateApply
-        // sweep creates stores for every visited cell and OOMed on top of
-        // the warm-resident baseline (user report, Day-109 save).
-        // vitaLoadRefill() re-queues the pool once the load lands.
+        // Fresh world: drop everything, general pool included; refill after.
         mPreloader->clear();
         mPreloader->vitaDropRegionRefs();
         mPreloader->vitaDropCommonRefs();
@@ -2085,6 +2070,36 @@ namespace MWWorld
         // Re-queue the cooked general pool dropped by vitaLoadPurge; the
         // pump re-warms it async exactly like a fresh boot.
         mPreloader->vitaBootWarm();
+    }
+
+    void Scene::vitaPostLoadDemote()
+    {
+        // Post-load safety sweep; skip-parse leaves little behind.
+        vitaMainPhase("postload");
+        const int before = (int)mWorld.getWorldModel().vitaCellStoreCount();
+        const int heapBefore = Vita::getHeapUsedMBFresh();
+        const auto protectedCells = vitaProtectedCells();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
+        int ext = 0, inter = 0;
+        while (std::chrono::steady_clock::now() < deadline
+            && mWorld.getWorldModel().vitaCellStoreCount() > 60
+            && mWorld.getWorldModel().vitaEvictOneDistant(protectedCells, mCurrentGridCenter.x(),
+                mCurrentGridCenter.y(), 2, [this](CellStore& store) { mWorld.purgeCellRefs(store); }))
+            ++ext;
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            const int got = (int)mWorld.getWorldModel().vitaEvictInteriors(
+                protectedCells, 8, [this](CellStore& store) { mWorld.purgeCellRefs(store); });
+            if (got == 0)
+                break;
+            inter += got;
+        }
+        mRendering.flushUnrefQueueImmediate();
+        malloc_trim(0);
+        char pb[128];
+        snprintf(pb, sizeof(pb), "[PostLoadDemote] ext=%d int=%d stores %d->%d heap %dMB->%dMB", ext, inter,
+            before, (int)mWorld.getWorldModel().vitaCellStoreCount(), heapBefore, Vita::getHeapUsedMBFresh());
+        Vita::breadcrumb(pb);
     }
 
     void Scene::insertCellLite(

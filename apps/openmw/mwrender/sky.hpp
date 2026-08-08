@@ -50,6 +50,10 @@ namespace MWRender
             Resource::SceneManager* sceneManager, bool enableSkyRTT);
         ~SkyManager();
 
+#ifdef __vita__
+        void vitaAccept(osg::NodeVisitor& nv);
+#endif
+
         void update(float duration);
 
         void setEnabled(bool enabled);
