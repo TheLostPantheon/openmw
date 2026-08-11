@@ -14,6 +14,9 @@
 
 #include <vitaGL.h>
 
+#include <osg/BufferObject>
+#include <osg/Texture>
+
 extern "C"
 {
     extern uint32_t osgprof_mat_us, osgprof_state_us, osgprof_unif_us, osgprof_draw_us, osgprof_leaves;
@@ -65,8 +68,10 @@ namespace MyGUIPlatform
 #include <components/esm3/loadinfo.hpp>
 #include <components/esm3/loadland.hpp>
 #include <components/esm3/loadscpt.hpp>
+#include <components/resource/bulletshapemanager.hpp>
 #include <components/resource/imagemanager.hpp>
 #include <components/resource/keyframemanager.hpp>
+#include <components/resource/niffilemanager.hpp>
 #include <components/resource/objectcache.hpp>
 #include <components/resource/resourcesystem.hpp>
 #include <components/resource/scenemanager.hpp>
@@ -116,8 +121,15 @@ namespace
         {
         }
 
+        void apply(osg::Node& node) override
+        {
+            ++mNodes;
+            traverse(node);
+        }
+
         void apply(osg::Drawable& drawable) override
         {
+            ++mDrawables;
             if (const osg::Geometry* geom = drawable.asGeometry())
             {
                 addArray(geom->getVertexArray());
@@ -137,6 +149,8 @@ namespace
         }
 
         size_t mBytes = 0;
+        size_t mNodes = 0;
+        size_t mDrawables = 0;
 
     private:
         void addArray(const osg::Array* array)
@@ -285,11 +299,40 @@ namespace Vita
         resourceSystem->getKeyframeManager()->getObjectCache()->call(
             [&](const auto&, osg::Object*) { ++keyframeCount; });
 
+        size_t nifCount = 0;
+        resourceSystem->getNifFileManager()->getObjectCache()->call([&](const auto&, osg::Object*) { ++nifCount; });
+
         char buf[256];
         snprintf(buf, sizeof(buf),
-            "[VitaAudit] caches: images=%u (%uKB), sceneTemplates=%u (geom %uKB), keyframes=%u",
+            "[VitaAudit] caches: images=%u (%uKB), sceneTemplates=%u (geom %uKB nodes=%u drw=%u), keyframes=%u, "
+            "nifs=%u",
             (unsigned)imageCount, (unsigned)(imageBytes / 1024), (unsigned)nodeCount,
-            (unsigned)(geomBytes.mBytes / 1024), (unsigned)keyframeCount);
+            (unsigned)(geomBytes.mBytes / 1024), (unsigned)geomBytes.mNodes, (unsigned)geomBytes.mDrawables,
+            (unsigned)keyframeCount, (unsigned)nifCount);
+        auditLog(buf);
+
+        // The unaudited majors: vitaGL pool occupancy + newlib-side use.
+        const auto used = [](vglMemType t) {
+            const size_t total = vglMemTotal(t);
+            return total > 0 ? total - vglMemFree(t) : (size_t)0;
+        };
+        snprintf(buf, sizeof(buf), "[VitaAudit] vgl: ram=%u/%uMB vram=%u/%uMB slow=%u/%uMB ext=%uMB",
+            (unsigned)(used(VGL_MEM_RAM) >> 20), (unsigned)(vglMemTotal(VGL_MEM_RAM) >> 20),
+            (unsigned)(used(VGL_MEM_VRAM) >> 20), (unsigned)(vglMemTotal(VGL_MEM_VRAM) >> 20),
+            (unsigned)(used(VGL_MEM_SLOW) >> 20), (unsigned)(vglMemTotal(VGL_MEM_SLOW) >> 20),
+            (unsigned)(used(VGL_MEM_EXTERNAL) >> 20));
+        auditLog(buf);
+
+    }
+
+    void auditBulletShapes(Resource::BulletShapeManager* shapes)
+    {
+        if (shapes == nullptr)
+            return;
+        size_t n = 0;
+        shapes->getObjectCache()->call([&](const auto&, osg::Object*) { ++n; });
+        char buf[96];
+        snprintf(buf, sizeof(buf), "[VitaAudit] bulletShapes=%u", (unsigned)n);
         auditLog(buf);
     }
 

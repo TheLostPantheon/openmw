@@ -15,6 +15,7 @@
 #include <osg/Texture2D>
 
 #include <MyGUI_Gui.h>
+#include <MyGUI_RenderManager.h>
 #include <MyGUI_ScrollBar.h>
 #include <MyGUI_TextBox.h>
 #include <MyGUI_UString.h>
@@ -278,6 +279,16 @@ namespace MWGui
             // as 4:3
             mSplashImage->setVisible(true);
             mSplashImage->setBackgroundImage(randomSplash, true, Settings::gui().mStretchMenuBackground);
+#ifdef __vita__
+            // 4MB each, cached by name forever: keep one splash resident.
+            if (!mVitaCurSplash.empty() && mVitaCurSplash != randomSplash)
+            {
+                auto& rm = MyGUI::RenderManager::getInstance();
+                if (MyGUI::ITexture* t = rm.getTexture(mVitaCurSplash))
+                    rm.destroyTexture(t);
+            }
+            mVitaCurSplash = randomSplash;
+#endif
         }
         mSceneImage->setBackgroundImage({});
         mSceneImage->setVisible(false);

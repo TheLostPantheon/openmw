@@ -22,7 +22,12 @@
 #include <components/misc/resourcehelpers.hpp>
 #include <components/misc/strings/algorithm.hpp>
 #include <components/misc/strings/lower.hpp>
+#include <components/resource/bulletshape.hpp>
 #include <components/resource/bulletshapemanager.hpp>
+
+#include <BulletCollision/CollisionShapes/btCompoundShape.h>
+
+#include <osg/Geometry>
 #include <components/resource/keyframemanager.hpp>
 #include <components/resource/resourcesystem.hpp>
 #include <components/resource/imagemanager.hpp>
@@ -1087,6 +1092,12 @@ namespace MWWorld
         }
     }
 
+    namespace
+    {
+        // Pool budget is denominated in bytes; entries weighed at admission.
+        constexpr std::size_t kVitaWarmPoolBudget = 32u << 20;
+    }
+
     void CellPreloader::vitaPumpWarm(bool idle)
     {
         // Always-on: the hydrator's cold requests need the worker MOST
@@ -1094,6 +1105,7 @@ namespace MWWorld
         if (!mWorkQueue)
             return;
         // Persistence writes moved behind screens: 362ms SD write on main.
+        vitaEnforcePoolBudget(kVitaWarmPoolBudget, 3);
         // Worker paces to frame health like every other subsystem.
         using PumpClock = std::chrono::steady_clock;
         static PumpClock::time_point sLastPumpT{};
@@ -1165,9 +1177,151 @@ namespace MWWorld
         mWorkQueue->addWorkItem(mVitaCommonItem);
     }
 
+    namespace
+    {
+        class VitaEntryBytesVisitor : public osg::NodeVisitor
+        {
+        public:
+            VitaEntryBytesVisitor()
+                : osg::NodeVisitor(TRAVERSE_ALL_CHILDREN)
+            {
+            }
+
+            void apply(osg::Node& node) override
+            {
+                mBytes += 512;
+                traverse(node);
+            }
+
+            void apply(osg::Drawable& drawable) override
+            {
+                mBytes += 512;
+                if (const osg::Geometry* g = drawable.asGeometry())
+                {
+                    const auto add = [this](const osg::Array* a) {
+                        if (a != nullptr)
+                            mBytes += a->getTotalDataSize();
+                    };
+                    add(g->getVertexArray());
+                    add(g->getNormalArray());
+                    add(g->getColorArray());
+                    for (const auto& tc : g->getTexCoordArrayList())
+                        add(tc.get());
+                    for (const auto& va : g->getVertexAttribArrayList())
+                        add(va.get());
+                    for (const auto& ps : g->getPrimitiveSetList())
+                        if (ps)
+                            mBytes += ps->getTotalDataSize();
+                }
+                traverse(drawable);
+            }
+
+            std::size_t mBytes = 0;
+        };
+
+        std::size_t vitaBtShapeBytes(const btCollisionShape* s)
+        {
+            if (s == nullptr)
+                return 0;
+            if (s->isCompound())
+            {
+                const btCompoundShape* c = static_cast<const btCompoundShape*>(s);
+                std::size_t b = 256;
+                for (int i = 0; i < c->getNumChildShapes(); ++i)
+                    b += vitaBtShapeBytes(c->getChildShape(i));
+                return b;
+            }
+            if (s->getShapeType() == TRIANGLE_MESH_SHAPE_PROXYTYPE)
+            {
+                const btBvhTriangleMeshShape* tm = static_cast<const btBvhTriangleMeshShape*>(s);
+                const btStridingMeshInterface* mi = tm->getMeshInterface();
+                std::size_t b = 256;
+                if (mi != nullptr)
+                    for (int part = 0; part < mi->getNumSubParts(); ++part)
+                    {
+                        const unsigned char* vb = nullptr;
+                        const unsigned char* ib = nullptr;
+                        int nv = 0, vs = 0, is = 0, nf = 0;
+                        PHY_ScalarType vt, it;
+                        mi->getLockedReadOnlyVertexIndexBase(&vb, nv, vt, vs, &ib, is, nf, it, part);
+                        b += (std::size_t)nv * vs + (std::size_t)nf * is + (std::size_t)nf * 32; // + BVH
+                        mi->unLockReadOnlyVertexBase(part);
+                    }
+                return b;
+            }
+            return 128;
+        }
+
+        unsigned vitaEntryBytes(const osg::Referenced* tmpl, const osg::Referenced* shape)
+        {
+            std::size_t b = 0;
+            if (const osg::Node* n = dynamic_cast<const osg::Node*>(tmpl))
+            {
+                VitaEntryBytesVisitor v;
+                const_cast<osg::Node*>(n)->accept(v);
+                b += v.mBytes;
+            }
+            if (const Resource::BulletShape* bs = dynamic_cast<const Resource::BulletShape*>(shape))
+            {
+                b += vitaBtShapeBytes(bs->mCollisionShape.get());
+                b += vitaBtShapeBytes(bs->mAvoidCollisionShape.get());
+            }
+            return (unsigned)std::min<std::size_t>(b, 0xffffffffu);
+        }
+    }
+
+    std::size_t CellPreloader::vitaWarmPoolBytes() const
+    {
+        const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
+        std::size_t total = 0;
+        for (const auto& [p, e] : mVitaCommonSet)
+            total += e.bytes;
+        for (const auto& [p, e] : mVitaRegionSet)
+            total += e.bytes;
+        return total;
+    }
+
+    void CellPreloader::vitaEnforceBudgetLocked(std::size_t targetBytes, int maxEvict)
+    {
+        std::size_t total = 0;
+        for (const auto& [p, e] : mVitaCommonSet)
+            total += e.bytes;
+        for (const auto& [p, e] : mVitaRegionSet)
+            total += e.bytes;
+        int evicted = 0;
+        while (total > targetBytes && evicted < maxEvict)
+        {
+            // Commons yield before the current region's spatial set.
+            auto& pool = !mVitaCommonSet.empty() ? mVitaCommonSet : mVitaRegionSet;
+            if (pool.empty())
+                break;
+            auto worst = pool.begin();
+            double worstScore = 1e30;
+            for (auto it = pool.begin(); it != pool.end(); ++it)
+            {
+                const double score = (double)(it->second.freq + 1) / (double)(it->second.bytes + 4096u);
+                if (score < worstScore)
+                {
+                    worstScore = score;
+                    worst = it;
+                }
+            }
+            total -= worst->second.bytes;
+            pool.erase(worst);
+            ++evicted;
+        }
+    }
+
+    void CellPreloader::vitaEnforcePoolBudget(std::size_t targetBytes, int maxEvict)
+    {
+        const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
+        vitaEnforceBudgetLocked(targetBytes, maxEvict);
+    }
+
     void CellPreloader::vitaStoreCommonRef(const std::string& path, osg::ref_ptr<const osg::Referenced> tmpl,
         osg::ref_ptr<const osg::Referenced> shape, bool regionTarget, unsigned epoch)
     {
+        const unsigned entryBytes = vitaEntryBytes(tmpl.get(), shape.get());
         const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
         if (regionTarget && epoch != mVitaRegionEpoch)
             return; // batch predates a region retarget; drop, not pollute
@@ -1181,6 +1335,7 @@ namespace MWWorld
         }
         VitaCommonRef& entry = regionTarget ? mVitaRegionSet[path] : mVitaCommonSet[path];
         entry.freq = mVitaModelFreq[path];
+        entry.bytes = entryBytes;
         entry.tmpl = std::move(tmpl);
         entry.shape = std::move(shape);
         // Hard cap: the total pool must stay bounded no matter how the
@@ -1196,6 +1351,7 @@ namespace MWWorld
                 break;
             mVitaRegionSet.erase(weakest);
         }
+        vitaEnforceBudgetLocked(kVitaWarmPoolBudget, 2);
     }
 
     bool CellPreloader::vitaIsCommonWarm(const std::string& path) const
@@ -1208,17 +1364,30 @@ namespace MWWorld
         return it != mVitaRegionSet.end() && it->second.tmpl;
     }
 
-    void CellPreloader::vitaRelievePressure()
+    void CellPreloader::vitaRelievePressure(bool desperate)
     {
         vitaMainPhase("relief");
-        // Stepwise relief: stalest biome, then all region refs, then the
-        // general pool only as a last resort. Paced so each step (and the
-        // store eviction that precedes it) can land before the next.
         static std::chrono::steady_clock::time_point sLastRelief{};
         const auto now = std::chrono::steady_clock::now();
         if (sLastRelief.time_since_epoch().count() != 0 && now - sLastRelief < std::chrono::seconds(15))
             return;
         sLastRelief = now;
+        // Pools are byte-bounded now: ordinary pressure shrinks toward a
+        // floor and stops. Empty pools = rewarm churn = fps loss.
+        constexpr std::size_t kFloor = 8u << 20;
+        const std::size_t before = vitaWarmPoolBytes();
+        if (before > kFloor)
+        {
+            vitaEnforcePoolBudget(kFloor, 24);
+            char buf[96];
+            snprintf(buf, sizeof(buf), "[CommonWarm] pressure: pool %uKB -> %uKB", (unsigned)(before / 1024),
+                (unsigned)(vitaWarmPoolBytes() / 1024));
+            Vita::breadcrumb(buf);
+            return;
+        }
+        // Nuclear tiers only when genuinely near the ceiling.
+        if (!desperate)
+            return;
         if (mVitaActiveRegions.size() > 1)
         {
             char buf[112];

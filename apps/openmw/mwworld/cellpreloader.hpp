@@ -150,11 +150,15 @@ namespace MWWorld
         void vitaPumpGrace(int ms);
         std::size_t vitaWarmBacklog() const { return mVitaCommonBacklog.size() + mVitaRegionBacklog.size(); }
         void vitaDropCommonRefs();
-        void vitaRelievePressure();
+        void vitaRelievePressure(bool desperate = false);
         void vitaRebuildRegionTargets();
         void vitaStoreCommonRef(const std::string& path, osg::ref_ptr<const osg::Referenced> tmpl,
             osg::ref_ptr<const osg::Referenced> shape, bool regionTarget = false, unsigned epoch = 0);
         bool vitaIsCommonWarm(const std::string& path) const;
+        /// Total template+shape bytes pinned by the warm pools.
+        std::size_t vitaWarmPoolBytes() const;
+        /// Evict lowest value-per-byte entries until under target.
+        void vitaEnforcePoolBudget(std::size_t targetBytes, int maxEvict);
         /// Worker-side terrain chunk warm for one exterior cell.
         void vitaRequestTerrainCell(int x, int y);
         bool vitaTerrainCellReady(int x, int y) const;
@@ -174,6 +178,9 @@ namespace MWWorld
         void reportStats(unsigned int frameNumber, osg::Stats& stats) const;
 
     private:
+#ifdef __vita__
+        void vitaEnforceBudgetLocked(std::size_t targetBytes, int maxEvict);
+#endif
         void clearAllTasks();
 
         Resource::ResourceSystem* mResourceSystem;
@@ -217,6 +224,7 @@ namespace MWWorld
         struct VitaCommonRef
         {
             unsigned freq = 0;
+            unsigned bytes = 0;
             osg::ref_ptr<const osg::Referenced> tmpl;
             osg::ref_ptr<const osg::Referenced> shape;
         };

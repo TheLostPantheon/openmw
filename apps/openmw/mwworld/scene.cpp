@@ -869,7 +869,7 @@ namespace MWWorld
                     // Still above the gate that disables warming: the pools
                     // must yield, or the loader never runs again.
                     if (afterMB >= budget - kVitaWarmGateMB)
-                        mPreloader->vitaRelievePressure();
+                        mPreloader->vitaRelievePressure(afterMB >= budget - 12);
                 }
                 const auto wdFlush0 = std::chrono::steady_clock::now();
                 // Snapshot what is resident before the flush wipes it.
