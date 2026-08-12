@@ -80,6 +80,7 @@ namespace MWGui
     class SettingsWindow;
     class HUD;
     class WindowBase;
+    class VitaTouchOverlay;
 
     enum ShowInDialogueMode
     {
@@ -389,6 +390,9 @@ namespace MWBase
 
         /// Return the window that should receive controller events
         virtual MWGui::WindowBase* getActiveControllerWindow() = 0;
+#ifdef __vita__
+        virtual MWGui::VitaTouchOverlay* getVitaTouchOverlay() = 0;
+#endif
         /// Return the available height for menus accounting for visible controller overlays
         virtual int getControllerMenuHeight() = 0;
         /// Cycle to the next window to receive controller events

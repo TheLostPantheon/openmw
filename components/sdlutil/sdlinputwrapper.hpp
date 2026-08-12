@@ -85,8 +85,6 @@ namespace SDLUtil
         Uint16 mScaleY;
 
 #ifdef __vita__
-        bool mTouchZoneLeft = false;   // top-left touch zone active
-        bool mTouchZoneRight = false;  // top-right touch zone active
         // Touch drives the MyGUI cursor only when this returns true (GUI mode).
         std::function<bool()> mTouchCursorEnabled;
         SDL_FingerID mCursorFingerId = 0;

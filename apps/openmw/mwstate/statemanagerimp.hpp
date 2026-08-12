@@ -89,8 +89,9 @@ namespace MWState
 
         void loadGame(const Character* character, const std::filesystem::path& filepath) override;
 
-            void loadGameFromReader(
-                const Character* character, const std::filesystem::path& filepath, ESM::ESMReader& reader);
+            /// fileBacked: spans may side-read filepath; memory readers pass false.
+            void loadGameFromReader(const Character* character, const std::filesystem::path& filepath,
+                ESM::ESMReader& reader, bool fileBacked = true);
 #ifdef __vita__
             /// Reload the world from a RAM buffer — no slot, no file. Used to
             /// switch the streaming architecture without a restart.

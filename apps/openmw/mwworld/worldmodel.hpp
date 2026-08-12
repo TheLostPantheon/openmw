@@ -115,11 +115,24 @@ namespace MWWorld
         std::size_t vitaCellStoreCount() const { return mCells.size(); }
         void vitaEvictedStats(std::size_t& ramBytes, int& count) const
         {
-            ramBytes = 0;
+            // At-rest state lives in the session ledger file, not RAM.
+            ramBytes = (std::size_t)mVitaLedgerEnd;
             count = (int)mVitaEvictedState.size();
-            for (const auto& [id, data] : mVitaEvictedState)
-                ramBytes += data.size();
         }
+        /// Load demote: peak one store, not one per cell.
+        void vitaSetLoadDemote(bool v) { mVitaLoadDemote = v; }
+        /// Skip-parse: actor-free records copy file->ledger, never materialize.
+        void vitaBeginFileLoad(const std::string& path) { mVitaLoadFilePath = path; }
+        void vitaEndFileLoad()
+        {
+            mVitaLoadFilePath.clear();
+            if (mVitaLoadFile)
+            {
+                fclose(mVitaLoadFile);
+                mVitaLoadFile = nullptr;
+            }
+        }
+        void vitaNoteRecordStart(std::size_t off) { mVitaRecStart = off; }
         std::size_t vitaEvictInteriors(const std::set<CellStore*, std::less<>>& protectedCells, std::size_t maxCount,
             const std::function<void(CellStore&)>& onEvict);
 #endif
@@ -138,6 +151,7 @@ namespace MWWorld
         bool readRecord(ESM::ESMReader& reader, uint32_t type);
 
     private:
+        bool readCellRecordBody(ESM::ESMReader& reader);
         struct GetCellStoreCallback;
 
         PtrRegistry mPtrRegistry; // defined before mCells because during destruction it should be the last
@@ -150,7 +164,29 @@ namespace MWWorld
         ESM::Cell mDraftCell;
         std::vector<std::pair<ESM::RefId, CellStore*>> mIdCache;
 #ifdef __vita__
-        std::map<ESM::RefId, std::string> mVitaEvictedState;
+        // Session ledger: one append-only file of headerless cell records.
+        struct VitaLedgerSpan
+        {
+            uint64_t mOff;
+            uint32_t mLen;
+        };
+        std::map<ESM::RefId, VitaLedgerSpan> mVitaEvictedState;
+        std::string mVitaLedgerHeader; // TES3 prefix for rehydrate parsing
+        mutable FILE* mVitaLedgerFile = nullptr;
+        uint64_t mVitaLedgerEnd = 0;
+        bool mVitaLoadDemote = false;
+        int mVitaApplyDepth = 0; // >0 = inside a nested rehydrate: demote forbidden
+        std::string mVitaLoadFilePath; // save being loaded (empty = memory load)
+        FILE* mVitaLoadFile = nullptr; // persistent side-read handle
+        std::size_t mVitaRecStart = 0; // file offset of the record being dispatched
+        void vitaLedgerHeaderEnsure();
+        /// True if span holds any ACID subrecord, or is malformed.
+        static bool vitaSpanHasActors(const std::string& span);
+        bool vitaLedgerEnsure() const;
+        bool vitaLedgerAppend(const std::string& data, std::size_t skip, VitaLedgerSpan& out);
+        bool vitaLedgerReadSpan(const VitaLedgerSpan& span, std::string& out) const;
+        /// Serialize store state into the ledger; false = store untouched.
+        bool vitaSerializeToLedger(CellStore& store);
         void vitaApplyBuffer(const std::string& data);
 #endif
         std::size_t mIdCacheIndex = 0;

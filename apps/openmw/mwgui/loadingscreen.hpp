@@ -82,6 +82,9 @@ namespace MWGui
         BackgroundImage* mSceneImage;
 
         std::vector<std::string> mSplashScreens;
+#ifdef __vita__
+        std::string mVitaCurSplash;
+#endif
 
         osg::ref_ptr<osg::Texture2D> mTexture;
         osg::ref_ptr<CopyFramebufferToTextureCallback> mCopyFramebufferToTextureCallback;

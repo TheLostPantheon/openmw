@@ -15,6 +15,7 @@
 #include <osg/Texture2D>
 
 #include <MyGUI_Gui.h>
+#include <MyGUI_RenderManager.h>
 #include <MyGUI_ScrollBar.h>
 #include <MyGUI_TextBox.h>
 #include <MyGUI_UString.h>
@@ -115,10 +116,14 @@ namespace MWGui
     double LoadingScreen::getTargetFrameRate() const
     {
         double frameRateLimit = MWBase::Environment::get().getFrameRateLimit();
+        double rate = mTargetFrameRate;
         if (frameRateLimit > 0)
-            return std::min(frameRateLimit, mTargetFrameRate);
-        else
-            return mTargetFrameRate;
+            rate = std::min(frameRateLimit, rate);
+#ifdef __vita__
+        // Draws cost 60-90ms; 5fps bounds overhead, widens ICO budget.
+        rate = std::min(rate, 5.0);
+#endif
+        return rate;
     }
 
     class CopyFramebufferToTextureCallback : public osg::Camera::DrawCallback
@@ -274,6 +279,16 @@ namespace MWGui
             // as 4:3
             mSplashImage->setVisible(true);
             mSplashImage->setBackgroundImage(randomSplash, true, Settings::gui().mStretchMenuBackground);
+#ifdef __vita__
+            // 4MB each, cached by name forever: keep one splash resident.
+            if (!mVitaCurSplash.empty() && mVitaCurSplash != randomSplash)
+            {
+                auto& rm = MyGUI::RenderManager::getInstance();
+                if (MyGUI::ITexture* t = rm.getTexture(mVitaCurSplash))
+                    rm.destroyTexture(t);
+            }
+            mVitaCurSplash = randomSplash;
+#endif
         }
         mSceneImage->setBackgroundImage({});
         mSceneImage->setVisible(false);

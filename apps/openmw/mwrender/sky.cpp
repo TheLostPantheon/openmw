@@ -235,6 +235,16 @@ namespace
 
 namespace MWRender
 {
+#ifdef __vita__
+    // Split update prunes at Mask_Scene above us and Mask_Sky below;
+    // main updates the sky subtree directly.
+    void SkyManager::vitaAccept(osg::NodeVisitor& nv)
+    {
+        if (mSkyRootNode.valid())
+            mSkyRootNode->accept(nv);
+    }
+#endif
+
     SkyManager::SkyManager(osg::Group* parentNode, osg::Group* rootNode, osg::Camera* camera,
         Resource::SceneManager* sceneManager, bool enableSkyRTT)
         : mSceneManager(sceneManager)

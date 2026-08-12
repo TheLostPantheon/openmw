@@ -19,6 +19,11 @@ namespace ESM
         void apply();
 
         void convert(ESM::RefNum& refNum, int actorId);
+
+        /// Entries reference parsed store fields; see resolveFrom.
+        std::size_t pendingCount() const { return mToConvert.size(); }
+        /// Resolve from idx; false = pending remain, keep store alive.
+        bool resolveFrom(std::size_t idx);
     };
 }
 

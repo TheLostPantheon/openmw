@@ -62,6 +62,87 @@
 
 #include "quicksavemanager.hpp"
 
+#ifdef __vita__
+namespace
+{
+    // Seekable RAM stream in fixed chunks: no contiguous growth.
+    class VitaChunkedBuf final : public std::streambuf
+    {
+        static constexpr std::size_t kChunk = 256 * 1024;
+        std::vector<std::unique_ptr<char[]>> mChunks;
+        std::size_t mPos = 0;
+        std::size_t mSize = 0;
+
+        void ensure(std::size_t pos)
+        {
+            while (mChunks.size() * kChunk < pos + 1)
+                mChunks.emplace_back(new char[kChunk]);
+        }
+
+    protected:
+        std::streamsize xsputn(const char* s, std::streamsize n) override
+        {
+            std::size_t left = static_cast<std::size_t>(n);
+            while (left > 0)
+            {
+                ensure(mPos);
+                const std::size_t inChunk = mPos % kChunk;
+                const std::size_t take = std::min(kChunk - inChunk, left);
+                std::memcpy(mChunks[mPos / kChunk].get() + inChunk, s, take);
+                mPos += take;
+                s += take;
+                left -= take;
+            }
+            mSize = std::max(mSize, mPos);
+            return n;
+        }
+
+        int_type overflow(int_type c) override
+        {
+            if (traits_type::eq_int_type(c, traits_type::eof()))
+                return traits_type::not_eof(c);
+            const char ch = traits_type::to_char_type(c);
+            xsputn(&ch, 1);
+            return c;
+        }
+
+        pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) override
+        {
+            if (!(which & std::ios_base::out))
+                return pos_type(off_type(-1));
+            const off_type base = dir == std::ios_base::beg ? 0
+                : dir == std::ios_base::cur               ? static_cast<off_type>(mPos)
+                                                          : static_cast<off_type>(mSize);
+            const off_type target = base + off;
+            if (target < 0 || static_cast<std::size_t>(target) > mSize)
+                return pos_type(off_type(-1));
+            mPos = static_cast<std::size_t>(target);
+            return pos_type(static_cast<off_type>(mPos));
+        }
+
+        pos_type seekpos(pos_type pos, std::ios_base::openmode which) override
+        {
+            return seekoff(static_cast<off_type>(pos), std::ios_base::beg, which);
+        }
+
+    public:
+        bool writeTo(std::ostream& out) const
+        {
+            std::size_t left = mSize;
+            for (const auto& chunk : mChunks)
+            {
+                const std::size_t take = std::min(left, kChunk);
+                out.write(chunk.get(), static_cast<std::streamsize>(take));
+                left -= take;
+                if (left == 0)
+                    break;
+            }
+            return !out.fail();
+        }
+    };
+}
+#endif
+
 void MWState::StateManager::cleanup(bool force)
 {
     if (mState != State_NoGame || force)
@@ -318,16 +399,30 @@ void MWState::StateManager::saveGame(std::string_view description, const Slot* s
         // Write to a memory stream first. If there is an exception during the save process, we don't want to trash the
         // existing save file we are overwriting.
 #ifdef __vita__
-        // The stream's buffer doublings need CONTIGUOUS space -- a mature
-        // ~6MB save wants 6-12MB in one piece, and a fragmented late-session
-        // heap OOMs with tens of MB nominally free (user report: Day 109,
-        // 5.64MB save, "33MB free" OOM saving without leaving the cell).
-        // Coalesce first; the save screen hides the trim cost.
-        vitaMainPhase("savetrim");
-        MWBase::Environment::get().getResourceSystem()->clearCache();
-        malloc_trim(0);
-#endif
+        // Write tmp, rename on success; old save never trashed.
+        std::filesystem::path vitaTmpPath = slot->mPath;
+        vitaTmpPath += ".tmp";
+        struct VitaTmpGuard
+        {
+            const std::filesystem::path* mPath{};
+            bool mKeep = false;
+            ~VitaTmpGuard()
+            {
+                if (mPath && !mKeep)
+                {
+                    std::error_code ec;
+                    std::filesystem::remove(*mPath, ec);
+                }
+            }
+        } vitaTmpGuard{ &vitaTmpPath };
+        // RAM-backed for ESMWriter's seeks; chunked because a growing
+        // stringstream doubles contiguously (sv_splice fragmentation OOM).
+        VitaChunkedBuf vitaSaveBuf;
+        std::ostream stream(&vitaSaveBuf);
+        vitaMainPhase("savebody");
+#else
         std::stringstream stream;
+#endif
 
         ESM::ESMWriter writer;
 
@@ -362,19 +457,41 @@ void MWState::StateManager::saveGame(std::string_view description, const Slot* s
 
         Loading::ScopedLoad load(&listener);
 
+#ifdef __vita__
+        // Trim under screen; screenshot must capture the game, not it.
+        {
+            vitaMainPhase("savetrim");
+            const int stBefore = Vita::getHeapUsedMBFresh();
+            MWBase::Environment::get().getResourceSystem()->clearCache();
+            malloc_trim(0);
+            char stb[80];
+            snprintf(stb, sizeof(stb), "[SaveTrim] %dMB->%dMB", stBefore, Vita::getHeapUsedMBFresh());
+            Vita::breadcrumb(stb);
+            vitaMainPhase("savebody");
+        }
+#endif
+
         writer.startRecord(ESM::REC_SAVE);
         slot->mProfile.save(writer);
         writer.endRecord(ESM::REC_SAVE);
 
+        vitaMainPhase("sv_journal");
         MWBase::Environment::get().getJournal()->write(writer, listener);
+        vitaMainPhase("sv_dialog");
         MWBase::Environment::get().getDialogueManager()->write(writer, listener);
         // LuaManager::write should be called before World::write because world also saves
         // local scripts that depend on LuaManager.
+        vitaMainPhase("sv_lua");
         MWBase::Environment::get().getLuaManager()->write(writer, listener);
+        vitaMainPhase("sv_world");
         MWBase::Environment::get().getWorld()->write(writer, listener);
+        vitaMainPhase("sv_scripts");
         MWBase::Environment::get().getScriptManager()->getGlobalScripts().write(writer, listener);
+        vitaMainPhase("sv_mech");
         MWBase::Environment::get().getMechanicsManager()->write(writer, listener);
+        vitaMainPhase("sv_input");
         MWBase::Environment::get().getInputManager()->write(writer, listener);
+        vitaMainPhase("sv_wm");
         MWBase::Environment::get().getWindowManager()->write(writer, listener);
 
         // Ensure we have written the number of records that was estimated
@@ -382,18 +499,34 @@ void MWState::StateManager::saveGame(std::string_view description, const Slot* s
             Log(Debug::Warning) << "Warning: number of written savegame records does not match. Estimated: "
                                 << recordCount + 1 << ", written: " << writer.getRecordCount();
 
+        vitaMainPhase("sv_close");
         writer.close();
 
         if (stream.fail())
             throw std::runtime_error(
                 "Write operation failed (memory stream): " + std::generic_category().message(errno));
 
+#ifdef __vita__
+        vitaMainPhase("savefile");
+        {
+            std::ofstream tmpOut(vitaTmpPath, std::ios::binary);
+            if (!vitaSaveBuf.writeTo(tmpOut))
+                throw std::runtime_error(
+                    "Write operation failed (temp save): " + std::generic_category().message(errno));
+        }
+        // Tmp is authoritative once written; keep even if rename fails.
+        vitaTmpGuard.mKeep = true;
+        std::error_code vitaRmEc;
+        std::filesystem::remove(slot->mPath, vitaRmEc); // FAT: no atomic replace
+        std::filesystem::rename(vitaTmpPath, slot->mPath);
+#else
         // All good, write to file
         std::ofstream filestream(slot->mPath, std::ios::binary);
         filestream << stream.rdbuf();
 
         if (filestream.fail())
             throw std::runtime_error("Write operation failed (file stream): " + std::generic_category().message(errno));
+#endif
 
         Settings::saves().mCharacter.set(Files::pathToUnicodeString(slot->mPath.parent_path().filename()));
         mLastSavegame = slot->mPath;
@@ -585,21 +718,16 @@ void MWState::StateManager::loadGameFromMemory(std::string&& data)
 {
     ESM::ESMReader reader;
     reader.open(std::make_unique<std::istringstream>(std::move(data)), "memory:modeswitch");
-    loadGameFromReader(getCurrentCharacter(), mLastSavegame, reader);
+    loadGameFromReader(getCurrentCharacter(), mLastSavegame, reader, /*fileBacked*/ false);
 }
 #endif
 
 void MWState::StateManager::loadGameFromReader(
-    const Character* character, const std::filesystem::path& filepath, ESM::ESMReader& reader)
+    const Character* character, const std::filesystem::path& filepath, ESM::ESMReader& reader, bool fileBacked)
 {
     try
     {
         cleanup();
-
-#ifdef __vita__
-        MWBase::Environment::get().getWorldScene()->vitaLoadPurge();
-        Vita::logMemoryStatus("Pre-save-load");
-#endif
 
         Log(Debug::Info) << "Reading save file " << filepath.filename();
 
@@ -625,12 +753,28 @@ void MWState::StateManager::loadGameFromReader(
 
         Loading::ScopedLoad load(&listener);
 
+#ifdef __vita__
+        // Under the screen: the purge can take seconds.
+        MWBase::Environment::get().getWorldScene()->vitaLoadPurge();
+        Vita::logMemoryStatus("Pre-save-load");
+#endif
+
         bool firstPersonCam = false;
 
         size_t total = reader.getFileSize();
         int currentPercent = 0;
+#ifdef __vita__
+        // Peak one store, not one per visited cell.
+        MWBase::Environment::get().getWorldModel()->vitaSetLoadDemote(true);
+        // Old formats must parse (migrate); spans splice verbatim.
+        if (fileBacked && reader.getFormatVersion() == ESM::CurrentSaveGameFormatVersion)
+            MWBase::Environment::get().getWorldModel()->vitaBeginFileLoad(filepath.string());
+#endif
         while (reader.hasMoreRecs())
         {
+#ifdef __vita__
+            MWBase::Environment::get().getWorldModel()->vitaNoteRecordStart((std::size_t)reader.getFileOffset());
+#endif
             ESM::NAME n = reader.getRecName();
             reader.getRecHeader();
 
@@ -737,10 +881,7 @@ void MWState::StateManager::loadGameFromReader(
                 listener.increaseProgress(progressPercent - currentPercent);
                 currentPercent = progressPercent;
 #ifdef __vita__
-                // Mature saves sweep hundreds of visited-cell records into
-                // fresh stores; without a mid-load valve the spike OOMed at
-                // "33MB free" (fragmentation). Same pattern as the cell-load
-                // loop's midload housekeep, paced by save-file progress.
+                // Mid-load spike valve; mirrors midload housekeep.
                 if (Vita::getHeapUsedMBFresh() > 190)
                 {
                     vitaMainPhase("loadtrim");
@@ -757,10 +898,15 @@ void MWState::StateManager::loadGameFromReader(
         mCharacterManager.setCurrentCharacter(character);
 
 #ifdef __vita__
+        MWBase::Environment::get().getWorldModel()->vitaSetLoadDemote(false);
+        MWBase::Environment::get().getWorldModel()->vitaEndFileLoad();
         // Re-queue the warm pool vitaLoadPurge dropped for load headroom.
         MWBase::Environment::get().getWorldScene()->vitaLoadRefill();
 #endif
         mState = State_Running;
+#ifdef __vita__
+        MWBase::Environment::get().getInputManager()->vitaShowTouchIntro();
+#endif
 
         if (character)
             Settings::saves().mCharacter.set(Files::pathToUnicodeString(character->getPath().filename()));
@@ -821,6 +967,11 @@ void MWState::StateManager::loadGameFromReader(
             if (mapped != actorIdConverter.mMappings.end())
                 MWBase::Environment::get().getMechanicsManager()->cleanupSummonedCreature(mapped->second);
         }
+
+#ifdef __vita__
+        // Safety sweep for anything skip-parse pinned.
+        MWBase::Environment::get().getWorldScene()->vitaPostLoadDemote();
+#endif
     }
     catch (const SaveVersionTooNewError& e)
     {

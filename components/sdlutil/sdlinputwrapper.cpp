@@ -332,30 +332,16 @@ namespace SDLUtil
                     {
                         const bool guiMode = mTouchCursorEnabled && mTouchCursorEnabled();
 
-                        // Zones only fire in gameplay so top-corner menu items stay clickable.
-                        if (!guiMode && evt.type != SDL_FINGERMOTION && mConListener)
+                        // App-level touch zones consume these (device 0 = front).
+                        if (mConListener)
                         {
-                            const bool isLeftZone = (evt.tfinger.x < 0.25f && evt.tfinger.y < 0.2f);
-                            const bool isRightZone = (evt.tfinger.x > 0.75f && evt.tfinger.y < 0.2f);
-                            if (isLeftZone || isRightZone)
-                            {
-                                bool pressed = (evt.type == SDL_FINGERDOWN);
-                                bool& state = isLeftZone ? mTouchZoneLeft : mTouchZoneRight;
-                                if (pressed != state)
-                                {
-                                    state = pressed;
-                                    SDL_ControllerButtonEvent btnEvt = {};
-                                    btnEvt.type = pressed ? SDL_CONTROLLERBUTTONDOWN : SDL_CONTROLLERBUTTONUP;
-                                    btnEvt.button = isLeftZone ? SDL_CONTROLLER_BUTTON_LEFTSTICK
-                                                               : SDL_CONTROLLER_BUTTON_RIGHTSTICK;
-                                    btnEvt.state = pressed ? SDL_PRESSED : SDL_RELEASED;
-                                    if (pressed)
-                                        mConListener->buttonPressed(1, btnEvt);
-                                    else
-                                        mConListener->buttonReleased(1, btnEvt);
-                                }
-                                break;
-                            }
+                            const SDLUtil::TouchEvent te(evt.tfinger, 0);
+                            if (evt.type == SDL_FINGERDOWN)
+                                mConListener->touchpadPressed(0, te);
+                            else if (evt.type == SDL_FINGERUP)
+                                mConListener->touchpadReleased(0, te);
+                            else
+                                mConListener->touchpadMoved(0, te);
                         }
 
                         // GUI mode: touch is absolute cursor position + click/drag.

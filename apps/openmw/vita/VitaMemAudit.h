@@ -12,6 +12,7 @@ namespace MWWorld
 namespace Resource
 {
     class ResourceSystem;
+    class BulletShapeManager;
 }
 
 namespace osgViewer
@@ -31,6 +32,7 @@ namespace Vita
 
     // Resource cache entry counts and byte estimates.
     void auditResourceCaches(Resource::ResourceSystem* resourceSystem);
+    void auditBulletShapes(Resource::BulletShapeManager* shapes);
 
     // Frame-phase and visible-scene stats, reported every ~5s. Call per frame.
     void auditFrameStats(osgViewer::Viewer& viewer);

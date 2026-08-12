@@ -93,6 +93,7 @@
 #include "../mwrender/npcanimation.hpp"
 #include "../mwrender/postprocessor.hpp"
 #include "../mwrender/renderingmanager.hpp"
+#include "../mwrender/sky.hpp"
 #include "../mwrender/vismask.hpp"
 
 #include "../mwscript/globalscripts.hpp"
@@ -1860,6 +1861,12 @@ namespace MWWorld
             if (!w.mParticleEffect.empty())
                 out.push_back(VFS::Path::toNormalized(w.mParticleEffect).value());
         }
+    }
+
+    void World::vitaUpdateSky(osg::NodeVisitor& nv)
+    {
+        if (mRendering && mRendering->getSkyManager())
+            mRendering->getSkyManager()->vitaAccept(nv);
     }
 #endif
 

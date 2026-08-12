@@ -10,6 +10,7 @@
 
 #include <components/debug/debuglog.hpp>
 #include <components/esm/defs.hpp>
+#include <components/esm3/actoridconverter.hpp>
 #include <components/esm3/cellid.hpp>
 #include <components/esm3/cellref.hpp>
 #include <components/esm3/cellstate.hpp>
@@ -18,29 +19,12 @@
 #include <components/esm3/formatversion.hpp>
 
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <sstream>
 
 namespace
 {
-    std::string vitaEvictPath(const ESM::RefId& id)
-    {
-        std::string name = id.toDebugString();
-        for (char& c : name)
-            if (!std::isalnum((unsigned char)c))
-                c = '_';
-        return "ux0:data/openmw/cache/evict/" + name + ".bin";
-    }
-
-    bool vitaSpillWrite(const std::string& path, const std::string& data)
-    {
-        FILE* f = fopen(path.c_str(), "wb");
-        if (!f)
-            return false;
-        const bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
-        fclose(f);
-        return ok;
-    }
-
     const std::string& vitaObjectIndexBlob();
     bool vitaSpillRead(const std::string& path, std::string& out)
     {
@@ -227,10 +211,15 @@ void MWWorld::WorldModel::clear()
     std::fill(mIdCache.begin(), mIdCache.end(), std::make_pair(ESM::RefId(), (MWWorld::CellStore*)nullptr));
     mIdCacheIndex = 0;
 #ifdef __vita__
-    for (const auto& [id, data] : mVitaEvictedState)
-        if (data.empty())
-            std::remove(vitaEvictPath(id).c_str());
     mVitaEvictedState.clear();
+    if (mVitaLedgerFile)
+    {
+        fclose(mVitaLedgerFile);
+        mVitaLedgerFile = nullptr;
+    }
+    std::remove("ux0:data/openmw/cache/session_ledger.bin");
+    mVitaLedgerEnd = 0;
+    mVitaLoadDemote = false;
 #endif
 }
 
@@ -635,18 +624,8 @@ bool MWWorld::WorldModel::vitaEvictOneDistant(const std::set<CellStore*, std::le
     CellStore* mut = const_cast<CellStore*>(victim);
     if (victimNeedsState)
     {
-        std::stringstream ss;
-        ESM::ESMWriter writer;
-        writer.setFormatVersion(ESM::CurrentSaveGameFormatVersion);
-        writer.save(ss);
-        writeCell(writer, *mut);
-        writer.close();
-        std::string data = std::move(ss).str();
-        const ESM::RefId id = mut->getCell()->getId();
-        if (vitaSpillWrite(vitaEvictPath(id), data))
-            mVitaEvictedState[id] = std::string(); // spilled: empty marker
-        else
-            mVitaEvictedState[id] = std::move(data);
+        if (!vitaSerializeToLedger(*mut))
+            return false; // ledger unavailable: keep the store resident
     }
     if (onEvict)
         onEvict(*mut);
@@ -657,6 +636,17 @@ bool MWWorld::WorldModel::vitaEvictOneDistant(const std::set<CellStore*, std::le
 
 void MWWorld::WorldModel::vitaApplyBuffer(const std::string& data)
 {
+    // Nested rehydrate must never demote: outer frames hold pointers.
+    struct DepthGuard
+    {
+        int& mDepth;
+        DepthGuard(int& d)
+            : mDepth(d)
+        {
+            ++mDepth;
+        }
+        ~DepthGuard() { --mDepth; }
+    } depthGuard{ mVitaApplyDepth };
     ESM::ESMReader reader;
     reader.open(std::make_unique<std::istringstream>(data), "vita-evicted-state");
     while (reader.hasMoreRecs())
@@ -667,19 +657,111 @@ void MWWorld::WorldModel::vitaApplyBuffer(const std::string& data)
     }
 }
 
+bool MWWorld::WorldModel::vitaLedgerEnsure() const
+{
+    if (mVitaLedgerFile)
+        return true;
+    mVitaLedgerFile = fopen("ux0:data/openmw/cache/session_ledger.bin", "w+b");
+    if (mVitaLedgerFile)
+        setvbuf(mVitaLedgerFile, nullptr, _IONBF, 0); // buffering wastes seeky reads
+    return mVitaLedgerFile != nullptr;
+}
+
+bool MWWorld::WorldModel::vitaLedgerAppend(const std::string& data, std::size_t skip, VitaLedgerSpan& out)
+{
+    if (data.size() <= skip || !vitaLedgerEnsure())
+        return false;
+    const std::size_t len = data.size() - skip;
+    if (fseek(mVitaLedgerFile, (long)mVitaLedgerEnd, SEEK_SET) != 0)
+        return false;
+    if (fwrite(data.data() + skip, 1, len, mVitaLedgerFile) != len)
+        return false;
+    fflush(mVitaLedgerFile);
+    out.mOff = mVitaLedgerEnd;
+    out.mLen = (uint32_t)len;
+    mVitaLedgerEnd += len;
+    return true;
+}
+
+bool MWWorld::WorldModel::vitaLedgerReadSpan(const VitaLedgerSpan& span, std::string& out) const
+{
+    if (!vitaLedgerEnsure())
+        return false;
+    out.resize(span.mLen);
+    if (fseek(mVitaLedgerFile, (long)span.mOff, SEEK_SET) != 0)
+        return false;
+    return fread(out.data(), 1, span.mLen, mVitaLedgerFile) == span.mLen;
+}
+
+void MWWorld::WorldModel::vitaLedgerHeaderEnsure()
+{
+    if (!mVitaLedgerHeader.empty())
+        return;
+    // Fixed length per config; readers ignore the count field.
+    std::stringstream hs;
+    ESM::ESMWriter hw;
+    hw.setFormatVersion(ESM::CurrentSaveGameFormatVersion);
+    hw.save(hs);
+    hw.close();
+    mVitaLedgerHeader = std::move(hs).str();
+}
+
+bool MWWorld::WorldModel::vitaSerializeToLedger(CellStore& store)
+{
+    std::stringstream ss;
+    ESM::ESMWriter writer;
+    writer.setFormatVersion(ESM::CurrentSaveGameFormatVersion);
+    writer.save(ss);
+    writeCell(writer, store);
+    writer.close();
+    std::string data = std::move(ss).str();
+    vitaLedgerHeaderEnsure();
+    VitaLedgerSpan span;
+    if (!vitaLedgerAppend(data, mVitaLedgerHeader.size(), span))
+        return false;
+    mVitaEvictedState[store.getCell()->getId()] = span;
+    return true;
+}
+
+bool MWWorld::WorldModel::vitaSpanHasActors(const std::string& span)
+{
+    // Flat name4+size4 walk; malformed reads as "has actors".
+    if (span.size() < 16)
+        return true;
+    std::size_t off = 16;
+    while (off + 8 <= span.size())
+    {
+        const char* name = span.data() + off;
+        uint32_t size;
+        std::memcpy(&size, span.data() + off + 4, 4);
+        if (off + 8 + size > span.size())
+            return true; // malformed: be conservative
+        if (std::memcmp(name, "ACID", 4) == 0)
+            return true;
+        off += 8 + size;
+    }
+    return off != span.size();
+}
+
 bool MWWorld::WorldModel::vitaApplyEvictedState(const ESM::RefId& id)
 {
     const auto it = mVitaEvictedState.find(id);
     if (it == mVitaEvictedState.end())
         return false;
-    std::string data = std::move(it->second);
+    const VitaLedgerSpan span = it->second;
     mVitaEvictedState.erase(it);
-    if (data.empty())
+    std::string payload;
+    if (!vitaLedgerReadSpan(span, payload))
     {
-        if (!vitaSpillRead(vitaEvictPath(id), data))
-            return false;
-        std::remove(vitaEvictPath(id).c_str());
+        char lb[96];
+        snprintf(lb, sizeof(lb), "[Ledger] READ FAIL %s", id.toDebugString().c_str());
+        Vita::breadcrumb(lb);
+        return false;
     }
+    std::string data;
+    data.reserve(mVitaLedgerHeader.size() + payload.size());
+    data += mVitaLedgerHeader;
+    data += payload;
     const auto sa0 = std::chrono::steady_clock::now();
     vitaApplyBuffer(data);
     const int saMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -727,18 +809,11 @@ std::size_t MWWorld::WorldModel::vitaEvictInteriors(const std::set<CellStore*, s
         }
         if (!safe)
         {
-            std::stringstream ss;
-            ESM::ESMWriter writer;
-            writer.setFormatVersion(ESM::CurrentSaveGameFormatVersion);
-            writer.save(ss);
-            writeCell(writer, *store);
-            writer.close();
-            std::string data = std::move(ss).str();
-            const ESM::RefId iid = store->getCell()->getId();
-            if (vitaSpillWrite(vitaEvictPath(iid), data))
-                mVitaEvictedState[iid] = std::string();
-            else
-                mVitaEvictedState[iid] = std::move(data);
+            if (!vitaSerializeToLedger(*store))
+            {
+                ++it;
+                continue; // ledger unavailable: keep the store resident
+            }
         }
         if (onEvict)
             onEvict(*store);
@@ -846,22 +921,28 @@ void MWWorld::WorldModel::write(ESM::ESMWriter& writer, Loading::Listener& progr
             progress.increaseProgress();
         }
 #ifdef __vita__
-    // Evicted-with-state cells: restore through the guarded path, write,
-    // leave resident; the valve reclaims later. Only guarded evictors may
-    // destroy stores. Snapshot ids: applies can cascade into this map.
-    WorldModel* self = const_cast<WorldModel*>(this);
-    std::vector<ESM::RefId> evictedIds;
-    evictedIds.reserve(self->mVitaEvictedState.size());
-    for (const auto& [id, data] : self->mVitaEvictedState)
-        evictedIds.push_back(id);
-    for (const ESM::RefId& id : evictedIds)
+    // Splice evicted cells verbatim, offset-ordered; never rehydrate.
+    vitaMainPhase("sv_splice");
+    std::vector<std::pair<VitaLedgerSpan, ESM::RefId>> spliceOrder;
+    spliceOrder.reserve(mVitaEvictedState.size());
+    for (const auto& [id, span] : mVitaEvictedState)
+        spliceOrder.push_back({ span, id });
+    std::sort(spliceOrder.begin(), spliceOrder.end(),
+        [](const auto& a, const auto& b) { return a.first.mOff < b.first.mOff; });
+    std::string payload;
+    unsigned spliced = 0;
+    for (const auto& [span, id] : spliceOrder)
     {
-        self->vitaApplyEvictedState(id); // no-op if a cascade consumed it
-        CellStore* cs = self->findCell(id, false);
-        if (cs == nullptr || !cs->hasState())
+        if (!vitaLedgerReadSpan(span, payload))
+        {
+            char wb[96];
+            snprintf(wb, sizeof(wb), "[SaveSplice] ledger read fail %s", id.toDebugString().c_str());
+            Vita::breadcrumb(wb);
             continue;
-        writeCell(writer, *cs);
-        progress.increaseProgress();
+        }
+        writer.write(payload.data(), payload.size());
+        if ((++spliced & 31) == 0)
+            progress.increaseProgress(32); // each tick may render a frame
     }
 #endif
 }
@@ -892,8 +973,97 @@ bool MWWorld::WorldModel::readRecord(ESM::ESMReader& reader, uint32_t type)
 {
     if (type == ESM::REC_CSTA)
     {
-        ESM::CellState state;
-        state.mId = reader.getCellId();
+#ifdef __vita__
+        // Actor-free: raw span to ledger. Actor-bearing: parse from span.
+        if (mVitaLoadDemote && mVitaApplyDepth == 0 && !mVitaLoadFilePath.empty())
+        {
+            const std::size_t spanStart = mVitaRecStart;
+            reader.skipRecord();
+            const std::size_t spanEnd = (std::size_t)reader.getFileOffset();
+            std::string span;
+            bool ok = spanEnd > spanStart;
+            if (ok)
+            {
+                span.resize(spanEnd - spanStart);
+                if (!mVitaLoadFile)
+                {
+                    mVitaLoadFile = fopen(mVitaLoadFilePath.c_str(), "rb");
+                    if (mVitaLoadFile)
+                        setvbuf(mVitaLoadFile, nullptr, _IONBF, 0);
+                }
+                ok = mVitaLoadFile && fseek(mVitaLoadFile, (long)spanStart, SEEK_SET) == 0
+                    && fread(span.data(), 1, span.size(), mVitaLoadFile) == span.size();
+            }
+            if (!ok)
+            {
+                char eb[112];
+                snprintf(eb, sizeof(eb), "[SpanLoad] SIDE-READ FAIL off=%u len=%u", (unsigned)spanStart,
+                    (unsigned)(spanEnd - spanStart));
+                Vita::breadcrumb(eb);
+                return true; // loud loss beats silent corruption
+            }
+            vitaLedgerHeaderEnsure();
+            if (!vitaSpanHasActors(span))
+            {
+                ESM::RefId spanId;
+                try
+                {
+                    std::string buf;
+                    buf.reserve(mVitaLedgerHeader.size() + span.size());
+                    buf += mVitaLedgerHeader;
+                    buf += span;
+                    ESM::ESMReader sr;
+                    sr.open(std::make_unique<std::istringstream>(std::move(buf)), "vita-span-id");
+                    const ESM::NAME n = sr.getRecName();
+                    sr.getRecHeader();
+                    if (n.toInt() == ESM::REC_CSTA)
+                        spanId = sr.getCellId();
+                }
+                catch (const std::exception&)
+                {
+                    spanId = ESM::RefId();
+                }
+                VitaLedgerSpan ls;
+                if (!spanId.empty() && vitaLedgerAppend(span, 0, ls))
+                {
+                    mVitaEvictedState[spanId] = ls;
+                    return true;
+                }
+                // fall through to span-parse on any anomaly
+            }
+            try
+            {
+                std::string buf;
+                buf.reserve(mVitaLedgerHeader.size() + span.size());
+                buf += mVitaLedgerHeader;
+                buf += span;
+                ESM::ESMReader sr;
+                sr.open(std::make_unique<std::istringstream>(std::move(buf)), "vita-span-parse");
+                sr.mActorIdConverter = reader.mActorIdConverter;
+                const ESM::NAME n = sr.getRecName();
+                sr.getRecHeader();
+                if (n.toInt() == ESM::REC_CSTA)
+                    readCellRecordBody(sr);
+            }
+            catch (const std::exception& e)
+            {
+                char eb[128];
+                snprintf(eb, sizeof(eb), "[SpanLoad] span-parse fail: %.90s", e.what());
+                Vita::breadcrumb(eb);
+            }
+            return true;
+        }
+#endif
+        return readCellRecordBody(reader);
+    }
+
+    return false;
+}
+
+bool MWWorld::WorldModel::readCellRecordBody(ESM::ESMReader& reader)
+{
+    ESM::CellState state;
+    state.mId = reader.getCellId();
 
         GetCellStoreCallback callback(*this);
 
@@ -906,6 +1076,11 @@ bool MWWorld::WorldModel::readRecord(ESM::ESMReader& reader, uint32_t type)
             return true;
         }
 
+#ifdef __vita__
+        // Converter entries reference this store's parsed data.
+        ESM::ActorIdConverter* const vitaConv = reader.mActorIdConverter;
+        const std::size_t vitaPend0 = vitaConv ? vitaConv->pendingCount() : 0;
+#endif
         state.load(reader);
         cellStore->loadState(state);
 
@@ -917,8 +1092,33 @@ bool MWWorld::WorldModel::readRecord(ESM::ESMReader& reader, uint32_t type)
 
         cellStore->readReferences(reader, &callback);
 
-        return true;
-    }
+#ifdef __vita__
+        // Demote after parse; same guards as the interior evictor.
+        if (mVitaLoadDemote && mVitaApplyDepth == 0)
+        {
+            std::string why;
+            const bool safe = cellStore->isSafeToEvict(&why);
+            bool pinned = false;
+            if (!safe && (why == "cellState" || why == "movedRefs"))
+                pinned = true;
+            // Forward actor refs pin the store until apply().
+            if (!pinned && vitaConv && !vitaConv->resolveFrom(vitaPend0))
+                pinned = true;
+            if (!pinned)
+                for (const auto& [cachedId, cachedCell] : mIdCache)
+                    if (cachedCell == cellStore)
+                    {
+                        pinned = true;
+                        break;
+                    }
+            if (!pinned && vitaSerializeToLedger(*cellStore))
+            {
+                std::erase_if(mInteriors, [&](const auto& e) { return e.second == cellStore; });
+                std::erase_if(mExteriors, [&](const auto& e) { return e.second == cellStore; });
+                std::erase_if(mCells, [&](auto& e) { return &e.second == cellStore; });
+            }
+        }
+#endif
 
-    return false;
+        return true;
 }

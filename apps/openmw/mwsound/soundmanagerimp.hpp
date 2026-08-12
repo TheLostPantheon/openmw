@@ -7,6 +7,15 @@
 #include <unordered_map>
 #include <utility>
 
+#ifdef __vita__
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <set>
+#include <thread>
+#include <vector>
+#endif
+
 #include <components/fallback/fallback.hpp>
 #include <components/misc/objectpool.hpp>
 #include <components/misc/strings/algorithm.hpp>
@@ -173,6 +182,26 @@ namespace MWSound
         std::set<ESM::RefId> mVitaSoundWarmQueued;
         void vitaPumpSoundWarm(int maxLoads);
         void vitaWarmActorSounds(MWWorld::CellStore& cell) override;
+
+        // Off-main decode: SD read + ffmpeg cost 55-240ms per file.
+        struct VitaDecoded
+        {
+            SoundBuffer* mSfx;
+            std::vector<char> mData;
+            int mFormat = 0;
+            int mSrate = 0;
+        };
+        std::thread mVitaSndThread;
+        std::mutex mVitaSndMutex;
+        std::condition_variable mVitaSndCv;
+        std::deque<SoundBuffer*> mVitaSndPending;
+        std::deque<VitaDecoded> mVitaSndDone;
+        std::set<SoundBuffer*> mVitaSndInFlight;
+        bool mVitaSndStop = false;
+        void vitaSndLoop();
+        void vitaRequestSoundLoad(SoundBuffer* sfx);
+        void vitaDrainDecodedSounds();
+        void vitaStopSndThread();
 #endif
 
         void stopMusic() override;

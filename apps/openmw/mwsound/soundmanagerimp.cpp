@@ -173,14 +173,93 @@ namespace MWSound
 
             Log(Debug::Info) << stream.str();
         }
+
+#ifdef __vita__
+        mVitaSndThread = std::thread([this] { vitaSndLoop(); });
+#endif
     }
 
     SoundManager::~SoundManager()
     {
+#ifdef __vita__
+        vitaStopSndThread();
+#endif
         SoundManager::clear();
         mSoundBuffers.clear();
         mOutput.reset();
     }
+
+#ifdef __vita__
+    void SoundManager::vitaSndLoop()
+    {
+        for (;;)
+        {
+            SoundBuffer* sfx;
+            {
+                std::unique_lock<std::mutex> lk(mVitaSndMutex);
+                mVitaSndCv.wait(lk, [this] { return mVitaSndStop || !mVitaSndPending.empty(); });
+                if (mVitaSndStop)
+                    return;
+                sfx = mVitaSndPending.front();
+                mVitaSndPending.pop_front();
+            }
+            VitaDecoded d;
+            d.mSfx = sfx;
+            mOutput->vitaDecodeSound(sfx->getResourceName(), d.mData, d.mFormat, d.mSrate);
+            {
+                std::lock_guard<std::mutex> lk(mVitaSndMutex);
+                mVitaSndDone.push_back(std::move(d));
+            }
+        }
+    }
+
+    void SoundManager::vitaRequestSoundLoad(SoundBuffer* sfx)
+    {
+        if (sfx == nullptr || sfx->getHandle() != nullptr)
+            return;
+        std::lock_guard<std::mutex> lk(mVitaSndMutex);
+        if (!mVitaSndInFlight.insert(sfx).second)
+            return;
+        mVitaSndPending.push_back(sfx);
+        mVitaSndCv.notify_all();
+    }
+
+    void SoundManager::vitaDrainDecodedSounds()
+    {
+        for (;;)
+        {
+            VitaDecoded d;
+            {
+                std::lock_guard<std::mutex> lk(mVitaSndMutex);
+                if (mVitaSndDone.empty())
+                    return;
+                d = std::move(mVitaSndDone.front());
+                mVitaSndDone.pop_front();
+                mVitaSndInFlight.erase(d.mSfx);
+            }
+            if (d.mSfx->getHandle() == nullptr)
+            {
+                auto [handle, size] = mOutput->vitaBufferFromPcm(d.mData, d.mFormat, d.mSrate);
+                if (handle != nullptr)
+                    mSoundBuffers.vitaFinishLoad(d.mSfx, handle, size);
+            }
+        }
+    }
+
+    void SoundManager::vitaStopSndThread()
+    {
+        {
+            std::lock_guard<std::mutex> lk(mVitaSndMutex);
+            mVitaSndStop = true;
+        }
+        mVitaSndCv.notify_all();
+        if (mVitaSndThread.joinable())
+            mVitaSndThread.join();
+        mVitaSndPending.clear();
+        mVitaSndDone.clear();
+        mVitaSndInFlight.clear();
+    }
+#endif
 
     // Return a new decoder instance, used as needed by the output implementations
     DecoderPtr SoundManager::getDecoder()
@@ -318,16 +397,20 @@ namespace MWSound
 
     void SoundManager::vitaPumpSoundWarm(int maxLoads)
     {
-        int loaded = 0;
-        while (!mVitaSoundWarmQueue.empty() && loaded < maxLoads)
+        int queued = 0;
+        while (!mVitaSoundWarmQueue.empty() && queued < maxLoads)
         {
             const ESM::RefId id = mVitaSoundWarmQueue.front();
             mVitaSoundWarmQueue.erase(mVitaSoundWarmQueue.begin());
             mVitaSoundWarmQueued.erase(id);
-            if (mSoundBuffers.load(id) != nullptr)
-                ++loaded;
+            SoundBuffer* sfx = mSoundBuffers.getOrInsert(id);
+            if (sfx != nullptr && sfx->getHandle() == nullptr)
+            {
+                vitaRequestSoundLoad(sfx);
+                ++queued;
+            }
         }
-        if (loaded > 0 && mVitaSoundWarmQueue.empty())
+        if (queued > 0 && mVitaSoundWarmQueue.empty())
             vitaBreadcrumb("[SoundWarm] queue drained");
     }
 #endif
@@ -596,6 +679,14 @@ namespace MWSound
         if (!mOutput->isInitialized())
             return nullptr;
 
+#ifdef __vita__
+        // Cold one-shot: decode off-main, skip this roll.
+        if (!(mode & PlayMode::Loop) && mSoundBuffers.lookup(soundId) == nullptr)
+        {
+            vitaRequestSoundLoad(mSoundBuffers.getOrInsert(soundId));
+            return nullptr;
+        }
+#endif
         SoundBuffer* sfx = mSoundBuffers.load(soundId);
         if (!sfx)
             return nullptr;
@@ -663,6 +754,14 @@ namespace MWSound
         if (remove3DSoundAtDistance(mode, ptr))
             return nullptr;
 
+#ifdef __vita__
+        // Cold one-shot: decode off-main, skip this roll.
+        if (!(mode & PlayMode::Loop) && mSoundBuffers.lookup(soundId) == nullptr)
+        {
+            vitaRequestSoundLoad(mSoundBuffers.getOrInsert(soundId));
+            return nullptr;
+        }
+#endif
         // Look up the sound in the ESM data
         SoundBuffer* sfx = mSoundBuffers.load(soundId);
         if (!sfx)
@@ -694,6 +793,14 @@ namespace MWSound
         if (!mOutput->isInitialized())
             return nullptr;
 
+#ifdef __vita__
+        // Cold one-shot: decode off-main, skip this roll.
+        if (!(mode & PlayMode::Loop) && mSoundBuffers.lookup(soundId) == nullptr)
+        {
+            vitaRequestSoundLoad(mSoundBuffers.getOrInsert(soundId));
+            return nullptr;
+        }
+#endif
         // Look up the sound in the ESM data
         SoundBuffer* sfx = mSoundBuffers.load(soundId);
         if (!sfx)
@@ -1177,7 +1284,8 @@ namespace MWSound
         if (!mOutput->isInitialized() || mPlaybackPaused)
             return;
 #ifdef __vita__
-        vitaPumpSoundWarm(1);
+        vitaDrainDecodedSounds();
+        vitaPumpSoundWarm(4);
 #endif
 
         MWBase::StateManager::State state = MWBase::Environment::get().getStateManager()->getState();

@@ -98,6 +98,10 @@ namespace MWBase
         virtual bool controlsDisabled() = 0;
 
         virtual void saveBindings() = 0;
+
+#ifdef __vita__
+        virtual void vitaShowTouchIntro() = 0;
+#endif
     };
 }
 

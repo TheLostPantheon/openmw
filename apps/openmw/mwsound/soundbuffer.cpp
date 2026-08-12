@@ -101,7 +101,7 @@ namespace MWSound
         return sfx;
     }
 
-    SoundBuffer* SoundBufferPool::load(const ESM::RefId& soundId)
+    SoundBuffer* SoundBufferPool::getOrInsert(const ESM::RefId& soundId)
     {
         if (mBufferNameMap.empty())
         {
@@ -114,20 +114,42 @@ namespace MWSound
                 insertSound(sound.mId, sound);
         }
 
-        SoundBuffer* sfx;
         const auto it = mBufferNameMap.find(soundId);
         if (it != mBufferNameMap.end())
-            sfx = it->second;
-        else
-        {
-            const ESM::Sound* sound = MWBase::Environment::get().getESMStore()->get<ESM::Sound>().search(soundId);
-            if (sound == nullptr)
-                return {};
-            sfx = insertSound(soundId, *sound);
-        }
+            return it->second;
 
-        return loadSfx(sfx);
+        const ESM::Sound* sound = MWBase::Environment::get().getESMStore()->get<ESM::Sound>().search(soundId);
+        if (sound == nullptr)
+            return {};
+        return insertSound(soundId, *sound);
     }
+
+    SoundBuffer* SoundBufferPool::load(const ESM::RefId& soundId)
+    {
+        SoundBuffer* sfx = getOrInsert(soundId);
+        return sfx != nullptr ? loadSfx(sfx) : nullptr;
+    }
+
+#ifdef __vita__
+    void SoundBufferPool::vitaFinishLoad(SoundBuffer* sfx, Sound_Handle handle, size_t size)
+    {
+        if (sfx->mHandle != nullptr)
+        {
+            // A sync load won the race; drop the duplicate buffer.
+            mOutput->unloadSound(handle);
+            return;
+        }
+        sfx->mHandle = handle;
+        mBufferCacheSize += size;
+        if (mBufferCacheSize > mBufferCacheMax)
+        {
+            unloadUnused();
+            if (!mUnusedBuffers.empty() && mBufferCacheSize > mBufferCacheMax)
+                Log(Debug::Warning) << "No unused sound buffers to free, using " << mBufferCacheSize << " bytes!";
+        }
+        mUnusedBuffers.push_front(sfx);
+    }
+#endif
 
     SoundBuffer* SoundBufferPool::load(VFS::Path::NormalizedView fileName)
     {

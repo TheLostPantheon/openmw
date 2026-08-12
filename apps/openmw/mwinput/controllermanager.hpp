@@ -13,6 +13,8 @@ namespace MWInput
     class BindingsManager;
     class MouseManager;
 
+    class VitaTouchZones;
+
     class ControllerManager : public SDLUtil::ControllerListener
     {
     public:
@@ -31,6 +33,9 @@ namespace MWInput
         void controllerRemoved(const SDL_ControllerDeviceEvent& arg) override;
 
         void touchpadMoved(int deviceId, const SDLUtil::TouchEvent& arg) override;
+#ifdef __vita__
+        void setTouchZones(VitaTouchZones* zones) { mVitaTouchZones = zones; }
+#endif
         void touchpadPressed(int deviceId, const SDLUtil::TouchEvent& arg) override;
         void touchpadReleased(int deviceId, const SDLUtil::TouchEvent& arg) override;
 
@@ -52,6 +57,9 @@ namespace MWInput
         std::string getControllerAxisIcon(int axis);
 
     private:
+#ifdef __vita__
+        VitaTouchZones* mVitaTouchZones = nullptr;
+#endif
         // Return true if GUI consumes input.
         bool gamepadToGuiControl(const SDL_ControllerButtonEvent& arg);
         bool gamepadToGuiControl(const SDL_ControllerAxisEvent& arg);

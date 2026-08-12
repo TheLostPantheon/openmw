@@ -1053,17 +1053,12 @@ namespace MWSound
         return ret;
     }
 
-    std::pair<Sound_Handle, size_t> OpenALOutput::loadSound(VFS::Path::NormalizedView fname)
+    // Split so a worker can run the decode half; AL stays on main.
+    static bool decodeSoundImpl(
+        DecoderPtr decoder, VFS::Path::NormalizedView fname, std::vector<char>& data, int& format, int& srate)
     {
-        getALError();
-
-        std::vector<char> data;
-        ALenum format = AL_NONE;
-        int srate = 0;
-
         try
         {
-            DecoderPtr decoder = mManager.getDecoder();
             decoder->open(Misc::ResourceHelpers::correctSoundPath(fname, *decoder->mResourceMgr));
 
             ChannelConfig chans;
@@ -1077,7 +1072,12 @@ namespace MWSound
         {
             Log(Debug::Error) << "Failed to load audio from " << fname << ": " << e.what();
         }
+        return !data.empty();
+    }
 
+    static std::pair<Sound_Handle, size_t> bufferFromPcmImpl(std::vector<char>& data, int format, int srate)
+    {
+        getALError();
         if (data.empty())
         {
             // If we failed to get any usable audio, substitute with silence.
@@ -1100,6 +1100,27 @@ namespace MWSound
         }
         return std::make_pair(MAKE_PTRID(buf), size);
     }
+
+    std::pair<Sound_Handle, size_t> OpenALOutput::loadSound(VFS::Path::NormalizedView fname)
+    {
+        std::vector<char> data;
+        int format = AL_NONE;
+        int srate = 0;
+        decodeSoundImpl(mManager.getDecoder(), fname, data, format, srate);
+        return bufferFromPcmImpl(data, format, srate);
+    }
+
+#ifdef __vita__
+    bool OpenALOutput::vitaDecodeSound(VFS::Path::NormalizedView fname, std::vector<char>& data, int& format, int& srate)
+    {
+        return decodeSoundImpl(mManager.getDecoder(), fname, data, format, srate);
+    }
+
+    std::pair<Sound_Handle, size_t> OpenALOutput::vitaBufferFromPcm(std::vector<char>& data, int format, int srate)
+    {
+        return bufferFromPcmImpl(data, format, srate);
+    }
+#endif
 
     size_t OpenALOutput::unloadSound(Sound_Handle data)
     {

@@ -33,6 +33,7 @@ struct SDL_Window;
 
 namespace MWInput
 {
+    class VitaTouchZones;
     class ControlSwitch;
     class ActionManager;
     class BindingsManager;
@@ -106,6 +107,10 @@ namespace MWInput
 
         bool controlsDisabled() override { return mControlsDisabled; }
 
+#ifdef __vita__
+        void vitaShowTouchIntro() override;
+#endif
+
     private:
         bool mControlsDisabled;
 
@@ -120,6 +125,9 @@ namespace MWInput
         std::unique_ptr<ControllerManager> mControllerManager;
         std::unique_ptr<SensorManager> mSensorManager;
         std::unique_ptr<GyroManager> mGyroManager;
+#ifdef __vita__
+        std::unique_ptr<VitaTouchZones> mVitaTouchZones;
+#endif
     };
 }
 #endif

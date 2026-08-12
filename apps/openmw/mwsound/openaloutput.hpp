@@ -91,6 +91,11 @@ namespace MWSound
         std::pair<Sound_Handle, size_t> loadSound(VFS::Path::NormalizedView fname) override;
         size_t unloadSound(Sound_Handle data) override;
 
+#ifdef __vita__
+        bool vitaDecodeSound(VFS::Path::NormalizedView fname, std::vector<char>& data, int& format, int& srate) override;
+        std::pair<Sound_Handle, size_t> vitaBufferFromPcm(std::vector<char>& data, int format, int srate) override;
+#endif
+
         bool playSound(Sound* sound, Sound_Handle data, float offset) override;
         bool playSound3D(Sound* sound, Sound_Handle data, float offset) override;
         void finishSound(Sound* sound) override;

@@ -43,6 +43,15 @@ namespace MWSound
         virtual std::pair<Sound_Handle, size_t> loadSound(VFS::Path::NormalizedView fname) = 0;
         virtual size_t unloadSound(Sound_Handle data) = 0;
 
+#ifdef __vita__
+        /// Decode half of loadSound; no AL calls, safe off-main.
+        virtual bool vitaDecodeSound(
+            VFS::Path::NormalizedView fname, std::vector<char>& data, int& format, int& srate)
+            = 0;
+        /// Buffer half of loadSound; AL calls, main thread only.
+        virtual std::pair<Sound_Handle, size_t> vitaBufferFromPcm(std::vector<char>& data, int format, int srate) = 0;
+#endif
+
         virtual bool playSound(Sound* sound, Sound_Handle data, float offset) = 0;
         virtual bool playSound3D(Sound* sound, Sound_Handle data, float offset) = 0;
         virtual void finishSound(Sound* sound) = 0;
