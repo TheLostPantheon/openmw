@@ -95,6 +95,8 @@ static void countDrawables(const osg::Node* node, unsigned int& drawableCount, u
 #include "../mwbase/mechanicsmanager.hpp"
 #include "../mwbase/soundmanager.hpp"
 #include "../mwbase/windowmanager.hpp"
+
+#include "../mwgui/mode.hpp"
 #include "../mwbase/world.hpp"
 #include "../mwbase/statemanager.hpp"
 
@@ -685,6 +687,15 @@ namespace MWWorld
                 == MWBase::StateManager::State_Running)
         {
             Vita::breadcrumb("[ModeSwitch] streaming setting changed; reloading world");
+            // Close the menus first: the rebuilt world does not restore
+            // their focus and the settings window would linger dead.
+            {
+                MWBase::WindowManager* wm = MWBase::Environment::get().getWindowManager();
+                if (wm->isSettingsWindowVisible())
+                    wm->toggleSettingsWindow();
+                while (wm->containsMode(MWGui::GM_MainMenu))
+                    wm->removeGuiMode(MWGui::GM_MainMenu);
+            }
             try
             {
                 std::string buffer;
@@ -710,13 +721,43 @@ namespace MWWorld
 #endif
         if (mChangeCellGridRequest.has_value())
         {
+#ifdef __vita__
+            const auto gc0 = std::chrono::steady_clock::now();
+#endif
             changeCellGrid(mChangeCellGridRequest->mPosition, mChangeCellGridRequest->mCellIndex,
                 mChangeCellGridRequest->mChangeEvent);
             mChangeCellGridRequest.reset();
+#ifdef __vita__
+            const int gcMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - gc0)
+                                 .count();
+            if (gcMs > 100)
+            {
+                char gb[48];
+                snprintf(gb, sizeof(gb), "[GridChange] wall %dms", gcMs);
+                Vita::breadcrumb(gb);
+            }
+#endif
         }
 
         mPreloader->updateCache(mRendering.getReferenceTime());
+#ifdef __vita__
+        {
+            const auto plc0 = std::chrono::steady_clock::now();
+            preloadCells(duration);
+            const int plcMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - plc0)
+                                  .count();
+            if (plcMs > 100)
+            {
+                char pb[48];
+                snprintf(pb, sizeof(pb), "[PreloadCells] %dms", plcMs);
+                Vita::breadcrumb(pb);
+            }
+        }
+#else
         preloadCells(duration);
+#endif
 #ifdef __vita__
         {
             static int sWarmTick = 0;
@@ -3478,8 +3519,13 @@ namespace MWWorld
         // calibrated on.
         const float retireFps = Settings::cells().mTargetFramerate;
         const int retireHealthyMs = retireFps > 1.f ? (int)(1000.f / retireFps) * 3 / 2 : 45;
-        if (frameDt > retireHealthyMs)
-            return; // only skip genuinely awful frames
+        // Sustained slow frames must not starve retirement: residency then
+        // ratchets up and makes the frames worse. Force one victim instead.
+        static int sStarved = 0;
+        const bool slowFrame = frameDt > retireHealthyMs;
+        if (slowFrame && ++sStarved < 90)
+            return;
+        const int maxVictims = slowFrame ? 1 : 2;
         CellStore* victims[2] = { nullptr, nullptr };
         int nv = 0;
         for (CellStore* cell : mActiveCells)
@@ -3491,12 +3537,23 @@ namespace MWWorld
             if (dx > mHalfGridSize + 1 || dy > mHalfGridSize + 1)
             {
                 victims[nv++] = cell;
-                if (nv == 2)
+                if (nv == maxVictims)
                     break;
             }
         }
+        if (nv > 0 || !slowFrame)
+            sStarved = 0;
         for (int i = 0; i < nv; ++i)
+        {
+            if (slowFrame)
+            {
+                char rb[64];
+                snprintf(rb, sizeof(rb), "[Retire] starved force (%d,%d)",
+                    victims[i]->getCell()->getGridX(), victims[i]->getCell()->getGridY());
+                Vita::breadcrumb(rb);
+            }
             unloadCell(victims[i], nullptr);
+        }
     }
 
     void Scene::processPendingCellLoads()
@@ -5816,6 +5873,9 @@ namespace MWWorld
 
         if (mPreloadEnabled)
         {
+#ifdef __vita__
+            mVitaPreloadBudget = 1;
+#endif
             if (mPreloadDoors)
                 preloadTeleportDoorDestinations(playerPos, predictedPos);
             if (mPreloadExteriorGrid)
@@ -5904,6 +5964,15 @@ namespace MWWorld
             {
                 try
                 {
+#ifdef __vita__
+                    CellStore* dest = mWorld.getWorldModel().findCell(door.getCellRef().getDestCell(), false);
+                    if (dest == nullptr || dest->getState() != CellStore::State_Loaded)
+                    {
+                        if (mVitaPreloadBudget <= 0)
+                            continue;
+                        --mVitaPreloadBudget;
+                    }
+#endif
                     preloadCellWithSurroundings(mWorld.getWorldModel().getCell(door.getCellRef().getDestCell()));
                 }
                 catch (const std::exception& e)
@@ -5987,7 +6056,19 @@ namespace MWWorld
         }
 
         for (std::size_t i = 0; i < candidates.size(); ++i)
-            preloadCell(mWorld.getWorldModel().getExterior(candidates[i].idx), topUrgent && i == 0);
+        {
+            CellStore& cell = mWorld.getWorldModel().getExterior(candidates[i].idx, false);
+            if (cell.getState() != CellStore::State_Loaded)
+            {
+                // Materializing a store parses refs on main; pay at most
+                // one per frame. Skipped candidates retry next frame.
+                if (mVitaPreloadBudget <= 0)
+                    continue;
+                --mVitaPreloadBudget;
+                mWorld.getWorldModel().getExterior(candidates[i].idx);
+            }
+            preloadCell(cell, topUrgent && i == 0);
+        }
 #endif
     }
 

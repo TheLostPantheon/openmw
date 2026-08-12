@@ -17,10 +17,6 @@
 #include "../mwgui/vitatouchoverlay.hpp"
 #include "../mwgui/windowbase.hpp"
 
-#include "../vita/VitaInit.h"
-
-#include <cstdio>
-
 #include "actionmanager.hpp"
 #include "bindingsmanager.hpp"
 #include "actions.hpp"
@@ -35,6 +31,7 @@ namespace MWInput
         { 0.00f, 0.80f, 0.19f, 1.00f, A_Sneak, true, false, "Sneak" },
         { 0.81f, 0.80f, 1.00f, 1.00f, A_TogglePOV, true, true, "Camera" },
         { 0.00f, 0.35f, 0.08f, 0.65f, A_QuickKeysMenu, true, false, "Keys" },
+        { 0.92f, 0.35f, 1.00f, 0.65f, A_QuickKey7, true, false, "7" },
         { 0.22f, 0.00f, 0.39f, 0.13f, A_QuickKey1, true, false, "1" },
         { 0.415f, 0.00f, 0.585f, 0.13f, A_QuickKey2, true, false, "2" },
         { 0.61f, 0.00f, 0.78f, 0.13f, A_QuickKey3, true, false, "3" },
@@ -73,11 +70,6 @@ namespace MWInput
             return;
         mActiveFinger = e.mFinger;
         mHighlight = z;
-        {
-            char tb[64];
-            snprintf(tb, sizeof(tb), "[Touch] down z=%d gui=%d", z, guiMode ? 1 : 0);
-            Vita::breadcrumb(tb);
-        }
         if (!guiMode && sZones[z].action == A_TogglePOV)
         {
             // Drive the real action channel: tap toggles, hold previews —
@@ -120,6 +112,15 @@ namespace MWInput
 
     void VitaTouchZones::update(float dt)
     {
+        if (mIntroPending
+            && MWBase::Environment::get().getStateManager()->getState() == MWBase::StateManager::State_Running
+            && !MWBase::Environment::get().getWindowManager()->isGuiMode())
+        {
+            mIntroPending = false;
+            mHighlight = -1;
+            showOverlay();
+            mFadeTimer = mIntroSeconds;
+        }
         if (!mOverlayShown || mActiveFinger != -1)
             return;
         mFadeTimer -= dt;
@@ -159,6 +160,15 @@ namespace MWInput
             return;
         }
         mActionManager.executeAction(z.action);
+    }
+
+    void VitaTouchZones::showIntro(float seconds)
+    {
+        // Deferred: loading screens render GUI layers, so showing now
+        // paints over them and burns the timer. update() arms it on the
+        // first live gameplay frame.
+        mIntroPending = true;
+        mIntroSeconds = seconds;
     }
 
     void VitaTouchZones::showOverlay()

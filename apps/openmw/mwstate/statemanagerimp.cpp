@@ -904,6 +904,9 @@ void MWState::StateManager::loadGameFromReader(
         MWBase::Environment::get().getWorldScene()->vitaLoadRefill();
 #endif
         mState = State_Running;
+#ifdef __vita__
+        MWBase::Environment::get().getInputManager()->vitaShowTouchIntro();
+#endif
 
         if (character)
             Settings::saves().mCharacter.set(Files::pathToUnicodeString(character->getPath().filename()));

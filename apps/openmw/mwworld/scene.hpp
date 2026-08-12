@@ -121,6 +121,9 @@ namespace MWWorld
 
 #ifdef __vita__
         osg::Vec3f mSmoothedMoveDir{ 0.0f, 0.0f, 0.0f };
+        // Per-frame cap on new cell-store materializations from preload
+        // scans; resident cells pass free. Fixed pace, never health-gated.
+        int mVitaPreloadBudget = 0;
 #endif
 
         std::vector<ESM::RefNum> mPagedRefs;

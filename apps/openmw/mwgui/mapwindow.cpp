@@ -625,6 +625,12 @@ namespace MWGui
     void LocalMapBase::updateRequiredMaps()
     {
         bool needRedraw = false;
+#ifdef __vita__
+        // One RTT rebuild per frame; a crossing otherwise sets up several
+        // segments in one wm frame (160-200ms hitch). Deferred entries stay
+        // textureless and retry next frame.
+        int mapRenderBudget = 1;
+#endif
         for (MapEntry& entry : mMaps)
         {
             if (!entry.mMapWidget->getVisible() || widgetCropped(entry.mMapWidget, mLocalMap))
@@ -633,8 +639,15 @@ namespace MWGui
             if (!entry.mMapTexture)
             {
                 if (mActiveCell->isExterior())
+                {
+#ifdef __vita__
+                    if (mapRenderBudget <= 0)
+                        continue;
+                    --mapRenderBudget;
+#endif
                     requestMapRender(&MWBase::Environment::get().getWorldModel()->getExterior(
                         ESM::ExteriorCellLocation(entry.mCellX, entry.mCellY, ESM::Cell::sDefaultWorldspaceId)));
+                }
 
                 osg::ref_ptr<osg::Texture2D> texture = mLocalMapRender->getMapTexture(entry.mCellX, entry.mCellY);
                 if (texture)

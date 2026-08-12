@@ -27,7 +27,7 @@ namespace MWInput
             const char* label;
         };
         static constexpr int kMenuInfo = -2; // synthesize R3 for GUI windows
-        static constexpr int kZoneCount = 11;
+        static constexpr int kZoneCount = 12;
         static const Zone sZones[kZoneCount];
 
         VitaTouchZones(ActionManager& actionManager, BindingsManager& bindingsManager);
@@ -36,6 +36,8 @@ namespace MWInput
         void onTouchMove(const SDLUtil::TouchEvent& e);
         void onTouchUp(const SDLUtil::TouchEvent& e);
         void update(float dt);
+        /// Reveal the layout unprompted (post-load discoverability).
+        void showIntro(float seconds);
 
     private:
         int zoneAt(float x, float y, bool guiMode) const;
@@ -50,6 +52,8 @@ namespace MWInput
         int mHighlight = -1;
         float mFadeTimer = 0.f;
         bool mOverlayShown = false;
+        bool mIntroPending = false;
+        float mIntroSeconds = 0.f;
     };
 }
 

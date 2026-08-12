@@ -281,4 +281,12 @@ namespace MWInput
     {
         mBindingsManager->saveBindings();
     }
+
+#ifdef __vita__
+    void InputManager::vitaShowTouchIntro()
+    {
+        if (mVitaTouchZones)
+            mVitaTouchZones->showIntro(5.f);
+    }
+#endif
 }

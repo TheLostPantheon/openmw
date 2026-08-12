@@ -107,6 +107,10 @@ namespace MWInput
 
         bool controlsDisabled() override { return mControlsDisabled; }
 
+#ifdef __vita__
+        void vitaShowTouchIntro() override;
+#endif
+
     private:
         bool mControlsDisabled;
 
