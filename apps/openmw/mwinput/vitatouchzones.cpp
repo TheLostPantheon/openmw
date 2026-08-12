@@ -14,6 +14,7 @@
 
 #include "../mwworld/ptr.hpp"
 
+#include "../mwgui/mode.hpp"
 #include "../mwgui/vitatouchoverlay.hpp"
 #include "../mwgui/windowbase.hpp"
 
@@ -30,7 +31,7 @@ namespace MWInput
         { 0.81f, 0.00f, 1.00f, 0.20f, A_QuickSave, true, false, "Quick Save" },
         { 0.00f, 0.80f, 0.19f, 1.00f, A_Sneak, true, false, "Sneak" },
         { 0.81f, 0.80f, 1.00f, 1.00f, A_TogglePOV, true, true, "Camera" },
-        { 0.00f, 0.35f, 0.08f, 0.65f, A_QuickKeysMenu, true, false, "Keys" },
+        { 0.00f, 0.35f, 0.08f, 0.65f, A_QuickKeysMenu, true, false, "Assign" },
         { 0.92f, 0.35f, 1.00f, 0.65f, A_QuickKey7, true, false, "7" },
         { 0.22f, 0.00f, 0.39f, 0.13f, A_QuickKey1, true, false, "1" },
         { 0.415f, 0.00f, 0.585f, 0.13f, A_QuickKey2, true, false, "2" },
@@ -121,6 +122,22 @@ namespace MWInput
             showOverlay();
             mFadeTimer = mIntroSeconds;
         }
+        // Assignment aid: while the quick keys menu is up, keep the zone
+        // layout visible; captions re-read so fresh assignments show.
+        if (MWBase::Environment::get().getWindowManager()->containsMode(MWGui::GM_QuickKeysMenu))
+        {
+            mQkRefresh -= dt;
+            if (!mQkMenuOpen || mQkRefresh <= 0.f)
+            {
+                mHighlight = -1;
+                showOverlay();
+                mQkRefresh = 0.5f;
+            }
+            mQkMenuOpen = true;
+            mFadeTimer = 0.6f;
+        }
+        else
+            mQkMenuOpen = false;
         if (!mOverlayShown || mActiveFinger != -1)
             return;
         mFadeTimer -= dt;

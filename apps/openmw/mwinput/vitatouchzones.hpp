@@ -54,6 +54,8 @@ namespace MWInput
         bool mOverlayShown = false;
         bool mIntroPending = false;
         float mIntroSeconds = 0.f;
+        bool mQkMenuOpen = false;
+        float mQkRefresh = 0.f;
     };
 }
 

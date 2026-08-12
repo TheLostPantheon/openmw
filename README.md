@@ -37,16 +37,32 @@ AI Usage: AI Assisted (build system detangling, streaming/performance investigat
 | Circle                             | Inventory / Back |
 | L trigger                          | Jump |
 | R trigger                          | Attack / Cast (use equipped) |
-| D-pad Up                           | Rest / Wait |
-| D-pad Down                         | Sneak |
-| D-pad Left                         | Cycle weapon |
-| D-pad Right                        | Cycle spell |
-| L3 (Top Left Corner Touch Screen)  | Toggle 1st / 3rd person |
-| R3 (Top Right Corner Touch Screen) | Quick save |
+| D-pad Up / Down                    | Cycle weapon right / left |
+| D-pad Right / Left                 | Cycle spell right / left |
 | Start                              | Game menu |
 | Select                             | Journal |
 | Hold Select + Start                | Console |
-| Front touchscreen                  | Cursor (in menus) |
+| Rear touch (left / right half)     | Jump / Attack (mirrors L and R triggers) |
+| Front touchscreen                  | Touch zones (in game), cursor (in menus) |
+
+### Touch Screen
+
+The front touchscreen carries a full hotkey layout during gameplay. Tap anywhere to reveal it, hold to keep it up, and release your finger inside a zone to trigger it. The layout also shows for a few seconds after loading a save.
+
+![Touch zone layout](docs/vita-touch-overlay.png)
+
+| Zone                | Action |
+| ------------------- | --- |
+| Top-left corner     | Rest / Wait |
+| Top-right corner    | Quick save |
+| Bottom-left corner  | Sneak (toggle) |
+| Bottom-right corner | Camera — tap toggles 1st / 3rd person, hold for a temporary orbit view |
+| Left edge (Assign)  | Opens the Quick Keys menu |
+| Edge slots 1–7      | Quick keys — top 1–3, bottom 4–6, right edge 7 |
+
+Quick key slots are fully user-assignable: touch **Assign** (or open the Quick Keys menu from the game menu), pick a slot, and bind any spell, weapon, or item. Each zone shows its current assignment on the overlay, and the overlay stays visible while the Quick Keys menu is open so you can see where each slot lives while assigning.
+
+Touch zones never block menus — in GUI screens the touchscreen is a cursor, and the bottom-right corner doubles as the info / description toggle where windows support it.
 
 ### Vita Settings
 
