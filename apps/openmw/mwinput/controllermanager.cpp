@@ -20,6 +20,9 @@
 
 #include "actions.hpp"
 #include "bindingsmanager.hpp"
+#ifdef __vita__
+#include "vitatouchzones.hpp"
+#endif
 #include "mousemanager.hpp"
 
 namespace MWInput
@@ -684,16 +687,28 @@ namespace MWInput
 
     void ControllerManager::touchpadMoved(int deviceId, const SDLUtil::TouchEvent& arg)
     {
+#ifdef __vita__
+        if (mVitaTouchZones != nullptr)
+            mVitaTouchZones->onTouchMove(arg);
+#endif
         MWBase::Environment::get().getLuaManager()->inputEvent({ MWBase::LuaManager::InputEvent::TouchMoved, arg });
     }
 
     void ControllerManager::touchpadPressed(int deviceId, const SDLUtil::TouchEvent& arg)
     {
+#ifdef __vita__
+        if (mVitaTouchZones != nullptr)
+            mVitaTouchZones->onTouchDown(arg);
+#endif
         MWBase::Environment::get().getLuaManager()->inputEvent({ MWBase::LuaManager::InputEvent::TouchPressed, arg });
     }
 
     void ControllerManager::touchpadReleased(int deviceId, const SDLUtil::TouchEvent& arg)
     {
+#ifdef __vita__
+        if (mVitaTouchZones != nullptr)
+            mVitaTouchZones->onTouchUp(arg);
+#endif
         MWBase::Environment::get().getLuaManager()->inputEvent({ MWBase::LuaManager::InputEvent::TouchReleased, arg });
     }
 }

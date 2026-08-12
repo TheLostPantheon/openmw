@@ -48,6 +48,16 @@ namespace MWGui
 
         std::string_view getWindowIdForLua() const override { return "QuickKeys"; }
 
+#ifdef __vita__
+        /// Assigned name for touch overlay labels; empty if unassigned.
+        std::string getKeyName(int index) const
+        {
+            if (index < 1 || index > (int)mKey.size())
+                return {};
+            return mKey[index - 1].name;
+        }
+#endif
+
     private:
         struct keyData
         {

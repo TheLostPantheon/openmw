@@ -639,6 +639,14 @@ namespace MWWorld
                 *whyNot = "notLoaded";
             return false;
         }
+        // Memory-safety veto, must win over every other answer: partner
+        // stores hold raw pointers into these lists.
+        if (!mMovedHere.empty() || !mMovedToAnotherCell.empty())
+        {
+            if (whyNot)
+                *whyNot = "movedRefs";
+            return false;
+        }
         if (!mHasState)
             return true;
         // Evictable iff a save would write nothing for this cell.
@@ -646,12 +654,6 @@ namespace MWWorld
         {
             if (whyNot)
                 *whyNot = mHasUnrecoverableState ? "cellState" : "fog";
-            return false;
-        }
-        if (!mMovedHere.empty() || !mMovedToAnotherCell.empty())
-        {
-            if (whyNot)
-                *whyNot = "movedRefs";
             return false;
         }
 

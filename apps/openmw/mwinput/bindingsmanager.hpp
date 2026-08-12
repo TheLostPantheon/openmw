@@ -43,7 +43,11 @@ namespace MWInput
         bool isLeftOrRightButton(int action, bool joystick) const;
 
         bool actionIsActive(int id) const;
-        float getActionValue(int id) const; // returns value in range [0, 1]
+        float getActionValue(int id) const;
+#ifdef __vita__
+        /// Drive an action's control directly (touch zones).
+        void vitaSetActionValue(int id, bool pressed);
+#endif // returns value in range [0, 1]
 
         SDL_GameController* getControllerOrNull() const;
 

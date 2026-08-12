@@ -36,6 +36,15 @@ namespace SDLUtil
             , mPressure(arg.pressure)
         {
         }
+
+        explicit TouchEvent(const SDL_TouchFingerEvent& arg, int device)
+            : mDevice(device)
+            , mFinger(static_cast<int>(arg.fingerId))
+            , mX(arg.x)
+            , mY(arg.y)
+            , mPressure(arg.pressure)
+        {
+        }
     };
 
     ///////////////

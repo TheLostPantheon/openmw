@@ -39,6 +39,7 @@ add_openmw_dir (mwrender
 add_openmw_dir (mwinput
     actions actionmanager bindingsmanager controllermanager controlswitch
     inputmanagerimp mousemanager keyboardmanager sensormanager gyromanager
+    vitatouchzones
     )
 
 add_openmw_dir (mwgui
@@ -54,7 +55,7 @@ add_openmw_dir (mwgui
     tradeitemmodel companionitemmodel pickpocketitemmodel controllers savegamedialog
     recharge mode videowidget backgroundimage itemwidget screenfader debugwindow spellmodel spellview
     draganddrop timeadvancer jailscreen itemchargeview keyboardnavigation textcolours statswatcher
-    postprocessorhud settings worlditemmodel itemtransfer controllerbuttonsoverlay inventorytabsoverlay
+    postprocessorhud settings worlditemmodel itemtransfer controllerbuttonsoverlay inventorytabsoverlay vitatouchoverlay
     )
 
 add_openmw_dir (mwdialogue

@@ -119,6 +119,7 @@ namespace MWGui
     class KeyboardNavigation;
     class ItemTransfer;
     class ControllerButtonsOverlay;
+    class VitaTouchOverlay;
     class InventoryTabsOverlay;
 
     class WindowManager : public MWBase::WindowManager
@@ -329,6 +330,10 @@ namespace MWGui
         /// Clear all savegame-specific data
         void clear() override;
 
+#ifdef __vita__
+        MWGui::VitaTouchOverlay* getVitaTouchOverlay() override { return mVitaTouchOverlay.get(); }
+#endif
+
         void write(ESM::ESMWriter& writer, Loading::Listener& progress) override;
         void readRecord(ESM::ESMReader& reader, uint32_t type) override;
         size_t countSavedGameRecords() const override;
@@ -458,6 +463,9 @@ namespace MWGui
         ConfirmationDialog* mConfirmationDialog;
         SpellWindow* mSpellWindow;
         QuickKeysMenu* mQuickKeysMenu;
+#ifdef __vita__
+        std::unique_ptr<VitaTouchOverlay> mVitaTouchOverlay;
+#endif
         LoadingScreen* mLoadingScreen;
         WaitDialog* mWaitDialog;
         std::unique_ptr<SoulgemDialog> mSoulgemDialog;

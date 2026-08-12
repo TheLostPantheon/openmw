@@ -182,6 +182,16 @@ namespace MWInput
 
         loadKeyDefaults();
         loadControllerDefaults();
+#ifdef __vita__
+        // Migrate saved bindings from the pre-touch-zone layout.
+        if (mInputBinder->getChannel(A_Rest)->getControlsCount() != 0)
+        {
+            ICS::Control* rest = mInputBinder->getChannel(A_Rest)->getAttachedControls().front().control;
+            if (mInputBinder->getJoystickButtonBinding(rest, sFakeDeviceId, ICS::Control::INCREASE)
+                == SDL_CONTROLLER_BUTTON_DPAD_UP)
+                loadControllerDefaults(true);
+        }
+#endif
 
         for (int i = 0; i < A_Last; ++i)
         {
@@ -239,6 +249,24 @@ namespace MWInput
     {
         return mInputBinder->getChannel(id)->getValue();
     }
+
+#ifdef __vita__
+    void BindingsManager::vitaSetActionValue(int id, bool pressed)
+    {
+        // Mirror ICS button handling: bare setValue auto-reverses next tick.
+        ICS::Channel* channel = mInputBinder->getChannel(id);
+        if (channel == nullptr || channel->getControlsCount() == 0)
+            return;
+        ICS::Control* control = channel->getAttachedControls().front().control;
+        if (pressed)
+        {
+            control->setIgnoreAutoReverse(false);
+            control->setChangingDirection(ICS::Control::INCREASE);
+        }
+        else
+            control->setChangingDirection(ICS::Control::STOP);
+    }
+#endif
 
     bool BindingsManager::actionIsActive(int id) const
     {
@@ -371,7 +399,7 @@ namespace MWInput
         // Shoulders (Xbox-style):
         //   L = Jump    R = Attack/Use
         // D-pad:
-        //   Up = Rest    Down = Sneak    Left = Cycle Weapon    Right = Cycle Spell
+        //   Dpad: full weapon cycle up/down, spell cycle left/right (rest/sneak on touch)
         // System:
         //   START = Game Menu    SELECT = Journal
         // Touch zones (front screen corners):
@@ -385,9 +413,9 @@ namespace MWInput
         defaultButtonBindings[A_Use] = SDL_CONTROLLER_BUTTON_RIGHTSHOULDER;           // R (Xbox RB)
         defaultButtonBindings[A_GameMenu] = SDL_CONTROLLER_BUTTON_START;
         defaultButtonBindings[A_Journal] = SDL_CONTROLLER_BUTTON_BACK;               // SELECT
-        defaultButtonBindings[A_Rest] = SDL_CONTROLLER_BUTTON_DPAD_UP;
-        defaultButtonBindings[A_Sneak] = SDL_CONTROLLER_BUTTON_DPAD_DOWN;
-        defaultButtonBindings[A_CycleWeaponLeft] = SDL_CONTROLLER_BUTTON_DPAD_LEFT;
+        defaultButtonBindings[A_CycleWeaponRight] = SDL_CONTROLLER_BUTTON_DPAD_UP;
+        defaultButtonBindings[A_CycleWeaponLeft] = SDL_CONTROLLER_BUTTON_DPAD_DOWN;
+        defaultButtonBindings[A_CycleSpellLeft] = SDL_CONTROLLER_BUTTON_DPAD_LEFT;
         defaultButtonBindings[A_CycleSpellRight] = SDL_CONTROLLER_BUTTON_DPAD_RIGHT;
         defaultButtonBindings[A_TogglePOV] = SDL_CONTROLLER_BUTTON_LEFTSTICK;        // Touch top-left
         defaultButtonBindings[A_QuickSave] = SDL_CONTROLLER_BUTTON_RIGHTSTICK;       // Touch top-right

@@ -16,6 +16,9 @@
 #include "actionmanager.hpp"
 #include "bindingsmanager.hpp"
 #include "controllermanager.hpp"
+#ifdef __vita__
+#include "vitatouchzones.hpp"
+#endif
 #include "controlswitch.hpp"
 #include "gyromanager.hpp"
 #include "keyboardmanager.hpp"
@@ -49,6 +52,8 @@ namespace MWInput
 #ifdef __vita__
         mInputWrapper->setTouchCursorEnabledPredicate(
             []() { return MWBase::Environment::get().getWindowManager()->isGuiMode(); });
+        mVitaTouchZones = std::make_unique<VitaTouchZones>(*mActionManager, *mBindingsManager);
+        mControllerManager->setTouchZones(mVitaTouchZones.get());
 #endif
     }
 
@@ -66,6 +71,9 @@ namespace MWInput
 
         mInputWrapper->setMouseVisible(MWBase::Environment::get().getWindowManager()->getCursorVisible());
         mInputWrapper->capture(disableEvents);
+#ifdef __vita__
+        mVitaTouchZones->update(dt);
+#endif
 
         if (disableControls)
         {
