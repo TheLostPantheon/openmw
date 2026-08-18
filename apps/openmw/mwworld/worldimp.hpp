@@ -1,7 +1,10 @@
 #ifndef GAME_MWWORLD_WORLDIMP_H
 #define GAME_MWWORLD_WORLDIMP_H
 
+#include <map>
+
 #include <osg/Timer>
+#include <osg/Vec3f>
 #include <osg/ref_ptr>
 
 #include <components/debug/debuglog.hpp>
@@ -115,6 +118,12 @@ namespace MWWorld
         std::vector<std::string> mContentFiles;
 
         std::filesystem::path mUserDataPath;
+#ifdef __vita__
+        // Static intervention/prison marker positions (boot scan + disk
+        // cache); getClosestMarker resolves against these instead of
+        // materialising every exterior cell store.
+        std::map<ESM::RefId, std::vector<osg::Vec3f>> mVitaMarkerTable;
+#endif
 
         int mActivationDistanceOverride;
 

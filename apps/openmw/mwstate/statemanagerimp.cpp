@@ -770,10 +770,27 @@ void MWState::StateManager::loadGameFromReader(
         if (fileBacked && reader.getFormatVersion() == ESM::CurrentSaveGameFormatVersion)
             MWBase::Environment::get().getWorldModel()->vitaBeginFileLoad(filepath.string());
 #endif
+#ifdef __vita__
+        // Per-record-type RAM census; drop ux0:data/openmw/loadcensus.txt
+        // to enable (mallinfo per record slows the load).
+        const bool vitaCensus = [] {
+            if (FILE* f = fopen("ux0:data/openmw/loadcensus.txt", "rb"))
+            {
+                fclose(f);
+                return true;
+            }
+            return false;
+        }();
+        std::map<uint32_t, std::pair<long long, int>> vitaTypeBytes;
+#endif
         while (reader.hasMoreRecs())
         {
 #ifdef __vita__
+            vitaMainPhase("loadrec"); // heartbeat: big saves parse for minutes
             MWBase::Environment::get().getWorldModel()->vitaNoteRecordStart((std::size_t)reader.getFileOffset());
+            long long vitaRecBefore = 0;
+            if (vitaCensus)
+                vitaRecBefore = (long long)mallinfo().uordblks;
 #endif
             ESM::NAME n = reader.getRecName();
             reader.getRecHeader();
@@ -875,6 +892,14 @@ void MWState::StateManager::loadGameFromReader(
                     Log(Debug::Warning) << "Warning: Ignoring unknown record: " << n.toStringView();
                     reader.skipRecord();
             }
+#ifdef __vita__
+            if (vitaCensus)
+            {
+                auto& [bytes, count] = vitaTypeBytes[n.toInt()];
+                bytes += (long long)mallinfo().uordblks - vitaRecBefore;
+                ++count;
+            }
+#endif
             int progressPercent = static_cast<int>(float(reader.getFileOffset()) / total * 100);
             if (progressPercent > currentPercent)
             {
@@ -896,6 +921,25 @@ void MWState::StateManager::loadGameFromReader(
             }
         }
         mCharacterManager.setCurrentCharacter(character);
+
+#ifdef __vita__
+        if (vitaCensus)
+        {
+            std::vector<std::pair<long long, uint32_t>> byBytes;
+            for (const auto& [type, bc] : vitaTypeBytes)
+                byBytes.push_back({ bc.first, type });
+            std::sort(byBytes.rbegin(), byBytes.rend());
+            for (std::size_t i = 0; i < byBytes.size() && i < 10; ++i)
+            {
+                const auto& [bytes, type] = byBytes[i];
+                const auto& bc = vitaTypeBytes[type];
+                const char* tc = reinterpret_cast<const char*>(&type);
+                char cb[96];
+                snprintf(cb, sizeof(cb), "[LoadCensus] %.4s n=%d %lldKB", tc, bc.second, bytes / 1024);
+                Vita::breadcrumb(cb);
+            }
+        }
+#endif
 
 #ifdef __vita__
         MWBase::Environment::get().getWorldModel()->vitaSetLoadDemote(false);

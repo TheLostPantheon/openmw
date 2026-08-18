@@ -1,5 +1,5 @@
---- a/MyGUIEngine/include/MyGUI_ILayer.h
-+++ b/MyGUIEngine/include/MyGUI_ILayer.h
+--- a/MyGUIEngine/include/MyGUI_ILayer.h	2026-08-12 17:17:54.026589712 -0600
++++ b/MyGUIEngine/include/MyGUI_ILayer.h	2026-08-12 17:17:54.004589713 -0600
 @@ -60,6 +60,14 @@
  		// render layer
  		virtual void renderToTarget(IRenderTarget* _target, bool _update) = 0;
@@ -15,3 +15,28 @@
  		virtual void resizeView(const IntSize& _viewSize) = 0;
  
  	protected:
+--- a/MyGUIEngine/src/MyGUI_RenderItem.cpp	2026-08-12 17:17:54.026589712 -0600
++++ b/MyGUIEngine/src/MyGUI_RenderItem.cpp	2026-08-12 17:17:54.004589713 -0600
+@@ -191,7 +191,9 @@
+ 
+ 	bool RenderItem::isOutOfDate() const
+ 	{
+-		return mOutOfDate;
++		// Vita: textureless items render nothing and renderToTarget
++		// early-outs before clearing the flag; report them clean.
++		return mOutOfDate && (mTexture != nullptr);
+ 	}
+ 
+ 	size_t RenderItem::getNeedVertexCount() const
+--- a/MyGUIEngine/src/MyGUI_SharedLayer.cpp	2026-08-12 17:27:46.547480046 -0600
++++ b/MyGUIEngine/src/MyGUI_SharedLayer.cpp	2026-08-12 17:27:46.516680049 -0600
+@@ -167,7 +167,8 @@
+ 
+ 	bool SharedLayer::isOutOfDate() const
+ 	{
+-		if (mChildItem->isOutOfDate())
++		// Vita: mChildItem is created lazily on first attach.
++		if (mChildItem != nullptr && mChildItem->isOutOfDate())
+ 			return true;
+ 
+ 		return mOutOfDate;

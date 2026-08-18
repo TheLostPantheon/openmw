@@ -420,6 +420,114 @@ namespace MWWorld
             }
         }
     }
+
+    namespace
+    {
+        // Intervention/prison marker positions are static ESM data; the
+        // stock lookup materialises EVERY exterior cell store to find them
+        // (8-12s, ~40MB on a cast). Scan once at boot, cache to disk.
+        constexpr uint32_t kMarkerCacheMagic = 0x564d4b31u; // 'VMK1'
+        const ESM::RefId kMarkerIds[3] = { ESM::RefId::stringRefId("divinemarker"),
+            ESM::RefId::stringRefId("templemarker"), ESM::RefId::stringRefId("prisonmarker") };
+
+        bool tryLoadMarkerCache(const std::filesystem::path& path, uint64_t key,
+            std::map<ESM::RefId, std::vector<osg::Vec3f>>& out)
+        {
+            std::ifstream in(path, std::ios::binary);
+            if (!in)
+                return false;
+            uint32_t magic = 0;
+            uint64_t k = 0;
+            uint32_t n = 0;
+            in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+            in.read(reinterpret_cast<char*>(&k), sizeof(k));
+            in.read(reinterpret_cast<char*>(&n), sizeof(n));
+            if (!in || magic != kMarkerCacheMagic || k != key || n > 4096)
+                return false;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                uint8_t which = 0;
+                float p[3];
+                in.read(reinterpret_cast<char*>(&which), sizeof(which));
+                in.read(reinterpret_cast<char*>(p), sizeof(p));
+                if (!in || which > 2)
+                {
+                    out.clear();
+                    return false;
+                }
+                out[kMarkerIds[which]].push_back(osg::Vec3f(p[0], p[1], p[2]));
+            }
+            return true;
+        }
+
+        void saveMarkerCache(const std::filesystem::path& path, uint64_t key,
+            const std::map<ESM::RefId, std::vector<osg::Vec3f>>& table)
+        {
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            if (!out)
+                return;
+            uint32_t n = 0;
+            for (const auto& [id, positions] : table)
+                n += static_cast<uint32_t>(positions.size());
+            out.write(reinterpret_cast<const char*>(&kMarkerCacheMagic), sizeof(kMarkerCacheMagic));
+            out.write(reinterpret_cast<const char*>(&key), sizeof(key));
+            out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+            for (uint8_t which = 0; which < 3; ++which)
+            {
+                const auto it = table.find(kMarkerIds[which]);
+                if (it == table.end())
+                    continue;
+                for (const osg::Vec3f& v : it->second)
+                {
+                    const float p[3] = { v.x(), v.y(), v.z() };
+                    out.write(reinterpret_cast<const char*>(&which), sizeof(which));
+                    out.write(reinterpret_cast<const char*>(p), sizeof(p));
+                }
+            }
+        }
+
+        void scanMarkers(const MWWorld::ESMStore& store, ESM::ReadersCache& readers,
+            std::map<ESM::RefId, std::vector<osg::Vec3f>>& out)
+        {
+            const auto isMarker = [](const ESM::RefId& id) {
+                return id == kMarkerIds[0] || id == kMarkerIds[1] || id == kMarkerIds[2];
+            };
+            const MWWorld::Store<ESM::Cell>& cells = store.get<ESM::Cell>();
+            for (auto it = cells.extBegin(); it != cells.extEnd(); ++it)
+            {
+                const ESM::Cell& cell = *it;
+                if (cell.mContextList.empty())
+                    continue;
+                for (size_t i = 0; i < cell.mContextList.size(); i++)
+                {
+                    try
+                    {
+                        const std::size_t index = static_cast<std::size_t>(cell.mContextList[i].index);
+                        const ESM::ReadersCache::BusyItem reader = readers.get(index);
+                        cell.restore(*reader, i);
+                        ESM::CellRef ref;
+                        ESM::MovedCellRef cMRef;
+                        bool deleted = false;
+                        bool moved = false;
+                        while (ESM::Cell::getNextRef(
+                            *reader, ref, deleted, cMRef, moved, ESM::Cell::GetNextRefMode::LoadOnlyNotMoved))
+                        {
+                            if (deleted || moved)
+                                continue;
+                            if (isMarker(ref.mRefID))
+                                out[ref.mRefID].push_back(ref.mPos.asVec3());
+                        }
+                    }
+                    catch (const std::exception&)
+                    {
+                    }
+                }
+                for (const auto& [lref, ldeleted] : cell.mLeasedRefs)
+                    if (!ldeleted && isMarker(lref.mRefID))
+                        out[lref.mRefID].push_back(lref.mPos.asVec3());
+            }
+        }
+    }
 #endif
 
     void World::loadData(const Files::Collections& fileCollections, const std::vector<std::string>& contentFiles,
@@ -455,6 +563,20 @@ namespace MWWorld
 #ifdef __vita__
         if (!refCacheHit)
             saveRefCache(refCachePath, refCacheKey_, mStore);
+        {
+            const std::filesystem::path markerCachePath = mUserDataPath / "config" / "marker_cache.bin";
+            if (!tryLoadMarkerCache(markerCachePath, refCacheKey_, mVitaMarkerTable))
+            {
+                VITA_CRUMB("loadData: scanning intervention markers");
+                scanMarkers(mStore, mReaders, mVitaMarkerTable);
+                saveMarkerCache(markerCachePath, refCacheKey_, mVitaMarkerTable);
+            }
+            char mb[96];
+            snprintf(mb, sizeof(mb), "[Markers] divine=%u temple=%u prison=%u",
+                (unsigned)mVitaMarkerTable[kMarkerIds[0]].size(), (unsigned)mVitaMarkerTable[kMarkerIds[1]].size(),
+                (unsigned)mVitaMarkerTable[kMarkerIds[2]].size());
+            Vita::breadcrumb(mb);
+        }
 #endif
 #ifdef __vita__
         VITA_CRUMB("loadData: validate done");
@@ -3690,6 +3812,93 @@ namespace MWWorld
     MWWorld::ConstPtr World::getClosestMarkerFromExteriorPosition(const osg::Vec3f& worldPos, const ESM::RefId& id)
     {
         const ESM::ExteriorCellLocation posIndex = ESM::positionToExteriorCellLocation(worldPos.x(), worldPos.y());
+
+#ifdef __vita__
+        // Marker table: same grid selection over cached positions, then
+        // materialise ONLY the winner's cell (the stock path below loads
+        // every exterior cell store in the game).
+        {
+            const auto mt = mVitaMarkerTable.find(id);
+            if (mt != mVitaMarkerTable.end() && !mt->second.empty())
+            {
+                struct PosInfo
+                {
+                    osg::Vec3f mPos;
+                    int mColumn, mRow;
+                };
+                std::vector<PosInfo> valid;
+                int minGrid = std::numeric_limits<int>::max();
+                osg::Vec3f winner(0.f, 0.f, 0.f);
+                bool haveWinner = false;
+                for (const osg::Vec3f& mp : mt->second)
+                {
+                    const ESM::ExteriorCellLocation midx = ESM::positionToExteriorCellLocation(mp.x(), mp.y());
+                    const int dX = midx.mX - posIndex.mX;
+                    const int dY = midx.mY - posIndex.mY;
+                    const int grid = std::max(std::abs(dX), std::abs(dY)) * 2;
+                    if (grid == 0)
+                    {
+                        winner = mp;
+                        haveWinner = true;
+                        break;
+                    }
+                    if (grid <= minGrid)
+                    {
+                        if (grid < minGrid)
+                        {
+                            valid.clear();
+                            minGrid = grid;
+                        }
+                        valid.push_back({ mp, grid / 2 + dX, grid / 2 + dY });
+                    }
+                }
+                if (!haveWinner && !valid.empty())
+                {
+                    int earliest = std::numeric_limits<int>::max();
+                    for (const PosInfo& m : valid)
+                    {
+                        int distance = 0;
+                        if (m.mRow == 0)
+                            distance = m.mColumn;
+                        else if (m.mColumn == minGrid)
+                            distance = minGrid + m.mRow;
+                        else if (m.mRow == minGrid)
+                            distance = minGrid * 3 - m.mColumn;
+                        else
+                            distance = minGrid * 4 - m.mRow;
+                        if (distance < earliest)
+                        {
+                            winner = m.mPos;
+                            earliest = distance;
+                        }
+                    }
+                    haveWinner = true;
+                }
+                if (haveWinner)
+                {
+                    const ESM::ExteriorCellLocation widx
+                        = ESM::positionToExteriorCellLocation(winner.x(), winner.y());
+                    CellStore& winnerCell = mWorldModel.getExterior(widx);
+                    ConstPtr best;
+                    winnerCell.forEachConst([&](const ConstPtr& p) {
+                        if (p.getCellRef().getRefId() != id)
+                            return true;
+                        if ((p.getRefData().getPosition().asVec3() - winner).length2() < 1.f)
+                        {
+                            best = p;
+                            return false;
+                        }
+                        if (best.isEmpty())
+                            best = p;
+                        return true;
+                    });
+                    if (!best.isEmpty())
+                        return best;
+                    // Table stale for this cell: fall through to the scan.
+                }
+            }
+        }
+#endif
 
         // Potential optimization: don't scan the entire world for markers and actually do the Todd spiral
         std::vector<Ptr> markers;

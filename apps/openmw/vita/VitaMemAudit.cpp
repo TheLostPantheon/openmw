@@ -163,6 +163,14 @@ namespace
 
 namespace Vita
 {
+    size_t getVglRamFreeKB()
+    {
+        const size_t total = vglMemTotal(VGL_MEM_RAM);
+        if (total == 0)
+            return SIZE_MAX;
+        return vglMemFree(VGL_MEM_RAM) / 1024;
+    }
+
     void auditDialogueStore(const MWWorld::ESMStore& store)
     {
         const auto& dialogues = store.get<ESM::Dialogue>();
@@ -265,6 +273,7 @@ namespace Vita
         std::string summary = "[VitaAudit] evictable=" + std::to_string(evictable);
         for (const auto& [reason, count] : blocked)
             summary += " " + reason + "=" + std::to_string(count);
+        summary += " idcache=" + std::to_string(worldModel.vitaIdCachePinnedCount());
         if (!firstDetail.empty())
             summary += " e.g. " + firstDetail;
         auditLog(summary.c_str());

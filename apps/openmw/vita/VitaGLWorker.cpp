@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <exception>
 
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 
 #include "VitaInit.h"
@@ -61,6 +62,9 @@ namespace Vita
 
     void GLWorker::finish()
     {
+        if (!mHasWork.load(std::memory_order_acquire))
+            return;
+        vitaMainPhase("glwait");
         while (mHasWork.load(std::memory_order_acquire))
             sceKernelDelayThread(10);
     }
@@ -85,6 +89,8 @@ namespace Vita
                 sceKernelDelayThread(10);
                 continue;
             }
+            vita_gl_job_start_us = sceKernelGetProcessTimeWide();
+            vita_gl_busy = 1;
             try
             {
                 mWork();
@@ -101,6 +107,8 @@ namespace Vita
                 breadcrumb("[GLWorker] non-std exception");
             }
             mWork = nullptr;
+            vita_gl_busy = 0;
+            vita_gl_phase = "idle";
             mHasWork.store(false, std::memory_order_release);
         }
     }

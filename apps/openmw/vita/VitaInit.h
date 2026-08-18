@@ -15,6 +15,12 @@ void vitaMemBreadcrumb(const char* msg);
 // Deadman heartbeat: stamp the phase the main thread is entering. Pass a
 // string LITERAL (the pointer is read from another thread).
 void vitaMainPhase(const char* phase);
+// Worker liveness, report-only; shown in [Deadman] lines.
+extern volatile int vita_gl_busy;
+extern volatile int vita_sim_busy;
+extern volatile int vita_draw_inflight;
+extern volatile unsigned long long vita_gl_job_start_us;
+extern const char* volatile vita_gl_phase;
 }
 
 namespace Vita
@@ -52,6 +58,11 @@ namespace Vita
 
     // Check if SELECT is held right now (raw SCE ctrl, no SDL needed).
     bool isSelectHeld();
+
+    // Free bytes in the vitaGL RAM pool (KB); SIZE_MAX before GL init.
+    // Pool exhaustion enters gpu_alloc's unsafe path (sceGxmFinish + 1s
+    // sleeps per failed alloc) — watch it like heap pressure.
+    size_t getVglRamFreeKB();
 }
 
 // Convenience macro that compiles to nothing on non-Vita

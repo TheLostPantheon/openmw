@@ -10,6 +10,7 @@
 
 #include <components/debug/debuglog.hpp>
 #include <components/esm/defs.hpp>
+#include <components/esm/util.hpp>
 #include <components/esm3/actoridconverter.hpp>
 #include <components/esm3/cellid.hpp>
 #include <components/esm3/cellref.hpp>
@@ -550,11 +551,11 @@ std::size_t MWWorld::WorldModel::evictSweptCellStores(const std::set<CellStore*,
             continue;
         toEvict.insert(&store);
     }
-    // Anything the Ptr cache references stays.
-    for (const auto& [cachedId, cachedCell] : mIdCache)
-        toEvict.erase(cachedCell);
     for (CellStore* pc : protectedCells)
         toEvict.erase(pc);
+    for (auto& entry : mIdCache)
+        if (entry.second != nullptr && toEvict.count(entry.second) > 0)
+            entry = { ESM::RefId(), nullptr };
 
     if (toEvict.empty())
         return 0;
@@ -566,7 +567,7 @@ std::size_t MWWorld::WorldModel::evictSweptCellStores(const std::set<CellStore*,
 }
 
 bool MWWorld::WorldModel::vitaEvictOneDistant(const std::set<CellStore*, std::less<>>& protectedCells,
-    int centerX, int centerY, int minDist, const std::function<void(CellStore&)>& onEvict)
+    float playerX, float playerY, float keepNearUnits, const std::function<void(CellStore&)>& onEvict)
 {
     const CellStore* victim = nullptr;
     bool victimNeedsState = false;
@@ -587,19 +588,13 @@ bool MWWorld::WorldModel::vitaEvictOneDistant(const std::set<CellStore*, std::le
                 ++movedPinned;
             if (pass == 0 ? !safe : (safe || why == "cellState" || why == "movedRefs"))
                 continue;
-            const int dx = std::abs(loc.mX - centerX);
-            const int dy = std::abs(loc.mY - centerY);
-            if (dx <= minDist && dy <= minDist)
+            // Player-distance guard, same metric the radial streamer uses;
+            // grid-center cell math lagged the player and over-protected.
+            const float cs = static_cast<float>(ESM::getCellSize(loc.mWorldspace));
+            const float ex = std::clamp(playerX, loc.mX * cs, (loc.mX + 1) * cs) - playerX;
+            const float ey = std::clamp(playerY, loc.mY * cs, (loc.mY + 1) * cs) - playerY;
+            if (ex * ex + ey * ey <= keepNearUnits * keepNearUnits)
                 continue;
-            bool cached = false;
-            for (const auto& [cachedId, cachedCell] : mIdCache)
-                if (cachedCell == store)
-                {
-                    cached = true;
-                    break;
-                }
-            if (cached)
-                continue; // skip, keep searching
             victim = store;
             victimNeedsState = !safe;
             break;
@@ -629,6 +624,7 @@ bool MWWorld::WorldModel::vitaEvictOneDistant(const std::set<CellStore*, std::le
     }
     if (onEvict)
         onEvict(*mut);
+    vitaInvalidateIdCache(victim);
     std::erase_if(mExteriors, [&](const auto& entry) { return entry.second == victim; });
     std::erase_if(mCells, [&](auto& entry) { return &entry.second == victim; });
     return true;
@@ -795,18 +791,6 @@ std::size_t MWWorld::WorldModel::vitaEvictInteriors(const std::set<CellStore*, s
             ++it;
             continue;
         }
-        bool cached = false;
-        for (const auto& [cachedId, cachedCell] : mIdCache)
-            if (cachedCell == store)
-            {
-                cached = true;
-                break;
-            }
-        if (cached)
-        {
-            ++it;
-            continue;
-        }
         if (!safe)
         {
             if (!vitaSerializeToLedger(*store))
@@ -817,6 +801,7 @@ std::size_t MWWorld::WorldModel::vitaEvictInteriors(const std::set<CellStore*, s
         }
         if (onEvict)
             onEvict(*store);
+        vitaInvalidateIdCache(store);
         it = mInteriors.erase(it);
         std::erase_if(mCells, [&](auto& e) { return &e.second == store; });
         ++evicted;
@@ -837,9 +822,9 @@ std::size_t MWWorld::WorldModel::evictInactiveLoadedCellStores(
             continue;
         toEvict.insert(&store);
     }
-    // Ptr-cached cells stay resident.
-    for (const auto& [cachedId, cachedCell] : mIdCache)
-        toEvict.erase(cachedCell);
+    for (auto& entry : mIdCache)
+        if (entry.second != nullptr && toEvict.count(entry.second) > 0)
+            entry = { ESM::RefId(), nullptr };
 
     if (toEvict.empty())
         return 0;
@@ -1105,12 +1090,7 @@ bool MWWorld::WorldModel::readCellRecordBody(ESM::ESMReader& reader)
             if (!pinned && vitaConv && !vitaConv->resolveFrom(vitaPend0))
                 pinned = true;
             if (!pinned)
-                for (const auto& [cachedId, cachedCell] : mIdCache)
-                    if (cachedCell == cellStore)
-                    {
-                        pinned = true;
-                        break;
-                    }
+                vitaInvalidateIdCache(cellStore);
             if (!pinned && vitaSerializeToLedger(*cellStore))
             {
                 std::erase_if(mInteriors, [&](const auto& e) { return e.second == cellStore; });

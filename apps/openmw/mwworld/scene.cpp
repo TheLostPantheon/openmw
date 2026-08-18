@@ -23,6 +23,11 @@
 #include <components/resource/imagemanager.hpp>
 #include <set>
 #include "../vita/VitaInit.h"
+#ifdef __vita__
+#include <osg/GLObjects>
+
+#include "../vita/VitaGLWorker.h"
+#endif
 #include "../vita/VitaSimWorker.h"
 #include "../vita/VitaMemAudit.h"
 #include "../mwrender/vismask.hpp"
@@ -153,6 +158,9 @@ namespace
     // loader is disabled and nothing is working to re-enable it -- which is
     // exactly where the heap parks.
     constexpr int kVitaWarmGateMB = 12;
+    // Store-eviction distance floors (world units to cell edge, player-based).
+    constexpr float kVitaEvictKeepNear = 12288.f;
+    constexpr float kVitaEvictKeepFar = 24576.f;
 
     int getVitaCellBudgetMB()
     {
@@ -882,18 +890,35 @@ namespace MWWorld
                 Vita::breadcrumb("[MemWatchdog] Latch re-armed");
             }
 
-            if (usedMB > budget - 20 && !s_cachesFlushed)
+            // vitaGL pool exhaustion enters gpu_alloc's unsafe path
+            // (sceGxmFinish + 1s sleep per failed alloc — seconds frozen at
+            // the GL fence). Fire the battery BEFORE an allocation can fail.
+            const bool vglStarved = Vita::getVglRamFreeKB() < 2048;
+            if ((usedMB > budget - 20 || vglStarved) && !s_cachesFlushed)
             {
+                if (vglStarved)
+                {
+                    char vb[64];
+                    snprintf(vb, sizeof(vb), "[MemWatchdog] vgl RAM pool starved (%uKB free)",
+                        (unsigned)Vita::getVglRamFreeKB());
+                    Vita::breadcrumb(vb);
+                    // Orphaned GL objects recycle in OSG pools inside the
+                    // vgl arena; the per-draw flush is time-budgeted and
+                    // drains them too slowly. Force a full flush.
+                    if (Vita::GLWorker* glw = Vita::getGLWorker())
+                        glw->run([] { osg::flushAllDeletedGLObjects(0); });
+                }
                 // Warm sets are the payload, not the luxury: only severe
                 // pressure drops them, or the drop/re-warm churn taxes
                 // every screen.
-                if (usedMB >= budget - kVitaWarmGateMB)
+                if (usedMB >= budget - kVitaWarmGateMB || vglStarved)
                 {
                     const auto pressureProtected = vitaProtectedCells();
+                    const osg::Vec3f evictPp = mWorld.getPlayerPtr().getRefData().getPosition().asVec3();
                     int freed = 0;
                     while (freed < 25
-                        && mWorld.getWorldModel().vitaEvictOneDistant(pressureProtected, mCurrentGridCenter.x(),
-                            mCurrentGridCenter.y(), 4, [this](CellStore& store) { mWorld.purgeCellRefs(store); }))
+                        && mWorld.getWorldModel().vitaEvictOneDistant(pressureProtected, evictPp.x(), evictPp.y(),
+                            kVitaEvictKeepNear, [this](CellStore& store) { mWorld.purgeCellRefs(store); }))
                         ++freed;
                     freed += (int)mWorld.getWorldModel().vitaEvictInteriors(
                         pressureProtected, 5, [this](CellStore& store) { mWorld.purgeCellRefs(store); });
@@ -2073,9 +2098,10 @@ namespace MWWorld
             = std::chrono::steady_clock::now() + std::chrono::milliseconds(pressure ? 12 : 4);
         const int cap = pressure ? 24 : 3;
         int n = 0;
+        const osg::Vec3f evictPp = mWorld.getPlayerPtr().getRefData().getPosition().asVec3();
         while (n < cap && std::chrono::steady_clock::now() < deadline
-            && mWorld.getWorldModel().vitaEvictOneDistant(protectedCells, mCurrentGridCenter.x(),
-                mCurrentGridCenter.y(), pressure ? 2 : 4,
+            && mWorld.getWorldModel().vitaEvictOneDistant(protectedCells, evictPp.x(), evictPp.y(),
+                pressure ? kVitaEvictKeepNear : kVitaEvictKeepFar,
                 [this](CellStore& store) { mWorld.purgeCellRefs(store); }))
             ++n;
         // Interior batch runs past the box; keep it small.
@@ -2098,9 +2124,10 @@ namespace MWWorld
         const auto protectedCells = vitaProtectedCells();
         const auto hkDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2500);
         int evicted = 0;
+        const osg::Vec3f evictPp = mWorld.getPlayerPtr().getRefData().getPosition().asVec3();
         while (std::chrono::steady_clock::now() < hkDeadline
-            && mWorld.getWorldModel().vitaEvictOneDistant(protectedCells, mCurrentGridCenter.x(),
-                mCurrentGridCenter.y(), 2, [this](CellStore& store) { mWorld.purgeCellRefs(store); }))
+            && mWorld.getWorldModel().vitaEvictOneDistant(protectedCells, evictPp.x(), evictPp.y(),
+                kVitaEvictKeepNear, [this](CellStore& store) { mWorld.purgeCellRefs(store); }))
             ++evicted;
         int interiors = 0;
         while (std::chrono::steady_clock::now() < hkDeadline)
@@ -2151,11 +2178,15 @@ namespace MWWorld
         const auto protectedCells = vitaProtectedCells();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(45);
         int ext = 0, inter = 0;
+        const osg::Vec3f evictPp = mWorld.getPlayerPtr().getRefData().getPosition().asVec3();
         while (std::chrono::steady_clock::now() < deadline
             && mWorld.getWorldModel().vitaCellStoreCount() > 60
-            && mWorld.getWorldModel().vitaEvictOneDistant(protectedCells, mCurrentGridCenter.x(),
-                mCurrentGridCenter.y(), 2, [this](CellStore& store) { mWorld.purgeCellRefs(store); }))
+            && mWorld.getWorldModel().vitaEvictOneDistant(protectedCells, evictPp.x(), evictPp.y(),
+                kVitaEvictKeepNear, [this](CellStore& store) { mWorld.purgeCellRefs(store); }))
+        {
             ++ext;
+            vitaMainPhase("postload"); // heartbeat: 45s-bounded loop
+        }
         while (std::chrono::steady_clock::now() < deadline)
         {
             const int got = (int)mWorld.getWorldModel().vitaEvictInteriors(
@@ -2163,6 +2194,7 @@ namespace MWWorld
             if (got == 0)
                 break;
             inter += got;
+            vitaMainPhase("postload");
         }
         mRendering.flushUnrefQueueImmediate();
         malloc_trim(0);
@@ -4987,6 +5019,7 @@ namespace MWWorld
             {
                 if (std::chrono::steady_clock::now() - qStart > std::chrono::seconds(20))
                     break;
+                vitaMainPhase("quiesce");
                 const int qOps = vitaBubbleTick(2000);
                 if (mPreloader->vitaDemandWantedCount() > 0
                     && Vita::getHeapUsedMB() < getVitaCellBudgetMB() - 12)
@@ -5029,6 +5062,7 @@ namespace MWWorld
                 {
                     if (std::chrono::steady_clock::now() - q2Start > std::chrono::seconds(8))
                         break;
+                    vitaMainPhase("quiesce");
                     const int qOps = vitaBubbleTick(2000);
                     if (mPreloader->vitaDemandWantedCount() > 0
                         && Vita::getHeapUsedMB() < getVitaCellBudgetMB() - 12)

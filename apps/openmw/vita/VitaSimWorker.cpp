@@ -27,6 +27,7 @@ namespace Vita
     void setDrawInFlight(bool inFlight)
     {
         sDrawInFlight.store(inFlight, std::memory_order_release);
+        vita_draw_inflight = inFlight ? 1 : 0;
     }
 
     void simFence()
@@ -105,6 +106,7 @@ namespace Vita
                 continue;
             }
 
+            vita_sim_busy = 1;
             try
             {
                 mWork();
@@ -122,6 +124,7 @@ namespace Vita
             }
 
             mWork = nullptr;
+            vita_sim_busy = 0;
             mHasWork.store(false, std::memory_order_release);
         }
     }

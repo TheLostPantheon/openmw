@@ -638,6 +638,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 #ifdef __vita__
     phase_evt_us = (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
     vitaPhaseT0 = sceKernelGetProcessTimeWide();
+    vitaMainPhase("upd");
     if (mUpdateOverlap && mSimWorker && mSimOverlap && mCullOverlap && mViewer->getSceneData())
     {
         // Hazard classes update on main; the rest on the worker pre-cull.
@@ -672,6 +673,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         {
             s_focusAccum = 0.f;
             vitaPhaseT0 = sceKernelGetProcessTimeWide();
+            vitaMainPhase("focus");
             mWorld->updateFocusObject();
             phase_focus_us = (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
         }
@@ -683,6 +685,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
     // if there is a separate Lua thread, it starts the update now
 #ifdef __vita__
     vitaPhaseT0 = sceKernelGetProcessTimeWide();
+    vitaMainPhase("lua");
     mLuaWorker->allowUpdate(frameStart, frameNumber, *stats);
     phase_lua_us += (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
 #else
@@ -690,6 +693,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 #endif
 
 #ifdef __vita__
+    vitaMainPhase("render");
     const uint64_t renderStartUs = sceKernelGetProcessTimeWide();
     if (mSimWorker && mSimOverlap && mCullOverlap)
     {
@@ -734,9 +738,10 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                     // (ICO), or is it dispatch/vitaGL itself?
                     const unsigned int icoSets
                         = icoProbe ? (unsigned int)icoProbe->getToCompile().size() : 0u;
-                    const bool icoBefore = icoSets > 0;
+                    vita_gl_phase = "draw";
                     renderer->draw();
                     const uint64_t t1 = sceKernelGetProcessTimeWide();
+                    vita_gl_phase = "swap";
                     gc->swapBuffers();
                     const uint64_t t2 = sceKernelGetProcessTimeWide();
                     if ((uint32_t)(t1 - t0) > 25000)
@@ -1243,6 +1248,7 @@ void OMW::Engine::setWindowIcon()
 void OMW::Engine::prepareEngine()
 {
     VITA_CRUMB("prepareEngine() enter");
+    vitaMainPhase("prep");
     mStateManager = std::make_unique<MWState::StateManager>(mCfgMgr.getUserDataPath() / "saves", mContentFiles);
     mEnvironment.setStateManager(*mStateManager);
 
@@ -1254,6 +1260,7 @@ void OMW::Engine::prepareEngine()
     mViewer->setSceneData(rootNode);
 
     VITA_CRUMB("prepareEngine() createWindow");
+    vitaMainPhase("prep");
 #ifdef __vita__
     Vita::logMemoryStatus("Pre-createWindow");
 #endif
@@ -1389,6 +1396,7 @@ void OMW::Engine::prepareEngine()
     Vita::logMemoryStatus("Post-VFS");
 #endif
     VITA_CRUMB("prepareEngine() creating WindowManager");
+    vitaMainPhase("prep");
     mWindowManager = std::make_unique<MWGui::WindowManager>(mWindow, mViewer, guiRoot, mResourceSystem.get(),
         mWorkQueue.get(), mCfgMgr.getLogPath(), mScriptConsoleMode, mTranslationDataStorage, mEncoding, mExportFonts,
         Version::getOpenmwVersionDescription(), shadersSupported, mCfgMgr);
@@ -1425,6 +1433,7 @@ void OMW::Engine::prepareEngine()
     }
     Vita::logMemoryStatus("Pre-data-load");
     VITA_CRUMB("prepareEngine() loading data async");
+    vitaMainPhase("prep");
     // Parse chases the prefetch reads started before createWindow.
     listener->loadingOn();
     {
@@ -1443,6 +1452,7 @@ void OMW::Engine::prepareEngine()
     Vita::logMemoryStatus("Post-data-load");
 #else
     VITA_CRUMB("prepareEngine() loading data async");
+    vitaMainPhase("prep");
     auto dataLoading = std::async(std::launch::async,
         [&] { mWorld->loadData(mFileCollections, mContentFiles, mGroundcoverFiles, mEncoder.get(), &asyncListener); });
 
@@ -1465,6 +1475,7 @@ void OMW::Engine::prepareEngine()
     VITA_CRUMB("prepareEngine() data loaded");
 
     VITA_CRUMB("prepareEngine() world init");
+    vitaMainPhase("prep");
 #ifdef __vita__
     Vita::logMemoryStatus("Pre-World::init");
 #endif
@@ -1491,6 +1502,7 @@ void OMW::Engine::prepareEngine()
     mWindowManager->setStore(mWorld->getStore());
 #ifdef __vita__
     Vita::logMemoryStatus("Pre-initUI");
+    vitaMainPhase("prep");
 #endif
     mWindowManager->initUI();
 #ifdef __vita__
@@ -1542,6 +1554,7 @@ void OMW::Engine::prepareEngine()
 
 #ifdef __vita__
     Vita::logMemoryStatus("Pre-LuaInit");
+    vitaMainPhase("prep");
 #endif
     mLuaManager->loadPermanentStorage(mCfgMgr.getUserConfigPath());
     mLuaManager->init();
@@ -1753,12 +1766,18 @@ void OMW::Engine::go()
                 const unsigned int vblanksPerFrame
                     = std::max(1u, (unsigned int)(60.f / fpsLimit + 0.5f));
                 const uint64_t paceT0 = sceKernelGetProcessTimeWide();
+                vitaMainPhase("pace");
                 const unsigned int vc = sceDisplayGetVcount();
-                if (s_lastVcount == 0 || vc >= s_lastVcount + vblanksPerFrame)
+                // Wrap-safe (vcount is a raw 32-bit counter since device
+                // boot) and bounded: an unbounded `<` spin here froze main
+                // forever once the counter wrapped (user hang reports:
+                // phase=render, all workers idle).
+                const int ahead = (int)(s_lastVcount + vblanksPerFrame - vc);
+                if (s_lastVcount == 0 || ahead <= 0 || ahead > 4)
                     s_lastVcount = vc;
                 else
                 {
-                    while (sceDisplayGetVcount() < s_lastVcount + vblanksPerFrame)
+                    for (int i = 0; i < ahead; ++i)
                         sceDisplayWaitVblankStart();
                     s_lastVcount += vblanksPerFrame;
                 }

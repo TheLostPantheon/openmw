@@ -3,6 +3,7 @@
 #ifdef __vita__
 #include "../vita/VitaInit.h"
 #include "../vita/VitaSimWorker.h"
+#include <psp2/kernel/processmgr.h>
 #endif
 
 #include <algorithm>
@@ -901,6 +902,19 @@ namespace MWGui
     {
         if (!mLocalMapRender)
             return;
+
+#ifdef __vita__
+        // 15Hz is plenty for compass/minimap scroll; per-frame updates
+        // dirtied the HUD layer every moving frame and defeated the GUI
+        // render-skip (~3.3ms on the sim-worker chain).
+        {
+            static uint64_t sLastMapUs = 0;
+            const uint64_t nowUs = sceKernelGetProcessTimeWide();
+            if (nowUs - sLastMapUs < 66000ULL)
+                return;
+            sLastMapUs = nowUs;
+        }
+#endif
 
         MWWorld::ConstPtr player = MWMechanics::getPlayer();
 

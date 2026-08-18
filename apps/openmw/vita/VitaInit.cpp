@@ -65,6 +65,12 @@ unsigned int sceUserMainThreadStackSize = 2 * 1024 * 1024;
 // Single writer; staleness is the signal.
 volatile uint64_t vita_main_heartbeat_us = 0;
 const char* volatile vita_main_phase = "boot";
+// Worker liveness for the deadman line (report-only).
+volatile int vita_gl_busy = 0;
+volatile int vita_sim_busy = 0;
+volatile int vita_draw_inflight = 0;
+volatile unsigned long long vita_gl_job_start_us = 0;
+const char* volatile vita_gl_phase = "idle";
 
 void vitaMainPhase(const char* phase)
 {
@@ -205,9 +211,15 @@ namespace
                 {
                     sLastReport = now;
                     const char* ph = vita_main_phase;
-                    char db[112];
-                    int n = snprintf(db, sizeof(db), "[Deadman] main silent %us phase=%s\n",
-                        (unsigned)((now - hb) / 1000000ULL), ph ? ph : "?");
+                    const char* glp = vita_gl_phase;
+                    const unsigned glAgeS = vita_gl_busy
+                        ? (unsigned)((now - vita_gl_job_start_us) / 1000000ULL)
+                        : 0u;
+                    char db[160];
+                    int n = snprintf(db, sizeof(db),
+                        "[Deadman] main silent %us phase=%s gl=%d(%us,%s) sim=%d draw=%d\n",
+                        (unsigned)((now - hb) / 1000000ULL), ph ? ph : "?", vita_gl_busy, glAgeS,
+                        glp ? glp : "?", vita_sim_busy, vita_draw_inflight);
                     if (n > 0)
                         logAppend(db, (size_t)n);
                 }
@@ -1384,6 +1396,23 @@ namespace Vita
             breadcrumb("BOOT: 4MB emergency reserve allocated");
         else
             breadcrumb("BOOT: WARNING - emergency reserve allocation failed");
+
+        // Debug ballast: simulate late-save heap pressure on demand. Drop
+        // ux0:data/openmw/ballast.txt containing an MB count; held for the
+        // whole session.
+        if (FILE* bf = fopen("ux0:data/openmw/ballast.txt", "rb"))
+        {
+            int ballastMB = 0;
+            if (fscanf(bf, "%d", &ballastMB) == 1 && ballastMB > 0 && ballastMB <= 200)
+            {
+                static void* sBallast = malloc((size_t)ballastMB * 1024u * 1024u);
+                char bb[64];
+                snprintf(bb, sizeof(bb), "BOOT: ballast %dMB %s", ballastMB,
+                    sBallast ? "held" : "ALLOC FAILED");
+                breadcrumb(bb);
+            }
+            fclose(bf);
+        }
 
         initClocks();
 

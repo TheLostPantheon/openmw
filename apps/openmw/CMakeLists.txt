@@ -426,7 +426,7 @@ if (VITA AND BUILD_OPENMW)
 
     # Create VPK package
     vita_create_vpk(openmw.vpk ${VITA_TITLEID} eboot.bin
-        VERSION 02.20
+        VERSION 02.21
         NAME ${VITA_APP_NAME}
         FILE ${CMAKE_SOURCE_DIR}/apps/openmw/vita/openmw.cfg openmw.cfg
         FILE ${CMAKE_BINARY_DIR}/defaults.bin defaults.bin

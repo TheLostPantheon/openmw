@@ -109,10 +109,28 @@ namespace MWWorld
         /// (door states, projectile casters) can drop Ptrs into it.
         std::size_t evictInactiveLoadedCellStores(
             const std::set<CellStore*, std::less<>>& activeCells, const std::function<void(CellStore&)>& onEvict);
-        bool vitaEvictOneDistant(const std::set<CellStore*, std::less<>>& protectedCells, int centerX, int centerY,
-            int minDist, const std::function<void(CellStore&)>& onEvict);
+        /// keepNearUnits: player-distance floor (world units to the cell's
+        /// nearest edge) below which stores are never victims.
+        bool vitaEvictOneDistant(const std::set<CellStore*, std::less<>>& protectedCells, float playerX, float playerY,
+            float keepNearUnits, const std::function<void(CellStore&)>& onEvict);
         bool vitaApplyEvictedState(const ESM::RefId& id);
         std::size_t vitaCellStoreCount() const { return mCells.size(); }
+        /// The Ptr cache is a lookup accelerator, not a lifetime pin:
+        /// evictors clear entries instead of being blocked by them.
+        void vitaInvalidateIdCache(const CellStore* store)
+        {
+            for (auto& entry : mIdCache)
+                if (entry.second == store)
+                    entry = { ESM::RefId(), nullptr };
+        }
+        std::size_t vitaIdCachePinnedCount() const
+        {
+            std::set<const CellStore*> distinct;
+            for (const auto& [id, cell] : mIdCache)
+                if (cell != nullptr)
+                    distinct.insert(cell);
+            return distinct.size();
+        }
         void vitaEvictedStats(std::size_t& ramBytes, int& count) const
         {
             // At-rest state lives in the session ledger file, not RAM.
