@@ -1779,6 +1779,15 @@ namespace MWRender
         }
     }
 
+#ifdef __vita__
+    float RenderingManager::vitaGetFogEnd() const
+    {
+        // Land fog only: the streamer is exterior; underwater fog is short
+        // and would collapse residency while swimming.
+        return mFog ? mFog->getFogEnd(false) : mViewDistance;
+    }
+#endif
+
     void RenderingManager::setViewDistance(float distance, bool delay)
     {
         mViewDistance = distance;

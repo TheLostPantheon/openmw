@@ -217,8 +217,32 @@ namespace MWRender
         }
         else
         {
+#ifdef __vita__
+            const uint32_t i0 = vita_anim_inst_us, t0 = vita_anim_tribip_us, k0 = vita_anim_kf_us,
+                           w0 = vita_anim_wire_us;
+            const auto ctorT0 = std::chrono::steady_clock::now();
+#endif
             osg::ref_ptr<NpcAnimation> anim(
                 new NpcAnimation(ptr, osg::ref_ptr<osg::Group>(ptr.getRefData().getBaseNode()), mResourceSystem));
+#ifdef __vita__
+            const uint32_t ctorMs = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - ctorT0)
+                                        .count();
+            if (ctorMs > 100)
+            {
+                // Same split the creature path prints; NPC composites were a
+                // black box (1s "hul" ticks with no PartCold attribution).
+                char ab[192];
+                snprintf(ab, sizeof(ab), "[NpcAdd] %s total=%ums inst=%u tribip=%u kf=%u wire=%u other=%d ms",
+                    ptr.getCellRef().getRefId().toDebugString().c_str(), ctorMs, (vita_anim_inst_us - i0) / 1000,
+                    (vita_anim_tribip_us - t0) / 1000, (vita_anim_kf_us - k0) / 1000, (vita_anim_wire_us - w0) / 1000,
+                    (int)ctorMs
+                        - (int)((vita_anim_inst_us - i0 + vita_anim_tribip_us - t0 + vita_anim_kf_us - k0
+                                    + vita_anim_wire_us - w0)
+                            / 1000));
+                Vita::breadcrumb(ab);
+            }
+#endif
 
             if (mObjects.emplace(ptr.mRef, anim).second)
             {

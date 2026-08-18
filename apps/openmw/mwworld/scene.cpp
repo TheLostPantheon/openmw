@@ -108,6 +108,7 @@ static void countDrawables(const osg::Node* node, unsigned int& drawableCount, u
 #include "../mwrender/landmanager.hpp"
 #include "../mwrender/objects.hpp"
 #include "../mwrender/postprocessor.hpp"
+#include "../mwrender/actorutil.hpp"
 #include "../mwrender/renderingmanager.hpp"
 
 #include "../mwphysics/actor.hpp"
@@ -230,6 +231,9 @@ namespace
     uint32_t sVitaAddRendUs = 0, sVitaAddMechUs = 0, sVitaAddPhysUs = 0, sVitaAddLuaUs = 0, sVitaAddNavUs = 0;
     uint32_t sVitaAddWorstUs = 0;
     char sVitaAddWorstTag[48] = {};
+    // Bumped on unloadCell: invalidates the far-band candidate cache
+    // (it holds Ptrs; a Ptr into an unloaded cell is a dangling ref).
+    unsigned sVitaFarCandGen = 0;
     inline uint32_t vitaUsSince(const std::chrono::steady_clock::time_point& t0)
     {
         return (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0)
@@ -771,12 +775,22 @@ namespace MWWorld
             static int sWarmTick = 0;
             static int sFastTick = 0;
             ++sFastTick;
-            if (sFastTick >= 8 && mPreloader->vitaDemandWantedCount() > 0 && sWarmTick < 29)
+            // Urgent demand: re-arm the worker as soon as its previous batch
+            // is done (it idles otherwise). The old 8-tick cadence capped
+            // delivery at ~20 models/s under load — throughput, not
+            // eligibility, was why "guaranteed" streaming kept missing.
+            // Memory headroom is the only gate; frame health governs adds.
+            const bool urgentDemand = mPreloader->vitaDemandUrgentCount() > 0;
+            if ((urgentDemand || (sFastTick >= 8 && mPreloader->vitaDemandWantedCount() > 0)) && sWarmTick < 29)
             {
-                // Demand pending: the worker should not wait for the slow
-                // cadence. ~50 models/sec ceiling while content streams.
                 sFastTick = 0;
-                if (Vita::getHeapUsedMB() < getVitaCellBudgetMB() - kVitaWarmGateMB)
+                // Gate is headroom-aware, not a cliff: urgent demand may load
+                // to within a small safety margin, because the pump call
+                // itself yields pool bytes (floating budget) to make room.
+                // Anticipatory work keeps the wider gate. Dense scenes sat
+                // exactly AT the old gate with 128 wanted / 0 loading.
+                const int gateMB = urgentDemand ? kVitaWarmGateMB / 2 : kVitaWarmGateMB;
+                if (Vita::getHeapUsedMB() < getVitaCellBudgetMB() - gateMB)
                     mPreloader->vitaPumpWarm(false);
             }
             if (++sWarmTick >= 30)
@@ -1810,6 +1824,7 @@ namespace MWWorld
         mVitaCleanSweep.erase(cell);
         mVitaCellRefBox.erase(cell);
         mVitaBareAfterAdd.clear(); // ref addresses die with the store; no stale skips
+        ++sVitaFarCandGen; // far-band candidate cache holds Ptrs into this cell
         Log(Debug::Info) << "Unloading cell " << cell->getCell()->getDescription();
         const auto ul0 = std::chrono::steady_clock::now();
         struct UlTimer
@@ -2603,6 +2618,34 @@ namespace MWWorld
         {
             const ESM::NPC* npc = ptr.get<ESM::NPC>()->mBase;
             const auto& bodyParts = mWorld.getStore().get<ESM::BodyPart>();
+            // Skeleton + its keyframes: NPCs animate from the shared race
+            // skeleton kf, not their own model. It was never in this list,
+            // so a re-parse (cache event, unique-NPC custom model) cold-
+            // loaded on assembly ("hul" kf=1228ms). Mirror NpcAnimation.
+            {
+                const bool female = !npc->isMale();
+                bool beast = false;
+                if (const ESM::Race* race = mWorld.getStore().get<ESM::Race>().search(npc->mRace))
+                    beast = (race->mData.mFlags & ESM::Race::Beast) != 0;
+                const VFS::Path::Normalized skel = Misc::ResourceHelpers::correctActorModelPath(
+                    VFS::Path::toNormalized(MWRender::getActorSkeleton(false, female, beast, false)), vfs);
+                out.push_back(skel.value());
+                VFS::Path::Normalized skf(skel);
+                skf.changeExtension(kfExt);
+                if (vfs->exists(skf))
+                    out.push_back(skf.value());
+                if (!npc->mModel.empty())
+                {
+                    // Custom model: it is the skeleton, and its own kf too.
+                    const VFS::Path::Normalized cm = Misc::ResourceHelpers::correctActorModelPath(
+                        Misc::ResourceHelpers::correctMeshPath(VFS::Path::Normalized(npc->mModel)), vfs);
+                    out.push_back(cm.value());
+                    VFS::Path::Normalized ckf(cm);
+                    ckf.changeExtension(kfExt);
+                    if (vfs->exists(ckf))
+                        out.push_back(ckf.value());
+                }
+            }
             for (const ESM::RefId& bpId : { npc->mHead, npc->mHair })
                 if (const ESM::BodyPart* bp = bodyParts.search(bpId))
                     out.push_back(
@@ -2856,8 +2899,20 @@ namespace MWWorld
         constexpr float rPhysIn = 3700.f;
         constexpr float rPhysOut = 6000.f;
         constexpr float rStructIn = 2600.f; // small-object floor
-        constexpr float rStructMax = 5000.f; // size-scaled reach cap (pre-stretch)
         constexpr float rHeadStretch = 2800.f; // sprint lead, heading only
+        // Outer structural reach follows the VIEW DISTANCE: an object is
+        // resident iff its geometry (bound sphere) overlaps the view sphere
+        // plus a fog-ramp buffer. Beyond that it is fog-occluded work.
+        // Salience (apparent size) now orders demand only.
+        // Reach tracks the LIVE fog end (weather-driven), not the settings
+        // viewing distance: they differ, and visibility ends where the fog
+        // ramp saturates. Buffer covers the ramp so objects are resident
+        // before they emerge. Foggy weather => shorter reach automatically.
+        // Load lead past the fog END. 1200 left stragglers; 2000 wedged the
+        // pump at the heap gate (+100 far objs, dmd 128u/0 loading, +10ms
+        // frames). Reach is resident memory, not a free dial.
+        constexpr float kViewBuffer = 1500.f;
+        const float rViewReach = std::max(rStructIn, mRendering.vitaGetFogEnd() + kViewBuffer);
         const osg::Vec2f moveDir(mSmoothedMoveDir.x(), mSmoothedMoveDir.y());
         constexpr float cSz = 8192.f;
         const bool isInterior = false;
@@ -2958,6 +3013,109 @@ namespace MWWorld
                 sGuardPos = pp;
                 sGuardReadyEpoch = readyEpoch;
                 sGuardLast = tick0;
+
+                // ---- Three-ring accuracy model ----
+                // Ring 3 (far, actors ~2000u): pre-warm only — file demand at
+                // top salience so actors reach the inner rings with assets
+                // already warm. Never adds; never costs the frame.
+                // Ring 2 (middle, 1100u): the existing static guard below.
+                // Ring 1 (near, 400u): the miss-ring — ANYTHING bare with warm
+                // assets inside interaction range is added now, one per
+                // pass, regardless of frame health. Rings 2/3 make this
+                // fire rarely; when it fires, presence beats one frame.
+                constexpr float rNear = 400.f;
+                constexpr float rActorWarm = 2000.f;
+                // Warm-actor memo; pool relief can re-cool assets, so it is
+                // dropped whenever the ready epoch moves (new deliveries).
+                static std::set<const LiveCellRefBase*> sRing3Warm;
+                static unsigned sRing3Epoch = 0;
+                if (readyEpoch != sRing3Epoch)
+                {
+                    sRing3Epoch = readyEpoch;
+                    sRing3Warm.clear();
+                }
+                {
+                    MWWorld::Ptr nearMiss;
+                    float nearBestD2 = rNear * rNear;
+                    int actorWarmFiled = 0;
+                    for (CellStore* gc : cells)
+                    {
+                        if (!gc->getCell()->isExterior()
+                            || vitaCellEdge2(*gc, pp) > rActorWarm * rActorWarm)
+                            continue;
+                        gc->forEach([&](const MWWorld::Ptr& ptr) {
+                            if (ptr.getRefData().getBaseNode() != nullptr)
+                                return true;
+                            if (isPagedRef(ptr) || ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
+                                return true;
+                            const bool actor = isActorType(ptr.getType());
+                            const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
+                            const float dx = op.x() - pp.x();
+                            const float dy = op.y() - pp.y();
+                            const float d2 = dx * dx + dy * dy;
+                            // Ring 1 candidate: nearest bare object of any type.
+                            if (d2 < nearBestD2 && mVitaBareAfterAdd.count(ptr.mRef) == 0)
+                            {
+                                nearBestD2 = d2;
+                                nearMiss = ptr;
+                            }
+                            // Ring 3: actors pre-warm out to rActorWarm. Memo
+                            // skips the VFS path walk once an actor is warm.
+                            if (actor && d2 < rActorWarm * rActorWarm && actorWarmFiled < 12
+                                && sRing3Warm.count(ptr.mRef) == 0)
+                            {
+                                std::vector<std::string> paths;
+                                vitaActorWarmPaths(ptr, paths);
+                                bool allWarm = true;
+                                for (const std::string& ap : paths)
+                                    allWarm = warmPath(ap, d2) && allWarm;
+                                if (!allWarm)
+                                    ++actorWarmFiled;
+                                else
+                                    sRing3Warm.insert(ptr.mRef);
+                            }
+                            return true;
+                        });
+                    }
+                    if (!nearMiss.isEmpty())
+                    {
+                        // Warm-gated: the no-sync-load invariant holds. Cold
+                        // demand was just filed above at top salience.
+                        bool warm = warmOrRequest(nearMiss, nearBestD2);
+                        if (warm && isActorType(nearMiss.getType()))
+                        {
+                            std::vector<std::string> paths;
+                            vitaActorWarmPaths(nearMiss, paths);
+                            for (const std::string& ap : paths)
+                                warm = warmPath(ap, nearBestD2) && warm;
+                        }
+                        if (warm)
+                        {
+                            try
+                            {
+                                addObject(nearMiss, mWorld, mPagedRefs, *mPhysics, mRendering);
+                                addObject(nearMiss, mWorld, *mPhysics, mLowestPoint, isInterior, mNavigator, nullptr);
+                                ++vitaOps;
+                                ++sVitaLiveObjects;
+                                ++sVitaLivePhys;
+                                if (nearMiss.getRefData().getBaseNode() == nullptr)
+                                    mVitaBareAfterAdd.insert(nearMiss.mRef);
+                                char nb[112];
+                                snprintf(nb, sizeof(nb), "[NearRing] add %s d=%d",
+                                    nearMiss.getCellRef().getRefId().toDebugString().c_str(),
+                                    (int)std::sqrt(nearBestD2));
+                                Vita::breadcrumb(nb);
+                            }
+                            catch (const std::exception& e)
+                            {
+                                mVitaBareAfterAdd.insert(nearMiss.mRef);
+                                Log(Debug::Error) << "near-ring add fail '" << nearMiss.getCellRef().getRefId()
+                                                  << "': " << e.what();
+                            }
+                        }
+                    }
+                }
+
                 int guardAdds = 0;
                 const auto guardAdd = [&](const MWWorld::Ptr& ptr) {
                     try
@@ -3106,6 +3264,174 @@ namespace MWWorld
             }
         }
 
+        // ---- Far band (reserved): view-overlapping statics beyond the near
+        // shells. This work needs LEAD TIME — an object must be resident
+        // before it emerges from the fog — yet it sat last in Lane A's
+        // deadline-bounded walk and starved under any pressure, popping in
+        // only once it reached the near rings. Own slice, run before shells
+        // consume the tick; ordered by how soon each will emerge
+        // (distance minus bound, ascending). Warm-gated like everything.
+        {
+            SegTimer segFar(&sSegShellUs);
+            const auto farDeadline = bigBudget ? deadline : tick0 + std::chrono::milliseconds(std::max(1, maxMs / 3));
+            struct FarCand
+            {
+                MWWorld::Ptr ptr;
+                float dEff;
+                float d2;
+            };
+            // Candidate set is CACHED and refreshed on movement/time, like
+            // the guard disc: rescanning every tick ate the whole slice
+            // (adds hit the deadline on entry) and materialised far cell
+            // stores per tick (StateApply bursts = 600ms frames). Between
+            // refreshes the slice goes to adds, not bookkeeping.
+            static std::vector<FarCand> sFarCands;
+            static osg::Vec3f sFarScanPos(1e9f, 1e9f, 0.f);
+            static Clock::time_point sFarScanAt{};
+            static unsigned sFarScanEpoch = 0;
+            static unsigned sFarScanGen = 0;
+            std::vector<FarCand>& farCands = sFarCands;
+            const float rNearBand = rStructIn + rHeadStretch;
+            int farStarved = 0;
+            const float fmx = pp.x() - sFarScanPos.x();
+            const float fmy = pp.y() - sFarScanPos.y();
+            const unsigned farEpoch = mPreloader->vitaDemandReadyEpoch();
+            const bool farRescan = fmx * fmx + fmy * fmy > 200.f * 200.f
+                || tick0 - sFarScanAt > std::chrono::milliseconds(750) || farEpoch != sFarScanEpoch
+                || sFarScanGen != sVitaFarCandGen || farCands.empty();
+            if (farRescan)
+            {
+                sFarScanPos = pp;
+                sFarScanAt = tick0;
+                sFarScanEpoch = farEpoch;
+                sFarScanGen = sVitaFarCandGen;
+                farCands.clear();
+            }
+            // Scan is incremental: it resumes at the cell it stopped on and
+            // completes over several ticks under its own small budget, so a
+            // wide dense scan can neither eat the add slice nor be thrown
+            // away half-done. Adds proceed from whatever is collected so far.
+            static std::size_t sFarScanCursor = 0;
+            static std::size_t sFarScanRot = 0; // rotation frozen at scan start
+            static std::size_t sFarScanN = 0;
+            static bool sFarScanInProgress = false;
+            if (farRescan || sFarScanN != n)
+            {
+                // Active set changed mid-scan: restart on the new array.
+                sFarScanCursor = 0;
+                sFarScanRot = sStartRot;
+                sFarScanN = n;
+                sFarScanInProgress = true;
+                if (!farRescan)
+                    farCands.clear();
+            }
+            const auto scanDeadline = tick0 + std::chrono::milliseconds(2);
+            for (; sFarScanInProgress && sFarScanCursor < n && Clock::now() < scanDeadline; ++sFarScanCursor)
+            {
+                CellStore& cell = *cells[(sFarScanCursor + sFarScanRot) % n];
+                if (!cell.getCell()->isExterior())
+                    continue;
+                if (vitaCellEdge2(cell, pp) > (rViewReach + 8192.f) * (rViewReach + 8192.f))
+                    continue;
+                cell.forEach([&](const MWWorld::Ptr& ptr) {
+                    if (ptr.getRefData().getBaseNode() != nullptr)
+                        return true;
+                    if (!isLiteType(ptr.getType()) || isPagedRef(ptr))
+                        return true;
+                    if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
+                        return true;
+                    const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
+                    const float dx = op.x() - pp.x();
+                    const float dy = op.y() - pp.y();
+                    const float d2 = dx * dx + dy * dy;
+                    if (d2 < rNearBand * rNearBand)
+                        return true; // near band: Lane A / shells own it
+                    const VFS::Path::Normalized m = getModel(ptr);
+                    if (m.empty())
+                        return true;
+                    float br = mPreloader->vitaKnownBoundRadius(std::string(m.value()));
+                    if (br <= 0.f)
+                        br = 1200.f;
+                    const float dEff = std::sqrt(d2) - br * ptr.getCellRef().getScale();
+                    if (dEff >= rViewReach)
+                        return true; // not overlapping the view sphere yet
+                    if (farCands.size() < 64)
+                        farCands.push_back({ ptr, dEff, d2 });
+                    else
+                        ++farStarved;
+                    return true;
+                });
+            }
+            if (sFarScanInProgress && sFarScanCursor >= n)
+                sFarScanInProgress = false;
+            // Sort whatever is collected (cheap for <=64); partial scans
+            // still yield a correctly ordered near-first list.
+            std::sort(farCands.begin(), farCands.end(),
+                [](const FarCand& a, const FarCand& b) { return a.dEff < b.dEff; });
+            // Drop entries that went live since the last refresh (added by
+            // any lane) so the loop below only sees real work.
+            farCands.erase(std::remove_if(farCands.begin(), farCands.end(),
+                               [](const FarCand& c) { return c.ptr.getRefData().getBaseNode() != nullptr; }),
+                farCands.end());
+            int farAdds = 0;
+            int farCold = 0, farThrew = 0;
+            // The SCAN consumed the whole slice in dense scenes, so the add
+            // loop hit the deadline on entry — every tick, zero adds, while
+            // "starved" read as a delivery problem. Adds get their own floor:
+            // at least kFarMinAdds warm candidates go in regardless of the
+            // scan's cost (each is one cheap warm add).
+            constexpr int kFarMinAdds = 4;
+            for (const FarCand& fc : farCands)
+            {
+                // ALWAYS touch: a starved candidate that never touched the
+                // ledger lost its Ready entry to GC (8s), got re-demanded,
+                // re-delivered, and starved again — a livelock for the back
+                // of the band ("streams only up to the middle ring").
+                // Touch is a map lookup; only the ADD is budgeted.
+                const bool warm = warmOrRequest(fc.ptr, fc.d2);
+                if (farAdds >= kFarMinAdds && Clock::now() >= farDeadline)
+                {
+                    ++farStarved;
+                    continue;
+                }
+                if (!warm)
+                {
+                    ++farCold;
+                    continue; // demand filed; adds when Ready
+                }
+                try
+                {
+                    addObject(fc.ptr, mWorld, mPagedRefs, *mPhysics, mRendering);
+                    ++vitaOps;
+                    ++sVitaLiveObjects;
+                    ++farAdds;
+                }
+                catch (const std::exception& e)
+                {
+                    ++farThrew;
+                    Log(Debug::Error) << "far-band hydrate fail '" << fc.ptr.getCellRef().getRefId()
+                                      << "': " << e.what();
+                }
+            }
+            static Clock::time_point sFarLog{};
+            if ((farAdds > 0 || farStarved > 0 || farCold > 0) && tick0 - sFarLog > std::chrono::seconds(5))
+            {
+                sFarLog = tick0;
+                // Name the first still-cold candidate: is it ever delivered?
+                char fb[160];
+                const char* firstId = "";
+                std::string firstIdStr;
+                if (farCold > 0 && !farCands.empty())
+                {
+                    firstIdStr = farCands.front().ptr.getCellRef().getRefId().toDebugString();
+                    firstId = firstIdStr.c_str();
+                }
+                snprintf(fb, sizeof(fb), "[FarBand] adds=%d cold=%d starved=%d threw=%d cands=%d slice=%dms first=%s",
+                    farAdds, farCold, farStarved, farThrew, (int)farCands.size(), std::max(1, maxMs / 3), firstId);
+                Vita::breadcrumb(fb);
+            }
+        }
+
         // ---- Shell passes: the closest missing structure ANYWHERE wins.
         // Budget exhausts in the nearest unfinished shell, so catch-up under
         // sprint fills as a wave from the player outward, not by cell.
@@ -3192,7 +3518,12 @@ namespace MWWorld
                 continue;
             const float edge2 = vitaCellEdge2(cell, pp);
             const bool wantFull = edge2 < rIn * rIn;
-            const bool wantStruct = edge2 < rStructIn * rStructIn;
+            // Cell gate must reach as far as ref eligibility does: a fresh
+            // cell whose edge sits between rStructIn and the view reach was
+            // never scanned, so its view-overlapping statics never queued.
+            // vitaCellEdge2 already folds the cell's refs' true bound box in.
+            const float rStructScan = rViewReach + rHeadStretch;
+            const bool wantStruct = edge2 < rStructScan * rStructScan;
             const bool inActorDomain = mVitaActorDomain.count(&cell) > 0;
             const bool inSceneDomain = mVitaPhysDomain.count(&cell) > 0;
             if (!wantFull && !inActorDomain && !wantStruct && !inSceneDomain)
@@ -3270,21 +3601,23 @@ namespace MWWorld
                                     anyResident = true;
                                 }
                             }
-                            else if (d2 < (rStructMax + rHeadStretch + 4608.f) * (rStructMax + rHeadStretch + 4608.f))
+                            else if (d2 < (rViewReach + rHeadStretch + 8192.f) * (rViewReach + rHeadStretch + 8192.f))
                             {
                                 const VFS::Path::Normalized m = getModel(ptr);
                                 if (!m.empty())
                                 {
                                     float br = mPreloader->vitaKnownBoundRadius(std::string(m.value()));
                                     if (br <= 0.f)
-                                        br = 300.f; // unlearned: modest until first load teaches
-                                    // Salience reach: eligible while apparent
-                                    // size br*scale/d exceeds ~0.1.
-                                    const float reach
-                                        = std::min(rStructMax - rStructIn + 4608.f,
-                                              10.f * br * ptr.getCellRef().getScale());
-                                    const float dEff = std::sqrt(d2) - reach;
-                                    if (dEff < rEff)
+                                        br = 1200.f; // unlearned: assume building-class; first load teaches
+                                    // Overlap test: geometry crosses the view
+                                    // sphere (origin distance minus bound
+                                    // radius). A wall whose origin is past the
+                                    // fog line but whose bulk is in view stays.
+                                    const float bound = br * ptr.getCellRef().getScale();
+                                    const float dEff = std::sqrt(d2) - bound;
+                                    // Eligible if within the near band, or if
+                                    // its geometry overlaps the view reach.
+                                    if (dEff < rEff || dEff < rViewReach)
                                     {
                                         if (warmOrRequest(ptr, d2))
                                         {
@@ -3324,10 +3657,13 @@ namespace MWWorld
                             const VFS::Path::Normalized mo = getModel(ptr);
                             const float bro
                                 = mo.empty() ? 0.f : mPreloader->vitaKnownBoundRadius(std::string(mo.value()));
-                            const float broBase = bro > 0.f ? 10.f * bro : 2400.f; // unknown: keep generously
-                            const float reach = std::min(rStructMax - rStructIn + 4608.f,
-                                broBase * ptr.getCellRef().getScale());
-                            if (std::sqrt(d2) - reach > rEffOut)
+                            // Same unlearned default as eligibility, or an
+                            // unlearned object flaps in/out at the boundary.
+                            const float bound = (bro > 0.f ? bro : 1200.f) * ptr.getCellRef().getScale();
+                            const float dEffOut = std::sqrt(d2) - bound;
+                            // Mirror of eligibility, +500 hysteresis, so the
+                            // view-reach boundary does not churn.
+                            if (dEffOut > rEffOut && dEffOut > rViewReach + 500.f)
                             {
                                 removeNonLiteObject(ptr, nullptr);
                                 sVitaLiveObjects = std::max(0, sVitaLiveObjects - 1);
@@ -3427,17 +3763,18 @@ namespace MWWorld
             if (std::chrono::duration_cast<std::chrono::seconds>(tick0 - sLastMap).count() >= 10)
             {
                 sLastMap = tick0;
-                char mm[144];
+                char mm[176];
                 int dw = 0, dl = 0, dr = 0;
                 mPreloader->vitaDemandStats(dw, dl, dr);
                 unsigned rigH = 0, rigM = 0, rigN = 0;
                 SceneUtil::getRigCacheStats(rigH, rigM, rigN);
                 snprintf(mm, sizeof(mm),
-                    "[MemMap] heap=%dMB objs=%d phys=%d stores=%d dmd=%du%d/%d/%d rig=%u/%u/%u ct=%u bud=%d/%d%s",
+                    "[MemMap] heap=%dMB objs=%d phys=%d stores=%d dmd=%du%d/%d/%d rig=%u/%u/%u ct=%u bud=%d/%d%s "
+                    "issued=%u/10s",
                     Vita::getHeapUsedMB(), (int)mRendering.getObjects().getObjectCount(),
                     (int)mPhysics->getObjectCount(), (int)mWorld.getWorldModel().vitaCellStoreCount(), dw,
                     mPreloader->vitaDemandUrgentCount(), dl, dr, rigH, rigM, rigN, sVitaContactAdds, maxMs,
-                    vitaOtherMs, vitaCatchUp ? "C" : "");
+                    vitaOtherMs, vitaCatchUp ? "C" : "", (unsigned)mPreloader->vitaDemandIssuedAndReset());
                 sVitaContactAdds = 0;
                 Vita::breadcrumb(mm);
             }
@@ -3457,8 +3794,10 @@ namespace MWWorld
             return vitaOps;
         SegTimer segActor(&sSegActorUs);
         int actorBudget = bigBudget ? 1000 : 1;
+        std::vector<osg::ref_ptr<const osg::Referenced>> actorPins;
         while (actorBudget > 0)
         {
+            actorPins.clear();
             if (bigBudget && Clock::now() >= deadline)
                 return vitaOps;
             MWWorld::Ptr best;
@@ -3513,6 +3852,12 @@ namespace MWWorld
                     assetsWarm = warmPath(ap, bestD2) && assetsWarm;
                 if (!assetsWarm)
                     return vitaOps; // actor assets streaming; assemble next tick
+                // PIN every part across the add: the floating pool budget
+                // may evict a part between this gate and assembly (same
+                // tick), which cold-loaded a whole composite (~1s stutter).
+                for (const std::string& ap : actorPaths)
+                    if (osg::ref_ptr<const osg::Referenced> h = mPreloader->vitaHoldWarm(ap))
+                        actorPins.push_back(std::move(h));
             }
             try
             {

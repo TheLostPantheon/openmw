@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 namespace SceneUtil
 {
@@ -73,6 +74,15 @@ namespace SceneUtil
         bool mBoneCacheInit;
 
         bool mNeedToUpdateBoneMatrices;
+#ifdef __vita__
+        // Cull prune: bones with no renderable beneath them contribute
+        // nothing to cull (RigGeometry reads bone matrices by name, not by
+        // traversal). Cached set + structural checksum for invalidation.
+        std::vector<osg::Node*> mVitaPrunedList;
+        unsigned int mVitaPruneChecksum = 0;
+        unsigned int mVitaPruneFrame = 0;
+        void vitaRebuildPrune();
+#endif
 
         ActiveType mActive;
 

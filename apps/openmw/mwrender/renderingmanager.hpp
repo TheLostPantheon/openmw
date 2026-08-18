@@ -254,6 +254,10 @@ namespace MWRender
 
         float getNearClipDistance() const { return mNearClip; }
         float getViewDistance() const { return mViewDistance; }
+#ifdef __vita__
+        // Live land-fog end (weather-driven); streaming reach tracks it.
+        float vitaGetFogEnd() const;
+#endif
 
         void setViewDistance(float distance, bool delay = false);
 

@@ -145,9 +145,22 @@ namespace SceneUtil
         {
             mLastCullFrameNumber = nv.getTraversalNumber();
 #ifdef __vita__
-            // Marks bone transform visits for [CullProf].
+            // Re-validate the prune set every 30 cull frames via a cheap
+            // structural checksum (attach/detach changes bone child counts).
+            const unsigned int fr = nv.getTraversalNumber();
+            if (fr - mVitaPruneFrame >= 30 || mVitaPruneFrame == 0)
+            {
+                mVitaPruneFrame = fr;
+                vitaRebuildPrune();
+            }
+            // Marks bone transform visits for [CullProf]. Pruned bones (any
+            // depth) are hidden from this cull only via a temporary mask.
             ++cullprof_in_skeleton;
+            for (osg::Node* b : mVitaPrunedList)
+                b->setNodeMask(0);
             osg::Group::traverse(nv);
+            for (osg::Node* b : mVitaPrunedList)
+                b->setNodeMask(~0u);
             --cullprof_in_skeleton;
             return;
 #endif
@@ -155,6 +168,63 @@ namespace SceneUtil
 
         osg::Group::traverse(nv);
     }
+
+#ifdef __vita__
+    namespace
+    {
+        // True if any Drawable lives under node (bones excluded from the
+        // decision only by their own emptiness; a bone with a drawable
+        // somewhere below stays traversed).
+        bool vitaHasDrawableBelow(const osg::Node* node, unsigned int& checksum)
+        {
+            if (node->asDrawable())
+                return true;
+            const osg::Group* g = node->asGroup();
+            if (!g)
+                return false;
+            checksum = checksum * 31u + g->getNumChildren();
+            bool any = false;
+            for (unsigned int i = 0; i < g->getNumChildren(); ++i)
+                if (vitaHasDrawableBelow(g->getChild(i), checksum))
+                    any = true; // keep walking: checksum must cover the whole tree
+            return any;
+        }
+    }
+
+    namespace
+    {
+        // Collect maximal bone subtrees (any depth) that contain no Drawable.
+        // A pruned bone's children are not listed separately (parent covers).
+        void vitaCollectPrunable(osg::Node* node, std::vector<osg::Node*>& out, unsigned int& checksum)
+        {
+            osg::Group* g = node->asGroup();
+            if (!g)
+                return;
+            checksum = checksum * 31u + g->getNumChildren();
+            unsigned int dummy = 0;
+            if (dynamic_cast<osg::MatrixTransform*>(node) != nullptr && !vitaHasDrawableBelow(node, dummy))
+            {
+                out.push_back(node);
+                return; // whole subtree hidden; no need to descend
+            }
+            for (unsigned int i = 0; i < g->getNumChildren(); ++i)
+                vitaCollectPrunable(g->getChild(i), out, checksum);
+        }
+    }
+
+    void Skeleton::vitaRebuildPrune()
+    {
+        unsigned int checksum = 0;
+        std::vector<osg::Node*> pruned;
+        for (unsigned int i = 0; i < getNumChildren(); ++i)
+            vitaCollectPrunable(getChild(i), pruned, checksum);
+        if (checksum != mVitaPruneChecksum || pruned.size() != mVitaPrunedList.size())
+        {
+            mVitaPruneChecksum = checksum;
+            mVitaPrunedList.swap(pruned);
+        }
+    }
+#endif
 
     void Skeleton::childInserted(unsigned int)
     {

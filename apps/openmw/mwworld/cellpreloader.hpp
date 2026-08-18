@@ -125,6 +125,12 @@ namespace MWWorld
         VitaDemandState vitaDemandTouch(const std::string& path, float prio = 1e12f);
         int vitaDemandWantedCount() const { return mVitaWantedCount; }
         int vitaDemandUrgentCount() const;
+        std::size_t vitaDemandIssuedAndReset()
+        {
+            const std::size_t n = mVitaDemandIssued;
+            mVitaDemandIssued = 0;
+            return n;
+        }
         void vitaDemandWant(const std::string& path);
         void vitaStoreDemandRef(const std::string& path, osg::ref_ptr<const osg::Referenced> tmpl,
             osg::ref_ptr<const osg::Referenced> shape);
@@ -155,6 +161,9 @@ namespace MWWorld
         void vitaStoreCommonRef(const std::string& path, osg::ref_ptr<const osg::Referenced> tmpl,
             osg::ref_ptr<const osg::Referenced> shape, bool regionTarget = false, unsigned epoch = 0);
         bool vitaIsCommonWarm(const std::string& path) const;
+        /// Warm template ref (pool or Ready ledger), or null. Callers pin it
+        /// across gate->add so pool eviction between them cannot cold-load.
+        osg::ref_ptr<const osg::Referenced> vitaHoldWarm(const std::string& path) const;
         /// Total template+shape bytes pinned by the warm pools.
         std::size_t vitaWarmPoolBytes() const;
         /// Evict lowest value-per-byte entries until under target.
@@ -248,6 +257,8 @@ namespace MWWorld
         std::atomic<int> mVitaDemandLatencyMs{ 1500 };
         std::chrono::steady_clock::time_point mVitaPumpGraceUntil{};
         osg::ref_ptr<SceneUtil::WorkItem> mVitaDemandItem;
+        osg::ref_ptr<SceneUtil::WorkItem> mVitaDemandItem2; // second lane: two preload threads
+        std::size_t mVitaDemandIssued = 0; // delivery-rate telemetry
         void vitaDemandGC();
         std::map<std::pair<int, int>, std::vector<std::pair<std::string, unsigned>>> mVitaHotspots;
         std::set<std::pair<int, int>> mVitaQueuedHotspots;
