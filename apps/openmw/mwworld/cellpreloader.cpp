@@ -34,6 +34,7 @@
 #include <components/resource/scenemanager.hpp>
 #include <components/terrain/view.hpp>
 #include <components/terrain/world.hpp>
+#include <components/settings/values.hpp>
 #include <components/vfs/manager.hpp>
 
 #include "../mwrender/landmanager.hpp"
@@ -1627,10 +1628,50 @@ namespace MWWorld
         mPreloadInstances = preload;
     }
 
+#ifdef __vita__
+    namespace
+    {
+        // Opens the archive handle pool on the worker that runs it: the
+        // first BSA access per thread pays fopen + a deep FAT seek (350-
+        // 420ms measured); paying it at boot moves that stall off the
+        // first streamed asset. One item per preload thread.
+        class VitaHandleWarmItem : public SceneUtil::WorkItem
+        {
+        public:
+            explicit VitaHandleWarmItem(const VFS::Manager* vfs)
+                : mVFS(vfs)
+            {
+            }
+            void doWork() override
+            {
+                try
+                {
+                    // Any BSA member; base_anim always lives in Morrowind.bsa.
+                    Files::IStreamPtr st = mVFS->get(VFS::Path::NormalizedView("meshes/base_anim.nif"));
+                    char c;
+                    st->read(&c, 1);
+                }
+                catch (...)
+                {
+                }
+            }
+
+        private:
+            const VFS::Manager* mVFS;
+        };
+    }
+#endif
+
     void CellPreloader::setWorkQueue(osg::ref_ptr<SceneUtil::WorkQueue> workQueue)
     {
         mWorkQueue = workQueue;
 #ifdef __vita__
+        // Handle pool is per thread: one warm item per preload thread. The
+        // queue hands items to idle threads, so posting N items with N
+        // threads reaches each once the first blocks on I/O.
+        if (mWorkQueue)
+            for (int i = 0; i < Settings::cells().mPreloadNumThreads; ++i)
+                mWorkQueue->addWorkItem(new VitaHandleWarmItem(mResourceSystem->getVFS()));
         vitaLoadModelFreq();
         vitaLoadModelBounds();
         vitaLoadRegionPackages();

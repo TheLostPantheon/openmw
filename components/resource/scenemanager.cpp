@@ -1,5 +1,12 @@
 #include "scenemanager.hpp"
 
+#ifdef __vita__
+#include <chrono>
+#include <cstdio>
+
+extern "C" void vitaBreadcrumb(const char* msg);
+#endif
+
 #include <cstdlib>
 #include <filesystem>
 
@@ -1078,6 +1085,10 @@ namespace Resource
         else
         {
             osg::ref_ptr<osg::Node> loaded;
+#ifdef __vita__
+            using LClock = std::chrono::steady_clock;
+            const auto lp0 = LClock::now();
+#endif
             try
             {
                 loaded = load(path, mVFS, mImageManager, mNifFileManager, mBgsmFileManager);
@@ -1087,6 +1098,9 @@ namespace Resource
                 Log(Debug::Error) << "Failed to load '" << path << "': " << e.what() << ", using marker_error instead";
                 loaded = cloneErrorMarker();
             }
+#ifdef __vita__
+            const auto lp1 = LClock::now();
+#endif
 
             // set filtering settings
             SetFilterSettingsVisitor setFilterSettingsVisitor(mMinFilter, mMagFilter, mMaxAnisotropy);
@@ -1097,6 +1111,9 @@ namespace Resource
 
             osg::ref_ptr<Shader::ShaderVisitor> shaderVisitor(createShaderVisitor());
             loaded->accept(*shaderVisitor);
+#ifdef __vita__
+            const auto lp2 = LClock::now();
+#endif
 
             if (canOptimize(path.value()))
             {
@@ -1111,6 +1128,9 @@ namespace Resource
             }
             else
                 shareState(loaded);
+#ifdef __vita__
+            const auto lp3 = LClock::now();
+#endif
 
 #ifdef __vita__
             // After the optimizer so unmerged leftovers are covered too.
@@ -1118,6 +1138,24 @@ namespace Resource
             {
                 EnableVBOVisitor enableVbo;
                 loaded->accept(enableVbo);
+            }
+            {
+                // Load-pipeline phase split for cold templates. Names where
+                // the payload cost actually is (parse vs visitors vs
+                // optimizer) so payload levers are grounded, not guessed.
+                const auto lp4 = LClock::now();
+                const auto ms = [](LClock::time_point a, LClock::time_point b) {
+                    return (int)std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+                };
+                const int total = ms(lp0, lp4);
+                if (total >= 20)
+                {
+                    char lb[224];
+                    snprintf(lb, sizeof(lb), "[LoadSplit] %.110s total=%d parse=%d vis=%d opt=%d vbo=%d",
+                        std::string(path.value()).c_str(), total, ms(lp0, lp1), ms(lp1, lp2), ms(lp2, lp3),
+                        ms(lp3, lp4));
+                    vitaBreadcrumb(lb);
+                }
             }
 #endif
 
@@ -1130,6 +1168,8 @@ namespace Resource
             return loaded;
         }
     }
+
+
 
     osg::ref_ptr<osg::Node> SceneManager::getInstance(VFS::Path::NormalizedView path, bool allowParticles)
     {

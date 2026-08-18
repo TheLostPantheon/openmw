@@ -25,6 +25,11 @@ namespace Files
         std::size_t mSize;
         Platform::File::ScopedHandle mFile;
 #ifdef __vita__
+        // Own absolute position: handles are pooled per thread on Vita, so
+        // the OS file position cannot be trusted across streams.
+        std::size_t mPos = 0;
+#endif
+#ifdef __vita__
         // 64K: fewer sceIo calls; bigger regresses seek-heavy ESM reads.
         char mBuffer[65536]{ 0 };
 #else

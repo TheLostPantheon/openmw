@@ -3292,7 +3292,6 @@ namespace MWWorld
             static unsigned sFarScanGen = 0;
             std::vector<FarCand>& farCands = sFarCands;
             const float rNearBand = rStructIn + rHeadStretch;
-            int farStarved = 0;
             const float fmx = pp.x() - sFarScanPos.x();
             const float fmy = pp.y() - sFarScanPos.y();
             const unsigned farEpoch = mPreloader->vitaDemandReadyEpoch();
@@ -3357,8 +3356,6 @@ namespace MWWorld
                         return true; // not overlapping the view sphere yet
                     if (farCands.size() < 64)
                         farCands.push_back({ ptr, dEff, d2 });
-                    else
-                        ++farStarved;
                     return true;
                 });
             }
@@ -3374,7 +3371,6 @@ namespace MWWorld
                                [](const FarCand& c) { return c.ptr.getRefData().getBaseNode() != nullptr; }),
                 farCands.end());
             int farAdds = 0;
-            int farCold = 0, farThrew = 0;
             // The SCAN consumed the whole slice in dense scenes, so the add
             // loop hit the deadline on entry — every tick, zero adds, while
             // "starved" read as a delivery problem. Adds get their own floor:
@@ -3390,15 +3386,9 @@ namespace MWWorld
                 // Touch is a map lookup; only the ADD is budgeted.
                 const bool warm = warmOrRequest(fc.ptr, fc.d2);
                 if (farAdds >= kFarMinAdds && Clock::now() >= farDeadline)
-                {
-                    ++farStarved;
                     continue;
-                }
                 if (!warm)
-                {
-                    ++farCold;
                     continue; // demand filed; adds when Ready
-                }
                 try
                 {
                     addObject(fc.ptr, mWorld, mPagedRefs, *mPhysics, mRendering);
@@ -3408,27 +3398,9 @@ namespace MWWorld
                 }
                 catch (const std::exception& e)
                 {
-                    ++farThrew;
                     Log(Debug::Error) << "far-band hydrate fail '" << fc.ptr.getCellRef().getRefId()
                                       << "': " << e.what();
                 }
-            }
-            static Clock::time_point sFarLog{};
-            if ((farAdds > 0 || farStarved > 0 || farCold > 0) && tick0 - sFarLog > std::chrono::seconds(5))
-            {
-                sFarLog = tick0;
-                // Name the first still-cold candidate: is it ever delivered?
-                char fb[160];
-                const char* firstId = "";
-                std::string firstIdStr;
-                if (farCold > 0 && !farCands.empty())
-                {
-                    firstIdStr = farCands.front().ptr.getCellRef().getRefId().toDebugString();
-                    firstId = firstIdStr.c_str();
-                }
-                snprintf(fb, sizeof(fb), "[FarBand] adds=%d cold=%d starved=%d threw=%d cands=%d slice=%dms first=%s",
-                    farAdds, farCold, farStarved, farThrew, (int)farCands.size(), std::max(1, maxMs / 3), firstId);
-                Vita::breadcrumb(fb);
             }
         }
 

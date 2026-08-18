@@ -1,5 +1,11 @@
 #include "imagemanager.hpp"
 
+#ifdef __vita__
+#include <chrono>
+#include <cstdio>
+extern "C" void vitaBreadcrumb(const char* msg);
+#endif
+
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -428,8 +434,26 @@ namespace Resource
                 stream->seekg(0);
             }
 
+#ifdef __vita__
+            const auto vitaImgT0 = std::chrono::steady_clock::now();
+#endif
             osgDB::ReaderWriter::ReadResult result
                 = reader->readImage(*stream, disableFlip ? mOptionsNoFlip : mOptions);
+#ifdef __vita__
+            {
+                // Per-image decode cost: names texture reads that dominate
+                // a model's "parse" time in [LoadSplit].
+                const int ims = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - vitaImgT0)
+                                    .count();
+                if (ims >= 15)
+                {
+                    char ib[200];
+                    snprintf(ib, sizeof(ib), "[ImgLoad] %dms %.140s", ims, std::string(path.value()).c_str());
+                    vitaBreadcrumb(ib);
+                }
+            }
+#endif
             if (!result.success())
             {
                 Log(Debug::Error) << "Error loading " << path << ": " << result.message() << " code "

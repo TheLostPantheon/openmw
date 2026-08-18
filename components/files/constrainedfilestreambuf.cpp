@@ -15,8 +15,12 @@ namespace Files
         mFile = File::open(fname);
         mSize = length != std::numeric_limits<std::size_t>::max() ? length : File::size(mFile) - start;
 
+#ifdef __vita__
+        mPos = start;
+#else
         if (start != 0)
             File::seek(mFile, start);
+#endif
 
         setg(nullptr, nullptr, nullptr);
     }
@@ -25,10 +29,18 @@ namespace Files
     {
         if (gptr() == egptr())
         {
+#ifdef __vita__
+            // Seek to OUR position first: the handle is shared per thread.
+            File::seek(mFile, mPos);
+            const std::size_t toRead = std::min((mOrigin + mSize) - mPos, sizeof(mBuffer));
+            const std::size_t got = File::read(mFile, mBuffer, toRead);
+            mPos += got;
+#else
             const std::size_t toRead = std::min((mOrigin + mSize) - (File::tell(mFile)), sizeof(mBuffer));
             // Read in the next chunk of data, and set the read pointers on success
             // Failure will throw exception.
             const std::size_t got = File::read(mFile, mBuffer, toRead);
+#endif
             setg(mBuffer, mBuffer, mBuffer + got);
         }
         if (gptr() == egptr())
@@ -51,7 +63,11 @@ namespace Files
                 newPos = offset;
                 break;
             case std::ios_base::cur:
+#ifdef __vita__
+                newPos = (mPos - mOrigin - (egptr() - gptr())) + offset;
+#else
                 newPos = (File::tell(mFile) - mOrigin - (egptr() - gptr())) + offset;
+#endif
                 break;
             case std::ios_base::end:
                 newPos = mSize + offset;
@@ -63,7 +79,11 @@ namespace Files
         if (newPos > mSize)
             return traits_type::eof();
 
+#ifdef __vita__
+        mPos = mOrigin + newPos;
+#else
         File::seek(mFile, mOrigin + newPos);
+#endif
 
         // Clear read pointers so underflow() gets called on the next read attempt.
         setg(nullptr, nullptr, nullptr);
@@ -79,7 +99,11 @@ namespace Files
         if (static_cast<std::size_t>(pos) > mSize)
             return traits_type::eof();
 
+#ifdef __vita__
+        mPos = mOrigin + static_cast<std::size_t>(pos);
+#else
         File::seek(mFile, mOrigin + pos);
+#endif
 
         // Clear read pointers so underflow() gets called on the next read attempt.
         setg(nullptr, nullptr, nullptr);
