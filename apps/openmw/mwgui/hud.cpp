@@ -1,5 +1,6 @@
 #include "hud.hpp"
 
+
 #include <MyGUI_Button.h>
 #include <MyGUI_ImageBox.h>
 #include <MyGUI_InputManager.h>
@@ -499,30 +500,43 @@ namespace MWGui
 
     void HUD::setWeapVisible(bool visible)
     {
+        if (mWeapBox->getVisible() == visible)
+            return;
         mWeapBox->setVisible(visible);
         updatePositions();
     }
 
     void HUD::setSpellVisible(bool visible)
     {
+        if (mSpellBox->getVisible() == visible)
+            return;
         mSpellBox->setVisible(visible);
         updatePositions();
     }
 
     void HUD::setSneakVisible(bool visible)
     {
+        // Called every frame from Actors::updateSneaking (sim thread);
+        // an unconditional updatePositions() dirtied four HUD widgets per
+        // frame and defeated the GUI render-skip.
+        if (mSneakBox->getVisible() == visible)
+            return;
         mSneakBox->setVisible(visible);
         updatePositions();
     }
 
     void HUD::setEffectVisible(bool visible)
     {
+        if (mEffectBox->getVisible() == visible)
+            return;
         mEffectBox->setVisible(visible);
         updatePositions();
     }
 
     void HUD::setMinimapVisible(bool visible)
     {
+        if (mMinimapBox->getVisible() == visible)
+            return;
         mMinimapBox->setVisible(visible);
         updatePositions();
     }
@@ -547,9 +561,12 @@ namespace MWGui
         if (!mWeaponVisible && !mSpellVisible)
             mWeaponSpellBox->setVisible(false);
 
-        mWeapBox->setPosition(mWeapBoxBaseLeft - weapDx, mWeapBox->getTop());
-        mSpellBox->setPosition(mSpellBoxBaseLeft - spellDx, mSpellBox->getTop());
-        mSneakBox->setPosition(mSneakBoxBaseLeft - sneakDx, mSneakBox->getTop());
+        if (mWeapBox->getLeft() != mWeapBoxBaseLeft - weapDx)
+            mWeapBox->setPosition(mWeapBoxBaseLeft - weapDx, mWeapBox->getTop());
+        if (mSpellBox->getLeft() != mSpellBoxBaseLeft - spellDx)
+            mSpellBox->setPosition(mSpellBoxBaseLeft - spellDx, mSpellBox->getTop());
+        if (mSneakBox->getLeft() != mSneakBoxBaseLeft - sneakDx)
+            mSneakBox->setPosition(mSneakBoxBaseLeft - sneakDx, mSneakBox->getTop());
 
         const MyGUI::IntSize& viewSize = MyGUI::RenderManager::getInstance().getViewSize();
 
@@ -562,8 +579,9 @@ namespace MWGui
         if (!mMapVisible)
             mCellNameBox->setVisible(false);
 
-        mEffectBox->setPosition(
-            (viewSize.width - mEffectBoxBaseRight) - mEffectBox->getWidth() + effectsDx, mEffectBox->getTop());
+        const int effectLeft = (viewSize.width - mEffectBoxBaseRight) - mEffectBox->getWidth() + effectsDx;
+        if (mEffectBox->getLeft() != effectLeft)
+            mEffectBox->setPosition(effectLeft, mEffectBox->getTop());
     }
 
     void HUD::updateEnemyHealthBar()
@@ -587,12 +605,23 @@ namespace MWGui
 
     void HUD::setEnemy(const MWWorld::Ptr& enemy)
     {
-        mEnemyActor = enemy.getCellRef().getRefNum();
-        mEnemyHealthTimer = MWBase::Environment::get()
-                                .getESMStore()
-                                ->get<ESM::GameSetting>()
-                                .find("fNPCHealthBarTime")
-                                ->mValue.getFloat();
+        static const float fNPCHealthBarTime = MWBase::Environment::get()
+                                                   .getESMStore()
+                                                   ->get<ESM::GameSetting>()
+                                                   .find("fNPCHealthBarTime")
+                                                   ->mValue.getFloat();
+        const ESM::RefNum refNum = enemy.getCellRef().getRefNum();
+        // Called per hit / per hostile-effect tick from the sim thread. Same
+        // enemy already shown: just extend the timer; the per-frame
+        // updateEnemyHealthBar in onFrame owns the bar. Re-showing an
+        // already-visible bar dirtied the HUD every combat frame.
+        if (mEnemyActor == refNum && mEnemyHealth->getVisible())
+        {
+            mEnemyHealthTimer = fNPCHealthBarTime;
+            return;
+        }
+        mEnemyActor = refNum;
+        mEnemyHealthTimer = fNPCHealthBarTime;
         if (!mEnemyHealth->getVisible())
             mWeaponSpellBox->setPosition(mWeaponSpellBox->getPosition() - MyGUI::IntPoint(0, 20));
         mEnemyHealth->setVisible(true);

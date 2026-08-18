@@ -1,5 +1,8 @@
 #include "myguirendermanager.hpp"
 
+#include <cstdio>
+#include <cstring>
+
 #include <MyGUI_Timer.h>
 #ifdef __vita__
 #include <MyGUI_LayerManager.h>
@@ -18,6 +21,11 @@
 #include <components/shader/shadermanager.hpp>
 
 #include "myguitexture.hpp"
+#ifdef __vita__
+#include <MyGUI_ISubWidget.h>
+#include <MyGUI_Widget.h>
+namespace Vita { bool isSimThread(); }
+#endif
 
 #define MYGUI_PLATFORM_LOG_SECTION "Platform"
 #define MYGUI_PLATFORM_LOG(level, text) MYGUI_LOGGING(MYGUI_PLATFORM_LOG_SECTION, level, text)
@@ -515,6 +523,92 @@ namespace MyGUIPlatform
 #ifdef __vita__
     uint32_t g_vitaGuiWalks = 0;
     uint32_t g_vitaGuiSkips = 0;
+    // Dirty attribution: every sub-widget dirty site reports (via the
+    // MyGUI probe macro). Keyed by owning widget name/type + parent chain
+    // + thread; top rows printed per audit window.
+    struct VitaDirtyRow
+    {
+        char key[72];
+        uint32_t n;
+    };
+    VitaDirtyRow g_vitaGuiDirtyRows[12] = {};
+    // Attribution table is opt-in: ux0:data/openmw/guidirty.txt. The probe
+    // macro's weak-hook check is the only per-dirty cost when off.
+    bool g_vitaGuiDirtyEnabled = false;
+    extern "C" void vitaGuiSubDirty(MyGUI::ISubWidget* sub)
+    {
+        if (!sub || !g_vitaGuiDirtyEnabled)
+            return;
+        char key[72];
+        MyGUI::Widget* w = nullptr;
+        if (MyGUI::ICroppedRectangle* cp = sub->getCroppedParent())
+            w = dynamic_cast<MyGUI::Widget*>(cp);
+        // Label = name if set, else type (type is a string_view).
+        const auto label = [](const MyGUI::Widget* x, char* out, size_t cap) {
+            if (!x)
+            {
+                out[0] = 0;
+                return;
+            }
+            const std::string& nm = x->getName();
+            if (!nm.empty())
+                snprintf(out, cap, "%s", nm.c_str());
+            else
+            {
+                const std::string_view tn = x->getTypeName();
+                snprintf(out, cap, "%.*s", (int)tn.size(), tn.data());
+            }
+        };
+        if (w)
+        {
+            char l0[28], l1[20], l2[20];
+            label(w, l0, sizeof(l0));
+            label(w->getParent(), l1, sizeof(l1));
+            label(w->getParent() ? w->getParent()->getParent() : nullptr, l2, sizeof(l2));
+            const std::string_view tn = w->getTypeName();
+            snprintf(key, sizeof(key), "%s<%.*s>^%s^%s%s", l0, (int)tn.size(), tn.data(), l1, l2,
+                Vita::isSimThread() ? "@sim" : "");
+        }
+        else
+        {
+            const std::string_view tn = sub->getTypeName();
+            snprintf(key, sizeof(key), "?<%.*s>%s", (int)tn.size(), tn.data(), Vita::isSimThread() ? "@sim" : "");
+        }
+        for (auto& row : g_vitaGuiDirtyRows)
+        {
+            if (row.key[0] == 0)
+            {
+                snprintf(row.key, sizeof(row.key), "%s", key);
+                row.n = 1;
+                return;
+            }
+            if (strcmp(row.key, key) == 0)
+            {
+                ++row.n;
+                return;
+            }
+        }
+    }
+    // Per-layer dirty attribution: which layer forced each walk.
+    char g_vitaGuiDirtyLayers[8][24] = {};
+    uint32_t g_vitaGuiDirtyCounts[8] = {};
+    static void vitaNoteDirtyLayer(const std::string& name)
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            if (g_vitaGuiDirtyLayers[i][0] == 0)
+            {
+                snprintf(g_vitaGuiDirtyLayers[i], sizeof(g_vitaGuiDirtyLayers[i]), "%s", name.c_str());
+                g_vitaGuiDirtyCounts[i] = 1;
+                return;
+            }
+            if (name == g_vitaGuiDirtyLayers[i])
+            {
+                ++g_vitaGuiDirtyCounts[i];
+                return;
+            }
+        }
+    }
 #endif
 
     void RenderManager::collectDrawCalls()
@@ -535,6 +629,8 @@ namespace MyGUIPlatform
             {
                 if (layers.current()->isOutOfDate())
                 {
+                    if (!anyDirty)
+                        vitaNoteDirtyLayer(layers.current()->getName());
                     anyDirty = true;
                     break;
                 }

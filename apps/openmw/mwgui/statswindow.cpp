@@ -152,12 +152,24 @@ namespace MWGui
         MyGUI::ProgressBar* pt;
         getWidget(pt, name);
 
+        // Compare-before-set on the DISPLAYED integers: the watcher fires
+        // on every float change (fatigue regenerates continuously), and
+        // rewriting identical text/progress dirtied this window every
+        // frame — even while closed — defeating the GUI render-skip.
+        const size_t range = static_cast<size_t>(std::max(0, max));
+        const size_t pos = static_cast<size_t>(std::max(0, val));
+        if (pt->getProgressRange() == range && pt->getProgressPosition() == pos)
+        {
+            // Text tracks the same ints; if the bar is unchanged, so is it.
+            return;
+        }
+
         std::stringstream out;
         out << val << "/" << max;
         setText(tname, out.str());
 
-        pt->setProgressRange(std::max(0, max));
-        pt->setProgressPosition(std::max(0, val));
+        pt->setProgressRange(range);
+        pt->setProgressPosition(pos);
     }
 
     void StatsWindow::setPlayerName(const std::string& playerName)

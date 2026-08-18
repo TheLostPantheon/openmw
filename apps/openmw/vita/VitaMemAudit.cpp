@@ -24,6 +24,7 @@ extern "C"
     extern unsigned int cullprof_node, cullprof_group, cullprof_transform, cullprof_geode, cullprof_drawable,
         cullprof_dcull, cullprof_leaves, cullprof_sg, cullprof_xf_bone;
     extern unsigned int cullprof_drw_us, cullprof_cb_us, cullprof_xf_us, cullprof_grp_us;
+    extern unsigned int cullprof_xfbound_us;
     extern uint32_t vita_sim_script_us, vita_sim_mech_us, vita_sim_phys_us, vita_sim_gscript_us;
     int cullprof_cb_report(char* buf, unsigned int buflen);
     int vita_script_hist_report(char* buf, unsigned int buflen);
@@ -53,6 +54,15 @@ namespace MyGUIPlatform
 {
     extern uint32_t g_vitaGuiWalks;
     extern uint32_t g_vitaGuiSkips;
+    extern char g_vitaGuiDirtyLayers[8][24];
+    extern uint32_t g_vitaGuiDirtyCounts[8];
+    struct VitaDirtyRow
+    {
+        char key[72];
+        uint32_t n;
+    };
+    extern VitaDirtyRow g_vitaGuiDirtyRows[12];
+    extern bool g_vitaGuiDirtyEnabled;
 }
 
 #include <cstdint>
@@ -544,6 +554,42 @@ namespace Vita
         vgl_memo_hits = vgl_memo_miss = 0;
         vgl_vprog_hits = vgl_vprog_miss = 0;
         vita_bin2_graphs = vita_bin2_leaves = 0;
+        {
+            char gl[200];
+            int n = snprintf(gl, sizeof(gl), "[GuiWalks]");
+            for (int i = 0; i < 8 && MyGUIPlatform::g_vitaGuiDirtyLayers[i][0]; ++i)
+            {
+                n += snprintf(gl + n, sizeof(gl) - n, " %s=%u", MyGUIPlatform::g_vitaGuiDirtyLayers[i],
+                    MyGUIPlatform::g_vitaGuiDirtyCounts[i]);
+                MyGUIPlatform::g_vitaGuiDirtyLayers[i][0] = 0;
+                MyGUIPlatform::g_vitaGuiDirtyCounts[i] = 0;
+                if (n >= (int)sizeof(gl) - 1)
+                    break;
+            }
+            auditLog(gl);
+            {
+                static bool sChecked = false;
+                if (!sChecked)
+                {
+                    sChecked = true;
+                    if (FILE* f = fopen("ux0:data/openmw/guidirty.txt", "rb"))
+                    {
+                        fclose(f);
+                        MyGUIPlatform::g_vitaGuiDirtyEnabled = true;
+                    }
+                }
+            }
+            for (auto& row : MyGUIPlatform::g_vitaGuiDirtyRows)
+            {
+                if (row.key[0] == 0)
+                    break;
+                char dr[112];
+                snprintf(dr, sizeof(dr), "[GuiDirtyW] %s=%u", row.key, row.n);
+                auditLog(dr);
+                row.key[0] = 0;
+                row.n = 0;
+            }
+        }
         MyGUIPlatform::g_vitaGuiSkips = MyGUIPlatform::g_vitaGuiWalks = 0;
         auditLog(buf);
 
@@ -564,7 +610,7 @@ namespace Vita
         {
             snprintf(buf, sizeof(buf),
                 "[CullProf] node=%u grp=%u xf=%u bone=%u geode=%u drw=%u dcull=%u leaves=%u crep=%u sg=%u terr=%.2fms "
-                "dus=%.2f cbus=%.2f xfus=%.2f gus=%.2f cdrop=%u /frame",
+                "dus=%.2f cbus=%.2f xfus=%.2f gus=%.2f xfbnd=%.2f cdrop=%u /frame",
                 cullprof_node / kReportEveryFrames, cullprof_group / kReportEveryFrames,
                 cullprof_transform / kReportEveryFrames, cullprof_xf_bone / kReportEveryFrames,
                 cullprof_geode / kReportEveryFrames, cullprof_drawable / kReportEveryFrames,
@@ -574,14 +620,15 @@ namespace Vita
                 (double)cullprof_drw_us / 1000.0 / kReportEveryFrames,
                 (double)cullprof_cb_us / 1000.0 / kReportEveryFrames,
                 (double)cullprof_xf_us / 1000.0 / kReportEveryFrames,
-                (double)cullprof_grp_us / 1000.0 / kReportEveryFrames, cullprof_crep_drop / kReportEveryFrames);
+                (double)cullprof_grp_us / 1000.0 / kReportEveryFrames,
+                (double)cullprof_xfbound_us / 1000.0 / kReportEveryFrames, cullprof_crep_drop / kReportEveryFrames);
             auditLog(buf);
         }
         cullprof_node = cullprof_group = cullprof_transform = cullprof_geode = 0;
         cullprof_drawable = cullprof_dcull = cullprof_leaves = cullprof_sg = 0;
         cullprof_xf_bone = cullprof_creplay = cullprof_crep_drop = 0;
         cullprof_terr_us = 0;
-        cullprof_drw_us = cullprof_cb_us = cullprof_xf_us = cullprof_grp_us = 0;
+        cullprof_drw_us = cullprof_cb_us = cullprof_xf_us = cullprof_grp_us = cullprof_xfbound_us = 0;
 
         // Sim-worker phase split: what the main thread's join actually waits on.
         if (vita_sim_script_us + vita_sim_mech_us + vita_sim_phys_us > 0)

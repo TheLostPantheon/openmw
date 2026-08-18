@@ -932,10 +932,27 @@ namespace MWGui
         }
         // else: need to know the current grid center, call setActiveMap from changeCell
 
+#ifdef __vita__
+        // Hidden widgets still dirty their layer on setPosition/setAngle:
+        // writing the map window's arrow while it is closed dirtied the
+        // Windows layer every tick and defeated the GUI render-skip. The
+        // window re-syncs on its next tick after opening.
+        if (mMap->isVisible())
+        {
+            mMap->setPlayerDir(playerdirection.x(), playerdirection.y());
+            mMap->setPlayerPos(x, y, u, v);
+        }
+        if (mHud->isVisible())
+        {
+            mHud->setPlayerDir(playerdirection.x(), playerdirection.y());
+            mHud->setPlayerPos(x, y, u, v);
+        }
+#else
         mMap->setPlayerDir(playerdirection.x(), playerdirection.y());
         mMap->setPlayerPos(x, y, u, v);
         mHud->setPlayerDir(playerdirection.x(), playerdirection.y());
         mHud->setPlayerPos(x, y, u, v);
+#endif
     }
 
     WindowBase* WindowManager::getActiveControllerWindow()

@@ -29,6 +29,14 @@
 #include "../mwworld/esmstore.hpp"
 #include "../mwworld/player.hpp"
 #include "../mwworld/worldmodel.hpp"
+#ifdef __vita__
+#include <components/esm3/loadmgef.hpp>
+
+#include "../mwmechanics/actorutil.hpp"
+#include "../mwmechanics/creaturestats.hpp"
+#include "../mwmechanics/magiceffects.hpp"
+#include "../mwworld/class.hpp"
+#endif
 
 #include "../mwrender/globalmap.hpp"
 #include "../mwrender/localmap.hpp"
@@ -751,6 +759,24 @@ namespace MWGui
 
     void LocalMapBase::updateMagicMarkers()
     {
+#ifdef __vita__
+        // 4Hz rebuild + forced redraw even with zero markers dirtied the HUD
+        // (minimap shares this path). Skip when nothing to show and nothing
+        // was shown.
+        {
+            const MWWorld::Ptr player = MWMechanics::getPlayer();
+            const MWMechanics::MagicEffects& effects = player.getClass().getCreatureStats(player).getMagicEffects();
+            const bool anyDetect = effects.getOrDefault(ESM::MagicEffect::DetectAnimal).getMagnitude() > 0
+                || effects.getOrDefault(ESM::MagicEffect::DetectKey).getMagnitude() > 0
+                || effects.getOrDefault(ESM::MagicEffect::DetectEnchantment).getMagnitude() > 0;
+            MWWorld::CellStore* mkCell = nullptr;
+            ESM::Position mkPos;
+            MWBase::Environment::get().getWorld()->getPlayer().getMarkedPosition(mkCell, mkPos);
+            const bool anyMark = mkCell != nullptr;
+            if (!anyDetect && !anyMark && mMagicMarkerWidgets.empty())
+                return;
+        }
+#endif
         // clear all previous markers
         for (MyGUI::Widget* widget : mMagicMarkerWidgets)
             MyGUI::Gui::getInstance().destroyWidget(widget);
