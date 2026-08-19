@@ -615,10 +615,9 @@ namespace MWGui
     void LocalMapBase::onFrame(float dt)
     {
 #ifdef __vita__
-        // Door-marker rebuild was 700ms of MyGUI widget churn in one frame.
-        // Gather once (cheap), then create a budget of widgets per frame so
-        // no single frame pays the whole cost. Held off the crossing frame
-        // via the settle window. Cosmetic — a few frames to fill is fine.
+        // Door-marker rebuild: gather once (cheap now — no interior force-
+        // load), then create widgets on a per-frame budget. Held off the
+        // crossing frame via the settle window.
         if (mNeedDoorMarkersUpdate && mVitaMapDeferFrames <= 0)
         {
             vitaGatherPendingDoors();

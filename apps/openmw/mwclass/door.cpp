@@ -303,7 +303,12 @@ namespace MWClass
         try
         {
             dest = MWBase::Environment::get().getWorld()->getCellName(
-                &MWBase::Environment::get().getWorldModel()->getCell(door.mRef.getDestCell()));
+                // forceLoad=false: the name comes from the cell RECORD, not
+                // its loaded refs. Forcing a load here materialised every
+                // teleport door's destination INTERIOR — on city entry the
+                // map's door-marker gather loaded all of Balmora's building
+                // interiors (503ms + [StateApply] storm).
+                &MWBase::Environment::get().getWorldModel()->getCell(door.mRef.getDestCell(), /*forceLoad*/ false));
         }
         catch (const std::exception& e)
         {

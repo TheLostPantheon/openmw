@@ -3376,6 +3376,7 @@ namespace MWWorld
             static unsigned sRadScanEpoch = 0;
             static unsigned sRadScanGen = 0;
             static std::size_t sRadScanCursor = 0;
+            static std::size_t sRadScanRefOffset = 0; // resume point within a dense cell
             static std::size_t sRadScanRot = 0;
             static std::size_t sRadScanN = 0;
             static bool sRadScanInProgress = false;
@@ -3409,6 +3410,7 @@ namespace MWWorld
                 sRadScanGen = sVitaFarCandGen;
                 sRadCands.clear();
                 sRadScanCursor = 0;
+                sRadScanRefOffset = 0;
                 sRadScanRot = sStartRot;
                 sRadScanN = n;
                 sRadScanInProgress = true;
@@ -3421,19 +3423,40 @@ namespace MWWorld
             // telemetry: scan=prog cands=0 forever; the whole queue was a
             // silent no-op while other lanes masked it).
             const auto scanDeadline = Clock::now() + std::chrono::milliseconds(2);
-            for (; sRadScanInProgress && sRadScanCursor < n && Clock::now() < scanDeadline; ++sRadScanCursor)
+            for (; sRadScanInProgress && sRadScanCursor < n && Clock::now() < scanDeadline;)
             {
                 CellStore& cell = *cells[(sRadScanCursor + sRadScanRot) % n];
                 if (!cell.getCell()->isExterior())
+                {
+                    ++sRadScanCursor;
                     continue;
+                }
                 if (cell.getState() != CellStore::State_Loaded)
                 {
                     ++sRadUnloadedSeen; // forEach no-ops silently on these
+                    ++sRadScanCursor;
                     continue;
                 }
                 if (vitaCellEdge2(cell, pp) > (rWarmReach + rHeadStretch + 8192.f) * (rWarmReach + rHeadStretch + 8192.f))
+                {
+                    ++sRadScanCursor;
                     continue;
+                }
+                // Deadline INSIDE forEach: a dense cell (thousands of refs)
+                // otherwise runs the whole forEach in one go, blowing the 2ms
+                // scan budget (sh=87ms on city entry, each ref taking the
+                // bound-radius mutex under pump contention). Resume mid-cell
+                // next tick via a saved ref offset.
+                std::size_t vScanRef = 0;
+                bool vScanAborted = false;
                 cell.forEach([&](const MWWorld::Ptr& ptr) {
+                    if (vScanRef++ < sRadScanRefOffset)
+                        return true; // already processed this cell up to here
+                    if ((vScanRef & 15) == 0 && Clock::now() >= scanDeadline)
+                    {
+                        vScanAborted = true;
+                        return false; // resume this cell next tick
+                    }
                     if (ptr.getRefData().getBaseNode() != nullptr)
                         return true;
                     if (!isLiteType(ptr.getType()) || isPagedRef(ptr))
@@ -3504,6 +3527,13 @@ namespace MWWorld
                     }
                     return true;
                 });
+                if (vScanAborted)
+                {
+                    sRadScanRefOffset = vScanRef - 1; // resume here next tick
+                    break; // out of the cell loop; deadline hit
+                }
+                sRadScanRefOffset = 0; // cell fully scanned; next cell fresh
+                ++sRadScanCursor;
             }
             if (sRadScanInProgress && sRadScanCursor >= n)
                 sRadScanInProgress = false;
@@ -3524,6 +3554,21 @@ namespace MWWorld
             // a few seconds; healthy frames use the full add slice anyway.
             constexpr int kRadMinAdds = 3;
             constexpr int kRadGuarAdds = 4;
+            // HARD per-tick add cap for live play: the ⅔-tick deadline let a
+            // healthy frame add ~16 statics at once on city entry (sh=82ms
+            // burst — a ~1s drop to ~4fps). Capping total adds smooths the
+            // fill: the city materialises over more ticks, each bounded to
+            // ~40ms. Screen loads (bigBudget) stay uncapped — the player is
+            // waiting there anyway.
+            const int kRadMaxAdds = bigBudget ? 100000 : 8;
+            // Touch cap: warmOrRequest takes mVitaCommonMutex, and on city
+            // entry sRadCands is ~160 mostly-COLD candidates — touching all
+            // of them contended with the busy pump worker for ~77ms/tick
+            // (sh=77, adds free). Candidates are nearest-first, so the near
+            // ones (guarantee ring + approaching outer) are covered; far
+            // ones get touched on later ticks as they shift up. Uncapped
+            // under screen load.
+            const int kRadTouchCap = bigBudget ? 100000 : 32;
             // Add slice starts NOW — after the scan — not at tick start.
             // Sharing one window let the 2ms scan consume the whole add
             // budget under load (bud=2 -> deadline passed before the first
@@ -3535,11 +3580,17 @@ namespace MWWorld
                 : Clock::now() + std::chrono::milliseconds(std::max(1, maxMs * 2 / 3));
             int radAdds = 0;
             int guarAdds = 0;
+            int radTouched = 0;
             for (const RadialCand& rc : sRadCands)
             {
-                // ALWAYS touch (files/refreshes demand in frontier order;
-                // starved-but-untouched entries livelocked the far band).
+                if (radTouched >= kRadTouchCap)
+                    break; // bound the per-tick demand-touch storm
+                ++radTouched;
+                // Touch (files/refreshes demand in frontier order; starved-
+                // but-untouched entries livelocked the far band).
                 const bool warm = warmOrRequest(rc.ptr, rc.d2);
+                if (radAdds >= kRadMaxAdds)
+                    break; // per-tick cap: smooth fill over stutter
                 const bool guaranteed = rc.d2 < kRadGuarantee * kRadGuarantee && guarAdds < kRadGuarAdds;
                 if (!guaranteed && radAdds >= kRadMinAdds && Clock::now() >= radialDeadline)
                     continue;
