@@ -1069,7 +1069,7 @@ namespace MWWorld
         using Clock = std::chrono::steady_clock;
         static Clock::time_point sLast{};
         const auto now = Clock::now();
-        if (sLast.time_since_epoch().count() != 0 && now - sLast < std::chrono::seconds(2))
+        if (sLast.time_since_epoch().count() != 0 && now - sLast < std::chrono::seconds(1))
             return;
         sLast = now;
         const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
@@ -1108,10 +1108,16 @@ namespace MWWorld
                 }
                 ++it;
             }
-            else if (it->second.state == VitaDemandState::Wanted && age > std::chrono::seconds(30))
+            else if (it->second.state == VitaDemandState::Wanted && age > std::chrono::seconds(4))
             {
+                // Untouched for 4s = no live needer scanned it (the hydrator
+                // touches every in-reach candidate each tick). Drop it: it
+                // was for an object the player has passed, and it holds an
+                // in-flight cap slot that blocks fresh nearby requests. 30s
+                // let a whole walk of stale requests jam the queue under a
+                // wedge. Bounds stay learned; it reloads if re-approached.
                 --mVitaWantedCount;
-                it = mVitaDemand.erase(it); // nobody re-asked
+                it = mVitaDemand.erase(it);
             }
             else
                 ++it;

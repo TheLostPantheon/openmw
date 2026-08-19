@@ -66,8 +66,10 @@ namespace MWRender
         osg::Matrix mViewMatrix;
         bool mActive;
 #ifdef __vita__
-        // Pipelined cull can miss a strict one-shot; stay live a few frames.
-        int mFramesLeft = 4;
+        // Pipelined cull can miss a strict one-shot; 2 frames covers the
+        // split-frame pipeline. Was 4 = FOUR full map renders per cell
+        // (each ~120ms on a dense cell) = the walking-crossing map stutter.
+        int mFramesLeft = 2;
 #endif
     };
 

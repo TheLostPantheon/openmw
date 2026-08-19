@@ -10,6 +10,10 @@
 
 #include "windowpinnablebase.hpp"
 
+#ifdef __vita__
+#include "../mwbase/world.hpp"
+#endif
+
 #include <components/esm3/custommarkerstate.hpp>
 #include <components/misc/constants.hpp>
 
@@ -186,6 +190,16 @@ namespace MWGui
         MyGUI::IntRect mGrid{ -1, -1, 1, 1 };
         float mMarkerUpdateTimer = 0.f;
 
+#ifdef __vita__
+        int mVitaMapDeferFrames = 0; // hold map captures off the crossing frame
+        // Door-marker rebuild spread across frames: gather once into pending,
+        // create a budget of widgets per frame (was 700ms wholesale).
+        std::vector<MWBase::World::DoorMarker> mVitaPendingDoors;
+        std::size_t mVitaPendingDoorIdx = 0;
+        bool mVitaDoorProcessing = false;
+        void vitaDrainPendingDoors();
+        void vitaGatherPendingDoors();
+#endif
         float mLastDirectionX = 0.f;
         float mLastDirectionY = 0.f;
 

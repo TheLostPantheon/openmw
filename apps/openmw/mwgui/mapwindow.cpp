@@ -26,6 +26,8 @@
 #include "../mwbase/world.hpp"
 
 #include "../mwworld/cellstore.hpp"
+
+
 #include "../mwworld/esmstore.hpp"
 #include "../mwworld/player.hpp"
 #include "../mwworld/worldmodel.hpp"
@@ -464,6 +466,12 @@ namespace MWGui
         }
 
         mActiveCell = &cell;
+#ifdef __vita__
+        // Hold map captures ~24 frames after a cell change so the expensive
+        // RTT (a full overhead scene render) lands after the crossing frame
+        // settles, not stacked on it.
+        mVitaMapDeferFrames = 24;
+#endif
 
         constexpr auto resetEntry = [](MapEntry& entry, bool visible, const MyGUI::IntPoint* position) {
             entry.mMapWidget->setVisible(visible);
@@ -606,12 +614,25 @@ namespace MWGui
 
     void LocalMapBase::onFrame(float dt)
     {
+#ifdef __vita__
+        // Door-marker rebuild was 700ms of MyGUI widget churn in one frame.
+        // Gather once (cheap), then create a budget of widgets per frame so
+        // no single frame pays the whole cost. Held off the crossing frame
+        // via the settle window. Cosmetic — a few frames to fill is fine.
+        if (mNeedDoorMarkersUpdate && mVitaMapDeferFrames <= 0)
+        {
+            vitaGatherPendingDoors();
+            mNeedDoorMarkersUpdate = false;
+        }
+        if (mVitaDoorProcessing)
+            vitaDrainPendingDoors();
+#else
         if (mNeedDoorMarkersUpdate)
         {
             updateDoorMarkers();
             mNeedDoorMarkersUpdate = false;
         }
-
+#endif
         mMarkerUpdateTimer += dt;
 
         if (mMarkerUpdateTimer >= 0.25)
@@ -619,7 +640,6 @@ namespace MWGui
             mMarkerUpdateTimer = 0;
             updateMagicMarkers();
         }
-
         updateRequiredMaps();
     }
 
@@ -638,6 +658,11 @@ namespace MWGui
         // segments in one wm frame (160-200ms hitch). Deferred entries stay
         // textureless and retry next frame.
         int mapRenderBudget = 1;
+        if (mVitaMapDeferFrames > 0)
+        {
+            --mVitaMapDeferFrames;
+            mapRenderBudget = 0; // defer captures until the crossing settles
+        }
 #endif
         for (MapEntry& entry : mMaps)
         {
@@ -694,6 +719,86 @@ namespace MWGui
         if (needRedraw)
             redraw();
     }
+
+#ifdef __vita__
+    void LocalMapBase::vitaGatherPendingDoors()
+    {
+        // Cheap: typed Door scans over already-loaded cells only. Fills the
+        // pending list; vitaDrainPendingDoors creates the widgets budgeted.
+        mVitaPendingDoors.clear();
+        mVitaPendingDoorIdx = 0;
+        MWBase::World* world = MWBase::Environment::get().getWorld();
+        MWWorld::WorldModel* worldModel = MWBase::Environment::get().getWorldModel();
+        if (!mActiveCell->isExterior())
+        {
+            MWWorld::CellStore& cell = worldModel->getInterior(mActiveCell->getNameId());
+            world->getDoorMarkers(cell, mVitaPendingDoors);
+        }
+        else
+        {
+            for (MapEntry& entry : mMaps)
+            {
+                if (!entry.mMapWidget->getVisible() || widgetCropped(entry.mMapWidget, mLocalMap))
+                    continue;
+                if (mExteriorDoorsByCell.contains({ entry.mCellX, entry.mCellY }))
+                    continue;
+                ESM::ExteriorCellLocation id(entry.mCellX, entry.mCellY, ESM::Cell::sDefaultWorldspaceId);
+                MWWorld::CellStore& dcell = worldModel->getExterior(id, /*forceLoad*/ false);
+                if (dcell.getState() != MWWorld::CellStore::State_Loaded)
+                    continue;
+                world->getDoorMarkers(dcell, mVitaPendingDoors);
+            }
+        }
+        mVitaDoorProcessing = true;
+    }
+
+    void LocalMapBase::vitaDrainPendingDoors()
+    {
+        constexpr std::size_t kDoorBudget = 12; // widgets per frame
+        std::size_t done = 0;
+        for (; mVitaPendingDoorIdx < mVitaPendingDoors.size() && done < kDoorBudget;
+             ++mVitaPendingDoorIdx, ++done)
+        {
+            MWBase::World::DoorMarker& marker = mVitaPendingDoors[mVitaPendingDoorIdx];
+            std::vector<std::string> destNotes;
+            CustomMarkerCollection::RangeType markers = mCustomMarkers.getMarkers(marker.dest);
+            for (auto iter = markers.first; iter != markers.second; ++iter)
+                destNotes.push_back(iter->second.mNote);
+
+            MarkerWidget* markerWidget = nullptr;
+            MarkerUserData* data;
+            if (mDoorMarkersToRecycle.empty())
+            {
+                markerWidget = createDoorMarker(marker.name, marker.x, marker.y);
+                data = markerWidget->getUserData<MarkerUserData>();
+                data->notes = std::move(destNotes);
+                doorMarkerCreated(markerWidget);
+            }
+            else
+            {
+                markerWidget = mDoorMarkersToRecycle.back();
+                mDoorMarkersToRecycle.pop_back();
+                data = markerWidget->getUserData<MarkerUserData>();
+                data->notes = std::move(destNotes);
+                data->caption = marker.name;
+                markerWidget->setCoord(getMarkerCoordinates(marker.x, marker.y, *data, 8));
+                markerWidget->setVisible(true);
+            }
+            currentDoorMarkersWidgets().push_back(markerWidget);
+            if (mActiveCell->isExterior())
+                mExteriorDoorsByCell[{ data->cellX, data->cellY }].push_back(markerWidget);
+        }
+        if (mVitaPendingDoorIdx >= mVitaPendingDoors.size())
+        {
+            // Finished: reposition all door widgets once, then release.
+            for (MyGUI::Widget* widget : currentDoorMarkersWidgets())
+                updateMarkerCoordinates(widget, 8);
+            mVitaPendingDoors.clear();
+            mVitaPendingDoorIdx = 0;
+            mVitaDoorProcessing = false;
+        }
+    }
+#endif
 
     void LocalMapBase::updateDoorMarkers()
     {

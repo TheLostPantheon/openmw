@@ -1487,7 +1487,17 @@ namespace MWWorld
                     if (mWorldScene->isCellActive(*newCell))
                         mWorldScene->changePlayerCell(*newCell, pos, false);
                     else
+                    {
+#ifdef __vita__
+                        // Walking into a not-yet-active adjacent exterior cell:
+                        // route SEAMLESS (radial hydration), not the loadScreen
+                        // path that full-hydrates synchronously.
+                        mWorldScene->changeToExteriorCell(
+                            newCell->getCell()->getId(), pos, false, true, /*vitaSeamlessCrossing*/ true);
+#else
                         mWorldScene->changeToExteriorCell(newCell->getCell()->getId(), pos, false);
+#endif
+                    }
                 }
                 addContainerScripts(getPlayerPtr(), newCell);
                 newPtr = getPlayerPtr();
@@ -1576,7 +1586,23 @@ namespace MWWorld
         const ESM::ExteriorCellLocation index
             = ESM::positionToExteriorCellLocation(position.x(), position.y(), worldspaceId);
 
-        CellStore* newCell = cell->isExterior() ? &mWorldModel.getExterior(index) : nullptr;
+        CellStore* newCell = nullptr;
+        if (cell->isExterior())
+        {
+#ifdef __vita__
+            // Called every frame for every actor (physics moveActors). Skip
+            // getExterior when the actor has not left its current cell (the
+            // common case) — the default forceLoad=true would otherwise
+            // synchronously parse a cold cell mid-physics if an NPC stepped
+            // onto an unloaded edge, bypassing the radial hydrator.
+            if (cell->getCell()->getGridX() == index.mX && cell->getCell()->getGridY() == index.mY)
+                newCell = cell;
+            else
+                newCell = &mWorldModel.getExterior(index);
+#else
+            newCell = &mWorldModel.getExterior(index);
+#endif
+        }
         bool isCellActive = getPlayerPtr().isInCell() && getPlayerPtr().getCell()->isExterior()
             && (newCell && mWorldScene->isCellActive(*newCell));
 

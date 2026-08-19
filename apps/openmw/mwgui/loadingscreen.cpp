@@ -33,6 +33,13 @@
 #include "../mwbase/inputmanager.hpp"
 #include "../mwbase/statemanager.hpp"
 #include "../mwbase/windowmanager.hpp"
+#ifdef __vita__
+#include <components/resource/imagemanager.hpp>
+#include <components/sceneutil/workqueue.hpp>
+
+#include "../mwbase/world.hpp"
+#include "../mwrender/renderingmanager.hpp"
+#endif
 
 #include "backgroundimage.hpp"
 
@@ -258,6 +265,10 @@ namespace MWGui
 
         setVisible(false);
 
+#ifdef __vita__
+        vitaPrefetchNextSplash();
+#endif
+
         if (osgUtil::IncrementalCompileOperation* ico = mViewer->getIncrementalCompileOperation())
         {
             ico->setMinimumTimeAvailableForGLCompileAndDeletePerFrame(mOldIcoMin);
@@ -268,11 +279,87 @@ namespace MWGui
         MWBase::Environment::get().getWindowManager()->removeGuiMode(GM_LoadingWallpaper);
     }
 
+#ifdef __vita__
+    namespace
+    {
+        // Decodes a splash on the preload worker so the image cache is warm
+        // when the next loading screen asks for it. Splash TGAs are 1024x1024
+        // 32-bit: ~900ms of software decode, paid on the critical path at
+        // every screen open until now. Same 4MB residency as before (one
+        // splash was already kept), just decoded early.
+        class VitaSplashPrefetchItem : public SceneUtil::WorkItem
+        {
+        public:
+            VitaSplashPrefetchItem(Resource::ImageManager* im, std::string path)
+                : mImageManager(im)
+                , mPath(std::move(path))
+            {
+            }
+            void doWork() override
+            {
+                try
+                {
+                    // Hold the decoded image ourselves: housekeeping runs
+                    // clearCache() at loading-screen entry (scene.cpp), which
+                    // would drop an unreferenced prefetched entry before use.
+                    mImage = mImageManager->getImage(VFS::Path::Normalized(mPath));
+                }
+                catch (...)
+                {
+                }
+            }
+            osg::ref_ptr<osg::Image> takeImage() { return std::move(mImage); }
+
+        private:
+            Resource::ImageManager* mImageManager;
+            std::string mPath;
+            osg::ref_ptr<osg::Image> mImage;
+        };
+    }
+
+    void LoadingScreen::vitaPrefetchNextSplash()
+    {
+        if (mSplashScreens.empty() || mVitaSplashItem)
+            return; // already armed
+        MWBase::World* world = MWBase::Environment::get().getWorld();
+        if (!world || !world->getRenderingManager())
+            return;
+        SceneUtil::WorkQueue* wq = world->getRenderingManager()->getWorkQueue();
+        if (!wq)
+            return;
+        mVitaNextSplash = mSplashScreens.at(Misc::Rng::rollDice(mSplashScreens.size()));
+        mVitaSplashItem = new VitaSplashPrefetchItem(mResourceSystem->getImageManager(), mVitaNextSplash);
+        wq->addWorkItem(mVitaSplashItem);
+    }
+#endif
+
     void LoadingScreen::changeWallpaper()
     {
         if (!mSplashScreens.empty())
         {
+#ifdef __vita__
+            // Use the splash prefetched at the previous loadingOff (its image
+            // is already decoded in the image cache), else roll now.
+            std::string randomSplash = mVitaNextSplash.empty()
+                ? mSplashScreens.at(Misc::Rng::rollDice(mSplashScreens.size()))
+                : mVitaNextSplash;
+            mVitaNextSplash.clear();
+            // Re-seat the held image so loadFromFile's getImage() hits. If
+            // the prefetch is not done (worker busy), do NOT block on it:
+            // fall back to the live decode; blocking a saturated worker cost
+            // more than the decode.
+            if (mVitaSplashItem)
+            {
+                if (mVitaSplashItem->isDone())
+                    if (auto* it = static_cast<VitaSplashPrefetchItem*>(mVitaSplashItem.get()))
+                        if (osg::ref_ptr<osg::Image> img = it->takeImage())
+                            mResourceSystem->getImageManager()->vitaInsertImage(
+                                VFS::Path::Normalized(randomSplash), img);
+                mVitaSplashItem = nullptr;
+            }
+#else
             std::string const& randomSplash = mSplashScreens.at(Misc::Rng::rollDice(mSplashScreens.size()));
+#endif
 
             // TODO: add option (filename pattern?) to use image aspect ratio instead of 4:3
             // we can't do this by default, because the Morrowind splash screens are 1024x1024, but should be displayed
@@ -405,11 +492,17 @@ namespace MWGui
         if (!needToDrawLoadingScreen())
             return;
 
+#ifdef __vita__
+        // No wallpaper rotation: each rotation decoded a fresh 1024^2 TGA
+        // (~900ms) DURING the load, on a worker already saturated by it.
+        // loadingOn() already sets the one splash per screen; nothing here.
+#else
         if (mShowWallpaper && mTimer.time_m() > mLastWallpaperChangeTime + 5000 * 1)
         {
             mLastWallpaperChangeTime = mTimer.time_m();
             changeWallpaper();
         }
+#endif
 
         if (!mShowWallpaper && mLastRenderTime < mLoadingOnTime)
         {

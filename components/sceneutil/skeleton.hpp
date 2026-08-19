@@ -78,7 +78,12 @@ namespace SceneUtil
         // Cull prune: bones with no renderable beneath them contribute
         // nothing to cull (RigGeometry reads bone matrices by name, not by
         // traversal). Cached set + structural checksum for invalidation.
-        std::vector<osg::Node*> mVitaPrunedList;
+        // Strong refs: a raw-pointer list dangled when a pruned subtree
+        // was removed between revalidations — the cull-side setNodeMask(~0u)
+        // then scribbled 0xFFFFFFFF into freed heap (crashed StateGraph's
+        // map). Refs make the write safe; worst case a detached node lives
+        // until the next revalidate.
+        std::vector<osg::ref_ptr<osg::Node>> mVitaPrunedList;
         unsigned int mVitaPruneChecksum = 0;
         unsigned int mVitaPruneFrame = 0;
         void vitaRebuildPrune();

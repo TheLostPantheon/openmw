@@ -383,6 +383,14 @@ namespace Resource
         return true;
     }
 
+#ifdef __vita__
+    void ImageManager::vitaInsertImage(VFS::Path::NormalizedView path, osg::ref_ptr<osg::Image> image)
+    {
+        if (image)
+            mCache->addEntryToObjectCache(path.value(), image);
+    }
+#endif
+
     osg::ref_ptr<osg::Image> ImageManager::getImage(VFS::Path::NormalizedView path, bool disableFlip)
     {
         osg::ref_ptr<osg::Object> obj = mCache->getRefFromObjectCache(path);
@@ -476,9 +484,12 @@ namespace Resource
 
                 // Mipless DXT stays compressed too (single-level upload);
                 // GXM samples base level when no chain is present.
+                // Non-POT DXT stays compressed as well: vitaGL pads block-
+                // compressed uploads to POT itself (nearest_po2 in
+                // gpu_alloc_compressed_texture), so the POT gate here only
+                // forced a software decode of every NPOT DXT (100-500ms).
                 const bool keepCompressed = Settings::general().mVitaKeepCompressedTextures && isDXT
-                    && image->r() == 1 && isPowerOfTwo(image->s()) && isPowerOfTwo(image->t())
-                    && image->isDataContiguous();
+                    && image->r() == 1 && image->isDataContiguous();
 
                 if (!keepCompressed)
                 {

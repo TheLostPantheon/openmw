@@ -234,6 +234,7 @@ namespace
     // Bumped on unloadCell: invalidates the far-band candidate cache
     // (it holds Ptrs; a Ptr into an unloaded cell is a dangling ref).
     unsigned sVitaFarCandGen = 0;
+
     inline uint32_t vitaUsSince(const std::chrono::steady_clock::time_point& t0)
     {
         return (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0)
@@ -912,15 +913,31 @@ namespace MWWorld
             {
                 if (vglStarved)
                 {
-                    char vb[64];
-                    snprintf(vb, sizeof(vb), "[MemWatchdog] vgl RAM pool starved (%uKB free)",
-                        (unsigned)Vita::getVglRamFreeKB());
-                    Vita::breadcrumb(vb);
-                    // Orphaned GL objects recycle in OSG pools inside the
-                    // vgl arena; the per-draw flush is time-budgeted and
-                    // drains them too slowly. Force a full flush.
+                    const unsigned vglBefore = (unsigned)Vita::getVglRamFreeKB();
+                    // vgl RAM holds TEXTURE objects for cached/warm templates.
+                    // Freeing them needs the TEMPLATE ref dropped so the image
+                    // goes unreferenced and its texture is released — that is
+                    // warm-pool relief. But vgl starves while HEAP is healthy
+                    // (textures live in the GXM arena, not the newlib heap),
+                    // so the heap-gated relief below never fired: the flush
+                    // hit an empty delete queue and the pool spun starved
+                    // every 200ms. Force relief on vgl pressure regardless of
+                    // heap, then release + flush on the worker.
+                    mPreloader->vitaRelievePressure(true);
+                    // clearUnreferenced (Vita clearCache): drops decoded
+                    // images whose only ref was the cache — now true after
+                    // relief dropped the warm-pool refs. Their textures go to
+                    // the unref queue; the worker flush releases the GL
+                    // objects, freeing the vgl pool. Visible textures keep a
+                    // scene ref and are untouched (no re-upload churn).
+                    mRendering.getResourceSystem()->getImageManager()->clearCache();
+                    mRendering.getResourceSystem()->getSceneManager()->clearCache();
+                    mRendering.flushUnrefQueueImmediate();
                     if (Vita::GLWorker* glw = Vita::getGLWorker())
                         glw->run([] { osg::flushAllDeletedGLObjects(0); });
+                    char vb[96];
+                    snprintf(vb, sizeof(vb), "[MemWatchdog] vgl starved %uKB->(worker frees)", vglBefore);
+                    Vita::breadcrumb(vb);
                 }
                 // Warm sets are the payload, not the luxury: only severe
                 // pressure drops them, or the drop/re-warm churn taxes
@@ -1824,7 +1841,7 @@ namespace MWWorld
         mVitaCleanSweep.erase(cell);
         mVitaCellRefBox.erase(cell);
         mVitaBareAfterAdd.clear(); // ref addresses die with the store; no stale skips
-        ++sVitaFarCandGen; // far-band candidate cache holds Ptrs into this cell
+        ++sVitaFarCandGen; // radial-queue candidate cache holds Ptrs into this cell
         Log(Debug::Info) << "Unloading cell " << cell->getCell()->getDescription();
         const auto ul0 = std::chrono::steady_clock::now();
         struct UlTimer
@@ -2894,7 +2911,8 @@ namespace MWWorld
         // Actors are the costliest add; give them the closest tier of their
         // own rather than riding the items+lights radius.
         constexpr float rActorIn = 2000.f;
-        constexpr float rItemOut = 3500.f;
+        // rItemOut is derived below from the view reach (was fixed 3500:
+        // items/lights popped at a sharp border well inside visible range).
         constexpr float rActorOut = 4800.f;
         constexpr float rPhysIn = 3700.f;
         constexpr float rPhysOut = 6000.f;
@@ -2908,11 +2926,34 @@ namespace MWWorld
         // viewing distance: they differ, and visibility ends where the fog
         // ramp saturates. Buffer covers the ramp so objects are resident
         // before they emerge. Foggy weather => shorter reach automatically.
-        // Load lead past the fog END. 1200 left stragglers; 2000 wedged the
-        // pump at the heap gate (+100 far objs, dmd 128u/0 loading, +10ms
-        // frames). Reach is resident memory, not a free dial.
-        constexpr float kViewBuffer = 1500.f;
-        const float rViewReach = std::max(rStructIn, mRendering.vitaGetFogEnd() + kViewBuffer);
+        // Load lead past the fog END. Held at 1500 while compensating for
+        // the inert-scan bug (tick0 deadline) and the screened-crossing
+        // stall — both since fixed. The far plane clips at viewDistance
+        // (4608) and fog saturates ~4750, so anything past that is INVISIBLE
+        // (clipped/fogged); a 1500 buffer hydrated a large r^2 ring of
+        // invisible objects that taxed every per-scan forEach. Large-object
+        // origins are handled by the overlap test (dEff = dist - bound), so
+        // the buffer is pure lead time — small now that the pipe is fast.
+        // TWO reaches, decoupled — opposite costs:
+        //  * HYDRATION (tight): objects become resident scene nodes. Drives
+        //    memory + per-scan forEach CPU + map-capture cost. Just past the
+        //    far clip (viewDistance); nothing beyond is drawn.
+        //  * WARM (wide): the scan files DEMAND so models are pool-Ready
+        //    ahead. Cheap (worker pool bytes, no scene nodes, no scan cost).
+        //    Wide runway => objects hydrate WARM (~1-5ms) crossing into the
+        //    tight ring — no cold stalls, guarantee ring included.
+        // Weather only EXTENDS the base (storms pull fog in; never shrink).
+        constexpr float kHydrateBuffer = 400.f;
+        constexpr float kWarmBuffer = 2800.f;
+        const float rViewBase = std::max(Settings::camera().mViewingDistance.get(), mRendering.vitaGetFogEnd());
+        const float rViewReach = rViewBase + kHydrateBuffer;
+        const float rWarmReach = rViewBase + kWarmBuffer;
+        // Items/lights reach past FULL fog saturation: their old 3000u band
+        // put a hard, followable pop-in border in clearly visible range
+        // (fog starts ~1300; saturates ~4800). Statics use the overlap test;
+        // items are small, origin distance suffices.
+        const float rItemIn = std::max(3000.f, rViewReach - 1000.f);
+        const float rItemOut = rItemIn + 500.f;
         const osg::Vec2f moveDir(mSmoothedMoveDir.x(), mSmoothedMoveDir.y());
         constexpr float cSz = 8192.f;
         const bool isInterior = false;
@@ -2940,9 +2981,19 @@ namespace MWWorld
                 return true;
             }
             // Salience priority: a tower at 4000 outranks a pitcher at 600.
+            // Architecture/landform by name class loads ahead of clutter at
+            // equal salience (x0.5 prio), so delivery order follows the same
+            // structure-first order placement uses. Nudge, not a gate.
             const float sbr = std::max(60.f, mPreloader->vitaKnownBoundRadius(path));
-            if (mPreloader->vitaDemandTouch(path, neederD2 / (sbr * sbr))
-                == CellPreloader::VitaDemandState::Ready)
+            float prio = neederD2 / (sbr * sbr);
+            {
+                const std::size_t slash = path.rfind('/');
+                const std::string_view name
+                    = slash == std::string::npos ? std::string_view(path) : std::string_view(path).substr(slash + 1);
+                if (name.rfind("ex_", 0) == 0 || name.rfind("in_", 0) == 0 || name.rfind("terrain_", 0) == 0)
+                    prio *= 0.5f;
+            }
+            if (mPreloader->vitaDemandTouch(path, prio) == CellPreloader::VitaDemandState::Ready)
                 return true;
             vitaTickCold.insert(std::move(path));
             return false;
@@ -2957,6 +3008,31 @@ namespace MWWorld
             }
             return warmPath(std::string(wm.value()), neederD2, alwaysWarm);
         };
+        // Structure tiers, hydrated in order at the same radius in every pass:
+        //   0  architecture / landform by NAME CLASS (ex_, in_, terrain_): a
+        //      Hlaalu wall is 20 medium segments — individually "detail" by
+        //      bound, collectively the most structural thing in view. The
+        //      content authors' prefix IS the flag.
+        //   1  big by MEASURE (bound*scale >= kStructBound; unlearned = big).
+        //   2  detail (clutter, flora, furniture, lights, containers).
+        // Reorders only; total work is unchanged. Same tier feeds demand
+        // priority so delivery order matches placement order.
+        constexpr float kStructBound = 600.f;
+        const auto structTier = [&](const MWWorld::Ptr& ptr) -> int {
+            const VFS::Path::Normalized m = getModel(ptr);
+            if (m.empty())
+                return 2;
+            const std::string_view path = m.value();
+            const std::size_t slash = path.rfind('/');
+            const std::string_view name = slash == std::string_view::npos ? path : path.substr(slash + 1);
+            if (name.rfind("ex_", 0) == 0 || name.rfind("in_", 0) == 0 || name.rfind("terrain_", 0) == 0)
+                return 0;
+            const float br = mPreloader->vitaKnownBoundRadius(std::string(path));
+            if (br <= 0.f)
+                return 1; // unlearned: assume big (safe direction)
+            return br * ptr.getCellRef().getScale() >= kStructBound ? 1 : 2;
+        };
+
         // Time-to-need: request only what arrival will need within the
         // measured load window. Speed-scaled; slow worker widens the lead.
         static osg::Vec2f sLastPP(0.f, 0.f);
@@ -3213,7 +3289,7 @@ namespace MWWorld
             // everything visible (phys was tracking objs 1:1).
             const float rWarm = std::clamp(1500.f + vitaPlayerSpeed * 1.8f, 1500.f, 6000.f);
             const float rContact = 1800.f;
-            const auto contactDeadline = tick0 + std::chrono::milliseconds(3);
+            const auto contactDeadline = Clock::now() + std::chrono::milliseconds(3);
             for (std::size_t ci = 0; ci < n && Clock::now() < contactDeadline; ++ci)
             {
                 CellStore& cell = *cells[(ci + sStartRot) % n];
@@ -3264,73 +3340,98 @@ namespace MWWorld
             }
         }
 
-        // ---- Far band (reserved): view-overlapping statics beyond the near
-        // shells. This work needs LEAD TIME — an object must be resident
-        // before it emerges from the fog — yet it sat last in Lane A's
-        // deadline-bounded walk and starved under any pressure, popping in
-        // only once it reached the near rings. Own slice, run before shells
-        // consume the tick; ordered by how soon each will emerge
-        // (distance minus bound, ascending). Warm-gated like everything.
+        // ---- Radial queue: ALL static hydration, one ordering ----
+        // Every bare lite-type object from the player's feet to the view
+        // reach is one candidate list, scored by
+        //     key = (originDistance - bound) - structureHeadStart
+        // and hydrated strictly in key order under the statics budget.
+        // Nearest-first gives a consistent expanding frontier (pop-in at a
+        // predictable, growing radius); the head start lets architecture
+        // (ex_/in_/terrain_ by name, else big-by-bound) edge ahead of
+        // adjacent clutter without breaking the ring. This replaced the
+        // banded shells + far band + Lane A hydrate branches, whose
+        // band/tier/cell-rotation composition was the pop-in patchwork.
         {
-            SegTimer segFar(&sSegShellUs);
-            const auto farDeadline = bigBudget ? deadline : tick0 + std::chrono::milliseconds(std::max(1, maxMs / 3));
-            struct FarCand
+            SegTimer segRadial(&sSegShellUs);
+            struct RadialCand
             {
                 MWWorld::Ptr ptr;
-                float dEff;
+                float key; // sort key: dEff - head start
                 float d2;
             };
-            // Candidate set is CACHED and refreshed on movement/time, like
-            // the guard disc: rescanning every tick ate the whole slice
-            // (adds hit the deadline on entry) and materialised far cell
-            // stores per tick (StateApply bursts = 600ms frames). Between
-            // refreshes the slice goes to adds, not bookkeeping.
-            static std::vector<FarCand> sFarCands;
-            static osg::Vec3f sFarScanPos(1e9f, 1e9f, 0.f);
-            static Clock::time_point sFarScanAt{};
-            static unsigned sFarScanEpoch = 0;
-            static unsigned sFarScanGen = 0;
-            std::vector<FarCand>& farCands = sFarCands;
-            const float rNearBand = rStructIn + rHeadStretch;
-            const float fmx = pp.x() - sFarScanPos.x();
-            const float fmy = pp.y() - sFarScanPos.y();
-            const unsigned farEpoch = mPreloader->vitaDemandReadyEpoch();
-            const bool farRescan = fmx * fmx + fmy * fmy > 200.f * 200.f
-                || tick0 - sFarScanAt > std::chrono::milliseconds(750) || farEpoch != sFarScanEpoch
-                || sFarScanGen != sVitaFarCandGen || farCands.empty();
-            if (farRescan)
+            // Two regimes: inside the bubble + buffer, hydration is
+            // GUARANTEED — always listed, adds never yield to the frame
+            // deadline (bounded per tick). Beyond, nearest-first best
+            // effort with whole-disc demand: eventually complete.
+            constexpr float kRadGuarantee = 4000.f; // bubble rIn 3000 + buffer
+            constexpr std::size_t kRadListMax = 160; // outer-disc list cap
+            static int sRadUnloadedSeen = 0; // cells whose refs are not loaded
+            // Candidate cache + incremental scan (proven far-band machinery):
+            // rescan on movement/time/delivery/unload; between refreshes the
+            // budget goes to adds, not bookkeeping. Scan resumes across
+            // ticks under its own small slice.
+            static std::vector<RadialCand> sRadCands;
+            static osg::Vec3f sRadScanPos(1e9f, 1e9f, 0.f);
+            static Clock::time_point sRadScanAt{};
+            static unsigned sRadScanEpoch = 0;
+            static unsigned sRadScanGen = 0;
+            static std::size_t sRadScanCursor = 0;
+            static std::size_t sRadScanRot = 0;
+            static std::size_t sRadScanN = 0;
+            static bool sRadScanInProgress = false;
+            const float rmx = pp.x() - sRadScanPos.x();
+            const float rmy = pp.y() - sRadScanPos.y();
+            const unsigned radEpoch = mPreloader->vitaDemandReadyEpoch();
+            // A scan IN PROGRESS is never restarted by staleness: at 2ms/tick
+            // a dense scan needs more than one 750ms window, and restarting
+            // from zero meant later cells were NEVER reached — their objects
+            // never became candidates while standing still (they only loaded
+            // when the guard disc caught them on approach). Restarting also
+            // cleared collected-but-cold candidates, whose untouched demand
+            // the 4s GC then dropped: queued -> cleared -> GC'd -> requeued.
+            // Only structural changes restart immediately (Ptr safety).
+            // Hard reset ONLY on cell unload (gen bump — Ptr safety). The
+            // active-set SIZE churns constantly (store eviction, deferred
+            // preps, promotions); resetting on it meant the scan never got
+            // past the first cells in dense areas — the disc stopped at a
+            // fraction of reach with an empty demand queue (objs half of
+            // healthy). Mid-scan set changes just make one pass approximate;
+            // the next staleness rescan corrects coverage.
+            const bool radHardReset = sRadScanGen != sVitaFarCandGen;
+            const bool radStale = rmx * rmx + rmy * rmy > 200.f * 200.f
+                || tick0 - sRadScanAt > std::chrono::milliseconds(750) || radEpoch != sRadScanEpoch
+                || sRadCands.empty();
+            if (radHardReset || (radStale && !sRadScanInProgress))
             {
-                sFarScanPos = pp;
-                sFarScanAt = tick0;
-                sFarScanEpoch = farEpoch;
-                sFarScanGen = sVitaFarCandGen;
-                farCands.clear();
+                sRadScanPos = pp;
+                sRadScanAt = tick0;
+                sRadScanEpoch = radEpoch;
+                sRadScanGen = sVitaFarCandGen;
+                sRadCands.clear();
+                sRadScanCursor = 0;
+                sRadScanRot = sStartRot;
+                sRadScanN = n;
+                sRadScanInProgress = true;
             }
-            // Scan is incremental: it resumes at the cell it stopped on and
-            // completes over several ticks under its own small budget, so a
-            // wide dense scan can neither eat the add slice nor be thrown
-            // away half-done. Adds proceed from whatever is collected so far.
-            static std::size_t sFarScanCursor = 0;
-            static std::size_t sFarScanRot = 0; // rotation frozen at scan start
-            static std::size_t sFarScanN = 0;
-            static bool sFarScanInProgress = false;
-            if (farRescan || sFarScanN != n)
+            if (sRadScanCursor >= n)
+                sRadScanInProgress = false; // set shrank past the cursor
+            // Anchor at NOW, not tick0: earlier passes consume the tick's
+            // opening milliseconds, and a tick0-anchored window was already
+            // expired on arrival — the scan never ran even once (RadQ
+            // telemetry: scan=prog cands=0 forever; the whole queue was a
+            // silent no-op while other lanes masked it).
+            const auto scanDeadline = Clock::now() + std::chrono::milliseconds(2);
+            for (; sRadScanInProgress && sRadScanCursor < n && Clock::now() < scanDeadline; ++sRadScanCursor)
             {
-                // Active set changed mid-scan: restart on the new array.
-                sFarScanCursor = 0;
-                sFarScanRot = sStartRot;
-                sFarScanN = n;
-                sFarScanInProgress = true;
-                if (!farRescan)
-                    farCands.clear();
-            }
-            const auto scanDeadline = tick0 + std::chrono::milliseconds(2);
-            for (; sFarScanInProgress && sFarScanCursor < n && Clock::now() < scanDeadline; ++sFarScanCursor)
-            {
-                CellStore& cell = *cells[(sFarScanCursor + sFarScanRot) % n];
+                CellStore& cell = *cells[(sRadScanCursor + sRadScanRot) % n];
                 if (!cell.getCell()->isExterior())
                     continue;
-                if (vitaCellEdge2(cell, pp) > (rViewReach + 8192.f) * (rViewReach + 8192.f))
+                if (cell.getState() != CellStore::State_Loaded)
+                {
+                    ++sRadUnloadedSeen; // forEach no-ops silently on these
+                    continue;
+                }
+                if (vitaCellEdge2(cell, pp) > (rWarmReach + rHeadStretch + 8192.f) * (rWarmReach + rHeadStretch + 8192.f))
                     continue;
                 cell.forEach([&](const MWWorld::Ptr& ptr) {
                     if (ptr.getRefData().getBaseNode() != nullptr)
@@ -3343,143 +3444,225 @@ namespace MWWorld
                     const float dx = op.x() - pp.x();
                     const float dy = op.y() - pp.y();
                     const float d2 = dx * dx + dy * dy;
-                    if (d2 < rNearBand * rNearBand)
-                        return true; // near band: Lane A / shells own it
                     const VFS::Path::Normalized m = getModel(ptr);
                     if (m.empty())
                         return true;
                     float br = mPreloader->vitaKnownBoundRadius(std::string(m.value()));
                     if (br <= 0.f)
-                        br = 1200.f;
+                        br = 1200.f; // unlearned: assume big; first load teaches
                     const float dEff = std::sqrt(d2) - br * ptr.getCellRef().getScale();
+                    // Heading-stretched WARM reach: elongate the warm runway
+                    // in the direction of travel, shrink it behind. Focuses
+                    // the pump's pool-warming AHEAD (where you are going) and
+                    // stops wasting half the budget on objects behind you
+                    // that are about to be evicted — the "smoother standing
+                    // still than walking" asymmetry. Warm only (cheap pool
+                    // bytes); the hydration ring stays tight and uniform, so
+                    // no extra resident objects.
+                    float warmReach = rWarmReach;
+                    if (moveDir.length2() > 0.25f && d2 > 1.f)
+                    {
+                        const float invD = 1.f / std::sqrt(d2);
+                        const float toward = (dx * invD) * moveDir.x() + (dy * invD) * moveDir.y();
+                        warmReach += rHeadStretch * toward; // +ahead, -behind
+                    }
+                    if (dEff >= warmReach)
+                        return true; // outside the (heading-shaped) warm runway
                     if (dEff >= rViewReach)
-                        return true; // not overlapping the view sphere yet
-                    if (farCands.size() < 64)
-                        farCands.push_back({ ptr, dEff, d2 });
+                    {
+                        // Warm band: pool-load ahead, do NOT hydrate. Cheap,
+                        // long runway so the tight ring hydrates warm.
+                        warmOrRequest(ptr, d2);
+                        return true;
+                    }
+                    const int tier = structTier(ptr);
+                    const float headStart = tier == 0 ? 400.f : (tier == 1 ? 150.f : 0.f);
+                    const float key = dEff - headStart;
+                    // GUARANTEE RING (bubble + buffer): candidates are always
+                    // listed — no cap, no replacement — so completeness in
+                    // reach of the player is structural, not best-effort.
+                    if (d2 < kRadGuarantee * kRadGuarantee)
+                    {
+                        sRadCands.push_back({ ptr, key, d2 });
+                        return true;
+                    }
+                    if (sRadCands.size() < kRadListMax)
+                        sRadCands.push_back({ ptr, key, d2 });
+                    else
+                    {
+                        // Outer disc: keep the best BY KEY, not by scan
+                        // order; what falls off the list still files demand
+                        // so the pump works the whole reach.
+                        std::size_t worst = 0;
+                        for (std::size_t i = 1; i < sRadCands.size(); ++i)
+                            if (sRadCands[i].key > sRadCands[worst].key)
+                                worst = i;
+                        if (key < sRadCands[worst].key && sRadCands[worst].d2 >= kRadGuarantee * kRadGuarantee)
+                            sRadCands[worst] = { ptr, key, d2 };
+                        else
+                            warmOrRequest(ptr, d2);
+                    }
                     return true;
                 });
             }
-            if (sFarScanInProgress && sFarScanCursor >= n)
-                sFarScanInProgress = false;
-            // Sort whatever is collected (cheap for <=64); partial scans
-            // still yield a correctly ordered near-first list.
-            std::sort(farCands.begin(), farCands.end(),
-                [](const FarCand& a, const FarCand& b) { return a.dEff < b.dEff; });
-            // Drop entries that went live since the last refresh (added by
-            // any lane) so the loop below only sees real work.
-            farCands.erase(std::remove_if(farCands.begin(), farCands.end(),
-                               [](const FarCand& c) { return c.ptr.getRefData().getBaseNode() != nullptr; }),
-                farCands.end());
-            int farAdds = 0;
-            // The SCAN consumed the whole slice in dense scenes, so the add
-            // loop hit the deadline on entry — every tick, zero adds, while
-            // "starved" read as a delivery problem. Adds get their own floor:
-            // at least kFarMinAdds warm candidates go in regardless of the
-            // scan's cost (each is one cheap warm add).
-            constexpr int kFarMinAdds = 4;
-            for (const FarCand& fc : farCands)
+            if (sRadScanInProgress && sRadScanCursor >= n)
+                sRadScanInProgress = false;
+            std::sort(sRadCands.begin(), sRadCands.end(),
+                [](const RadialCand& a, const RadialCand& b) { return a.key < b.key; });
+            // Drop entries another lane made live since the last refresh.
+            sRadCands.erase(std::remove_if(sRadCands.begin(), sRadCands.end(),
+                                [](const RadialCand& c) { return c.ptr.getRefData().getBaseNode() != nullptr; }),
+                sRadCands.end());
+            // Add floor: warm candidates go in even when the scan ate the
+            // slice or the frame is over target — the frontier must advance.
+            // Guarantee-ring candidates get their own larger exemption: up
+            // to kRadGuarAdds warm adds per tick proceed regardless of the
+            // deadline. Presence near the player beats one frame.
+            // Floors trimmed 6/8 -> 3/4: they only rule OVER-TARGET frames,
+            // where 14 exempt adds x 1-8ms stacked visible dips. Guarantee
+            // pace is still ~120 adds/s worst case — a dense ring fills in
+            // a few seconds; healthy frames use the full add slice anyway.
+            constexpr int kRadMinAdds = 3;
+            constexpr int kRadGuarAdds = 4;
+            // Add slice starts NOW — after the scan — not at tick start.
+            // Sharing one window let the 2ms scan consume the whole add
+            // budget under load (bud=2 -> deadline passed before the first
+            // add), capping the outer disc at the floor (~120 adds/s) while
+            // walking makes ~180 objects/s newly eligible: the frontier
+            // compressed into the visible fog gradient and sat there.
+            const auto radialDeadline = bigBudget
+                ? deadline
+                : Clock::now() + std::chrono::milliseconds(std::max(1, maxMs * 2 / 3));
+            int radAdds = 0;
+            int guarAdds = 0;
+            for (const RadialCand& rc : sRadCands)
             {
-                // ALWAYS touch: a starved candidate that never touched the
-                // ledger lost its Ready entry to GC (8s), got re-demanded,
-                // re-delivered, and starved again — a livelock for the back
-                // of the band ("streams only up to the middle ring").
-                // Touch is a map lookup; only the ADD is budgeted.
-                const bool warm = warmOrRequest(fc.ptr, fc.d2);
-                if (farAdds >= kFarMinAdds && Clock::now() >= farDeadline)
+                // ALWAYS touch (files/refreshes demand in frontier order;
+                // starved-but-untouched entries livelocked the far band).
+                const bool warm = warmOrRequest(rc.ptr, rc.d2);
+                const bool guaranteed = rc.d2 < kRadGuarantee * kRadGuarantee && guarAdds < kRadGuarAdds;
+                if (!guaranteed && radAdds >= kRadMinAdds && Clock::now() >= radialDeadline)
                     continue;
                 if (!warm)
                     continue; // demand filed; adds when Ready
                 try
                 {
-                    addObject(fc.ptr, mWorld, mPagedRefs, *mPhysics, mRendering);
+                    addObject(rc.ptr, mWorld, mPagedRefs, *mPhysics, mRendering);
                     ++vitaOps;
                     ++sVitaLiveObjects;
-                    ++farAdds;
+                    if (rc.d2 < rPhysIn * rPhysIn)
+                    {
+                        addObject(rc.ptr, mWorld, *mPhysics, mLowestPoint, isInterior, mNavigator, nullptr);
+                        ++sVitaLivePhys;
+                    }
+                    ++radAdds;
+                    if (rc.d2 < kRadGuarantee * kRadGuarantee)
+                        ++guarAdds;
                 }
                 catch (const std::exception& e)
                 {
-                    Log(Debug::Error) << "far-band hydrate fail '" << fc.ptr.getCellRef().getRefId()
+                    Log(Debug::Error) << "radial hydrate fail '" << rc.ptr.getCellRef().getRefId()
                                       << "': " << e.what();
                 }
             }
-        }
-
-        // ---- Shell passes: the closest missing structure ANYWHERE wins.
-        // Budget exhausts in the nearest unfinished shell, so catch-up under
-        // sprint fills as a wave from the player outward, not by cell.
-        {
-            SegTimer segShell(&sSegShellUs);
-            // Shells take at most 2/3 of the box: the outer band (4500 to
-            // rStructIn+stretch) must always make progress or the visible
-            // stream edge collapses to the last shell under movement.
-            const auto shellDeadline
-                = bigBudget ? deadline : tick0 + std::chrono::milliseconds(std::max(1, maxMs * 2 / 3));
-            const float shellEdges[2] = { 1500.f, 2600.f };
-            float shellPrev = 0.f;
-            for (float shellMax : shellEdges)
+            // Stage telemetry: names which stage kills the outer ring —
+            // unloaded stores (scan sees nothing), no candidates
+            // (eligibility), candidates-but-cold (delivery), or no adds
+            // (budget). Farthest candidate key shows actual queue depth.
             {
-                if (Clock::now() >= shellDeadline)
-                    break;
-                for (std::size_t ci = 0; ci < n; ++ci)
+                static Clock::time_point sRadLog{};
+                if (tick0 - sRadLog > std::chrono::seconds(5))
                 {
-                    if (Clock::now() >= shellDeadline)
-                        break;
-                    CellStore& cell = *cells[(ci + sStartRot) % n];
-                    if (!cell.getCell()->isExterior())
-                        continue;
+                    sRadLog = tick0;
+                    int cold = 0, guarCands = 0;
+                    float farKey = 0.f;
+                    for (const RadialCand& rc : sRadCands)
                     {
-                        auto cs = mVitaCleanSweep.find(&cell);
-                        if (cs != mVitaCleanSweep.end()
-                            && (cs->second - osg::Vec2f(pp.x(), pp.y())).length2() < 512.f * 512.f)
-                            continue; // fully serviced near here; skip the scan
+                        if (rc.d2 < kRadGuarantee * kRadGuarantee)
+                            ++guarCands;
+                        if (rc.key > farKey)
+                            farKey = rc.key;
+                        if (rc.ptr.getRefData().getBaseNode() == nullptr)
+                            ++cold;
                     }
-                    bool shellColdSkip = false;
-                    if (vitaCellEdge2(cell, pp) > shellMax * shellMax)
-                        continue; // cell cannot contain this shell
-                    cell.forEach([&](const MWWorld::Ptr& ptr) {
-                        if (Clock::now() >= shellDeadline)
-                            return false;
-                        if (!isLiteType(ptr.getType()) || isPagedRef(ptr))
-                            return true;
-                        if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
-                            return true;
-                        if (ptr.getRefData().getBaseNode() != nullptr)
-                            return true;
-                        const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
-                        const float dx = op.x() - pp.x();
-                        const float dy = op.y() - pp.y();
-                        const float d2 = dx * dx + dy * dy;
-                        if (d2 < shellPrev * shellPrev || d2 >= shellMax * shellMax)
-                            return true;
-                        if (!warmOrRequest(ptr, d2))
-                        {
-                            shellColdSkip = true;
-                            return true;
-                        }
-                        try
-                        {
-                            addObject(ptr, mWorld, mPagedRefs, *mPhysics, mRendering);
-                            addObject(ptr, mWorld, *mPhysics, mLowestPoint, isInterior, mNavigator, nullptr);
-                            ++vitaOps;
-                            ++sVitaLiveObjects;
-                            ++sVitaLivePhys;
-                            mVitaCleanSweep.erase(&cell);
-                        }
-                        catch (const std::exception& e)
-                        {
-                            Log(Debug::Error)
-                                << "hydrate fail '" << ptr.getCellRef().getRefId() << "': " << e.what();
-                        }
-                        return true;
-                    });
-                    if (shellMax == shellEdges[1] && !shellColdSkip && Clock::now() < shellDeadline)
-                        mVitaCleanSweep[&cell] = osg::Vec2f(pp.x(), pp.y()); // completed both shells here
+                    char rb[176];
+                    snprintf(rb, sizeof(rb),
+                        "[RadQ] cells=%d unloaded=%d scan=%s cands=%d(g=%d) adds=%d(g=%d) far=%d reach=%d",
+                        (int)n, sRadUnloadedSeen, sRadScanInProgress ? "prog" : "done", (int)sRadCands.size(),
+                        guarCands, radAdds, guarAdds, (int)farKey, (int)rViewReach);
+                    Vita::breadcrumb(rb);
+                    sRadUnloadedSeen = 0;
                 }
-                shellPrev = shellMax;
+            }
+
+            // ---- Idle annulus warm: stream BEYOND the fog, cheaply ----
+            // When the frontier is complete (no candidates left in reach)
+            // and no live demand is pending, spend the idle worker warming
+            // models in the next ring past the view reach — anticipatory
+            // priority only (behind all live demand; cannot flip the pump
+            // gate or pool yield). Nothing is hydrated out there: residency
+            // past the fog costs cull/heap for invisible pixels (measured).
+            // Warm models make the frontier sweep at ADD speed, not
+            // delivery speed, the moment you move.
+            // Idle annulus retired: the scan now warms out to rWarmReach
+            // every tick (wide warm band), so a separate idle warmer is
+            // redundant. Kept disabled rather than removed for clarity.
+            if (false && sRadCands.empty() && !sRadScanInProgress && mPreloader->vitaDemandWantedCount() == 0)
+            {
+                constexpr float kAnnulus = 4096.f;
+                static Clock::time_point sAnnulusAt{};
+                static osg::Vec3f sAnnulusPos(1e9f, 1e9f, 0.f);
+                const float amx = pp.x() - sAnnulusPos.x();
+                const float amy = pp.y() - sAnnulusPos.y();
+                if (tick0 - sAnnulusAt > std::chrono::seconds(2)
+                    || amx * amx + amy * amy > 512.f * 512.f)
+                {
+                    sAnnulusAt = tick0;
+                    sAnnulusPos = pp;
+                    int filed = 0;
+                    const auto annulusDeadline = Clock::now() + std::chrono::milliseconds(2);
+                    for (std::size_t ci = 0; ci < n && filed < 32 && Clock::now() < annulusDeadline; ++ci)
+                    {
+                        CellStore& cell = *cells[(ci + sStartRot) % n];
+                        if (!cell.getCell()->isExterior())
+                            continue;
+                        const float outer = rViewReach + kAnnulus + 8192.f;
+                        if (vitaCellEdge2(cell, pp) > outer * outer)
+                            continue;
+                        cell.forEach([&](const MWWorld::Ptr& ptr) {
+                            if (filed >= 32 || Clock::now() >= annulusDeadline)
+                                return false;
+                            if (ptr.getRefData().getBaseNode() != nullptr)
+                                return true;
+                            if (!isLiteType(ptr.getType()) || isPagedRef(ptr))
+                                return true;
+                            if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
+                                return true;
+                            const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
+                            const float dx = op.x() - pp.x();
+                            const float dy = op.y() - pp.y();
+                            const float d2 = dx * dx + dy * dy;
+                            const VFS::Path::Normalized m = getModel(ptr);
+                            if (m.empty())
+                                return true;
+                            float br = mPreloader->vitaKnownBoundRadius(std::string(m.value()));
+                            if (br <= 0.f)
+                                br = 1200.f;
+                            const float dEff = std::sqrt(d2) - br * ptr.getCellRef().getScale();
+                            if (dEff < rViewReach || dEff >= rViewReach + kAnnulus)
+                                return true; // not in the annulus
+                            if (mPreloader->vitaIsCommonWarm(std::string(m.value())))
+                                return true;
+                            mPreloader->vitaDemandWant(std::string(m.value()));
+                            ++filed;
+                            return true;
+                        });
+                    }
+                }
             }
         }
 
-        // ---- Lane A ----
+        // ---- Lane A ----        // ---- Lane A ----
         const auto laneA0 = Clock::now();
         for (std::size_t ci = 0; ci < n; ++ci)
         {
@@ -3513,23 +3696,6 @@ namespace MWWorld
             const bool domainNow = wantFull || inActorDomain;
             bool aborted = false;
             bool anyResident = false;
-            int icoAdds = 0;
-            // ObjCost mallinfo sampling removed: the free-list walk cost
-            // 1-4ms per sampled add during streaming bursts. Findings kept
-            // in memory: avg ~26KB/object, worst offenders logged.
-            const auto hydrateRender = [&](const MWWorld::Ptr& ptr) {
-                try
-                {
-                    addObject(ptr, mWorld, mPagedRefs, *mPhysics, mRendering);
-                    ++icoAdds;
-                    ++vitaOps;
-                    ++sVitaLiveObjects;
-                }
-                catch (const std::exception& e)
-                {
-                    Log(Debug::Error) << "hydrate fail '" << ptr.getCellRef().getRefId() << "': " << e.what();
-                }
-            };
             if (!aborted)
             {
                 cell.forEach([&](const MWWorld::Ptr& ptr) {
@@ -3554,59 +3720,29 @@ namespace MWWorld
                         const bool live = ptr.getRefData().getBaseNode() != nullptr;
                         if (!live)
                         {
-                            // Size-scaled reach: a shrub matters at 2600, a
-                            // castle IS the landscape at 8000. Heading
-                            // stretch buys sprint lead on top.
-                            float rEff = rStructIn;
-                            if (d2 > 1.f)
+                            // Hydration is the radial queue's job. Here only
+                            // pre-warm the load window: sprint-lead demand for
+                            // objects arriving just beyond the view reach.
+                            if (vitaWindowUnits > 0.f && d2 > 1.f
+                                && d2 < (rViewReach + rHeadStretch + 8192.f) * (rViewReach + rHeadStretch + 8192.f))
                             {
                                 const float invD = 1.f / std::sqrt(d2);
                                 const float toward = (dx * invD) * moveDir.x() + (dy * invD) * moveDir.y();
                                 if (toward > 0.2f)
-                                    rEff += rHeadStretch * toward;
-                            }
-                            if (d2 < rEff * rEff)
-                            {
-                                if (warmOrRequest(ptr, d2))
                                 {
-                                    hydrateRender(ptr);
-                                    anyResident = true;
-                                }
-                            }
-                            else if (d2 < (rViewReach + rHeadStretch + 8192.f) * (rViewReach + rHeadStretch + 8192.f))
-                            {
-                                const VFS::Path::Normalized m = getModel(ptr);
-                                if (!m.empty())
-                                {
-                                    float br = mPreloader->vitaKnownBoundRadius(std::string(m.value()));
-                                    if (br <= 0.f)
-                                        br = 1200.f; // unlearned: assume building-class; first load teaches
-                                    // Overlap test: geometry crosses the view
-                                    // sphere (origin distance minus bound
-                                    // radius). A wall whose origin is past the
-                                    // fog line but whose bulk is in view stays.
-                                    const float bound = br * ptr.getCellRef().getScale();
-                                    const float dEff = std::sqrt(d2) - bound;
-                                    // Eligible if within the near band, or if
-                                    // its geometry overlaps the view reach.
-                                    if (dEff < rEff || dEff < rViewReach)
+                                    const VFS::Path::Normalized m = getModel(ptr);
+                                    if (!m.empty())
                                     {
-                                        if (warmOrRequest(ptr, d2))
+                                        float br = mPreloader->vitaKnownBoundRadius(std::string(m.value()));
+                                        if (br <= 0.f)
+                                            br = 1200.f;
+                                        const float bound = br * ptr.getCellRef().getScale();
+                                        const float dEff = std::sqrt(d2) - bound;
+                                        if (dEff >= rViewReach && dEff - rViewReach < vitaWindowUnits)
                                         {
-                                            hydrateRender(ptr);
-                                            anyResident = true;
+                                            const float pbr = std::max(60.f, bound);
+                                            mPreloader->vitaDemandTouch(std::string(m.value()), d2 / (pbr * pbr));
                                         }
-                                    }
-                                    else if (vitaWindowUnits > 0.f && d2 > 1.f
-                                        && dEff - rEff < vitaWindowUnits
-                                        && ((dx / std::sqrt(d2)) * moveDir.x()
-                                                   + (dy / std::sqrt(d2)) * moveDir.y()
-                                               > 0.2f))
-                                    {
-                                        // Arriving within the load window:
-                                        // warm now, place on arrival.
-                                        const float pbr = std::max(60.f, br * ptr.getCellRef().getScale());
-                                        mPreloader->vitaDemandTouch(std::string(m.value()), d2 / (pbr * pbr));
                                     }
                                 }
                             }
@@ -3634,7 +3770,9 @@ namespace MWWorld
                             const float bound = (bro > 0.f ? bro : 1200.f) * ptr.getCellRef().getScale();
                             const float dEffOut = std::sqrt(d2) - bound;
                             // Mirror of eligibility, +500 hysteresis, so the
-                            // view-reach boundary does not churn.
+                            // view-reach boundary does not churn. Detail past
+                            // the near band is released regardless of view
+                            // reach (structure-only far ring).
                             if (dEffOut > rEffOut && dEffOut > rViewReach + 500.f)
                             {
                                 removeNonLiteObject(ptr, nullptr);
@@ -3676,7 +3814,10 @@ namespace MWWorld
                         }
                         return true;
                     }
-                    if (!domainNow)
+                    // Items reach to the fog now, not just domain cells;
+                    // domainNow still gates actors/scripts bookkeeping.
+                    const bool itemCellNear = edge2 < rItemIn * rItemIn;
+                    if (!domainNow && !itemCellNear)
                         return true;
                     if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
                         return true;
@@ -3686,7 +3827,7 @@ namespace MWWorld
                     const float d2 = dx * dx + dy * dy;
                     const bool live = ptr.getRefData().getBaseNode() != nullptr;
                     const bool actor = isActorType(t);
-                    if (!live && !actor && wantFull && d2 < rIn * rIn)
+                    if (!live && !actor && itemCellNear && d2 < rItemIn * rItemIn)
                     {
                         if (!warmOrRequest(ptr, d2))
                             return true;
@@ -3742,11 +3883,12 @@ namespace MWWorld
                 SceneUtil::getRigCacheStats(rigH, rigM, rigN);
                 snprintf(mm, sizeof(mm),
                     "[MemMap] heap=%dMB objs=%d phys=%d stores=%d dmd=%du%d/%d/%d rig=%u/%u/%u ct=%u bud=%d/%d%s "
-                    "issued=%u/10s",
+                    "issued=%u/10s reach=%d",
                     Vita::getHeapUsedMB(), (int)mRendering.getObjects().getObjectCount(),
                     (int)mPhysics->getObjectCount(), (int)mWorld.getWorldModel().vitaCellStoreCount(), dw,
                     mPreloader->vitaDemandUrgentCount(), dl, dr, rigH, rigM, rigN, sVitaContactAdds, maxMs,
-                    vitaOtherMs, vitaCatchUp ? "C" : "", (unsigned)mPreloader->vitaDemandIssuedAndReset());
+                    vitaOtherMs, vitaCatchUp ? "C" : "", (unsigned)mPreloader->vitaDemandIssuedAndReset(),
+                    (int)rViewReach);
                 sVitaContactAdds = 0;
                 Vita::breadcrumb(mm);
             }
@@ -3921,9 +4063,43 @@ namespace MWWorld
         sLastPrep = now;
         // Bar tracks the frame target; a fixed 40 skipped most ticks once
         // the controller settled frames above it, starving the far ring.
+        // STARVATION FLOOR: busy towns sit above the bar even standing
+        // still, so deferred ring cells never loaded — their objects could
+        // not become streaming candidates, and the visible disc froze at
+        // the loaded-cell boundary ("streams only to the middle ring").
+        // One prep per 2s proceeds regardless: a bounded occasional hitch
+        // beats a permanently missing ring.
+        static Clock::time_point sLastPrepDone{};
+        const bool prepStarved = sLastPrepDone.time_since_epoch().count() == 0
+            || now - sLastPrepDone > std::chrono::seconds(2);
         const float prepFps = Settings::cells().mTargetFramerate;
         const int prepHealthyMs = prepFps > 1.f ? (int)(1000.f / prepFps) * 3 / 2 : 45;
-        if (frameDt > prepHealthyMs)
+        // REACH URGENCY: after a crossing every non-center grid cell is
+        // deferred — active but EMPTY. Terrain draws for them; their statics
+        // cannot stream until prep. At 1 prep/2s a ring took ~16s, so
+        // buildings materialised mid-approach with bare terrain beyond —
+        // a visible, moving statics border. A pending cell whose edge is
+        // inside the view reach preps NOW (still one per call).
+        bool prepUrgent = false;
+        // Paced: post-crossing all 8 ring cells are urgent at once, and an
+        // every-tick bypass stacked 8 heavy preps into consecutive frames
+        // (the brief crossing stall). One urgent prep per 300ms preps the
+        // ring in ~2.5s — far ahead of need — without the pile-up.
+        if (now - sLastPrepDone >= std::chrono::milliseconds(300))
+        {
+            const osg::Vec3f ppos = mWorld.getPlayerPtr().getRefData().getPosition().asVec3();
+            const float reach
+                = std::max(Settings::camera().mViewingDistance.get(), mRendering.vitaGetFogEnd()) + 1500.f;
+            for (const auto& pc : mPendingCellLoads)
+            {
+                if (pc.cell->getCell()->isExterior() && vitaCellEdge2(*pc.cell, ppos) < reach * reach)
+                {
+                    prepUrgent = true;
+                    break;
+                }
+            }
+        }
+        if (frameDt > prepHealthyMs && !prepStarved && !prepUrgent)
             return;
         if (mPendingCellLoads.size() > 1)
         {
@@ -3961,6 +4137,7 @@ namespace MWWorld
                     continue;
                 }
                 prepareCellForDeferredLoad(prepCell, prepPos, nullptr);
+                sLastPrepDone = Clock::now();
                 mPreloader->vitaReleaseTerrainCell(prepGx, prepGy);
                 if (prepCell.getState() == CellStore::State_Loaded)
                 {
@@ -4984,7 +5161,17 @@ namespace MWWorld
             const ESM::ExteriorCellLocation location(x, y, playerCellIndex.mWorldspace);
             if (isCellInCollection(location, mActiveCells))
                 return;
+#ifdef __vita__
+            // Do NOT force-load cold ring cells to size a progress bar: in
+            // seamless mode the listener is a no-op and the count is
+            // discarded, yet .count() force-parsed every cold cell's refs
+            // (~30ms each) on EVERY crossing — the last cell-based load in
+            // the otherwise-radial path. getExterior(false) just creates the
+            // store; refs load radially by distance.
+            mWorld.getWorldModel().getExterior(location, /*forceLoad*/ false);
+#else
             refsToLoad += mWorld.getWorldModel().getExterior(location).count();
+#endif
             cellsPositionsToLoad.emplace_back(x, y);
         });
 
@@ -6042,14 +6229,35 @@ namespace MWWorld
             pp->setExteriorFlag(cell.getCell()->isQuasiExterior());
     }
 
-    void Scene::changeToExteriorCell(
-        const ESM::RefId& extCellId, const ESM::Position& position, bool adjustPlayerPos, bool changeEvent)
+    void Scene::changeToExteriorCell(const ESM::RefId& extCellId, const ESM::Position& position, bool adjustPlayerPos,
+        bool changeEvent, bool vitaSeamlessCrossing)
     {
 #ifdef __vita__
         Vita::simFence(); // Scene teardown; wait out overlapped draw.
+        // Decide seamless-vs-screened by the TRANSITION, not the caller: an
+        // adjacent same-worldspace exterior crossing is a walk (radial
+        // hydration, no screen); a worldspace change or a far teleport is a
+        // real load (keep the screen + the geometric guarantee behind it).
+        // The screened path's 8s synchronous guarantee sweep was firing on
+        // ordinary walk-ins that merely found the cell not-yet-active.
+        bool vitaScreen = true;
+        if (vitaSeamlessMode() && mCurrentCell != nullptr && mCurrentCell->isExterior())
+        {
+            CellStore& tgt = mWorld.getWorldModel().getCell(extCellId);
+            const bool sameWorldspace
+                = tgt.getCell()->getWorldSpace() == mCurrentCell->getCell()->getWorldSpace();
+            const int ddx = std::abs(tgt.getCell()->getGridX() - mCurrentCell->getCell()->getGridX());
+            const int ddy = std::abs(tgt.getCell()->getGridY() - mCurrentCell->getCell()->getGridY());
+            const bool adjacent = ddx <= mHalfGridSize + 1 && ddy <= mHalfGridSize + 1;
+            if (sameWorldspace && adjacent)
+                vitaScreen = false; // a walk, not a load
+        }
+        vitaScreen = vitaScreen && !vitaSeamlessCrossing;
+#else
+        const bool vitaScreen = true;
 #endif
 
-        if (changeEvent)
+        if (changeEvent && vitaScreen)
             MWBase::Environment::get().getWindowManager()->fadeScreenOut(0.5);
         CellStore& current = mWorld.getWorldModel().getCell(extCellId);
 
@@ -6057,11 +6265,11 @@ namespace MWWorld
 
         changeCellGrid(position.asVec3(),
             ESM::ExteriorCellLocation(cellIndex.x(), cellIndex.y(), current.getCell()->getWorldSpace()), changeEvent,
-            /*loadScreen*/ true);
+            /*loadScreen*/ vitaScreen);
 
         changePlayerCell(current, position, adjustPlayerPos);
 
-        if (changeEvent)
+        if (changeEvent && vitaScreen)
             MWBase::Environment::get().getWindowManager()->fadeScreenIn(0.5);
 
         if (auto* pp = MWBase::Environment::get().getWorld()->getPostProcessor())
@@ -6456,8 +6664,19 @@ namespace MWWorld
 
         const ESM::RefId worldspace = cell.getCell()->getWorldSpace();
         for (const auto& [x, y] : cells)
+#ifdef __vita__
+            // getExterior(false): the preloader loads asynchronously; forcing
+            // a synchronous parse of every surrounding cell here (unbudgeted,
+            // runs every frame near a teleport door / travel NPC) was a
+            // per-frame N*N cell-store parse burst. The preloader handles
+            // cold cells itself off the main thread.
+            mPreloader->preload(
+                mWorld.getWorldModel().getExterior(ESM::ExteriorCellLocation(x, y, worldspace), /*forceLoad*/ false),
+                mRendering.getReferenceTime());
+#else
             mPreloader->preload(mWorld.getWorldModel().getExterior(ESM::ExteriorCellLocation(x, y, worldspace)),
                 mRendering.getReferenceTime());
+#endif
     }
 
     void Scene::preloadCell(CellStore& cell, bool urgent)

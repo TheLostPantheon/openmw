@@ -28,6 +28,12 @@ namespace Resource
         /// Create or retrieve an Image
         /// Returns the dummy image if the given image is not found.
         osg::ref_ptr<osg::Image> getImage(VFS::Path::NormalizedView path, bool disableFlip = false);
+#ifdef __vita__
+        /// (Re)insert an already-decoded image under its path, so a following
+        /// getImage() is a cache hit. Used to survive clearCache() between a
+        /// prefetch and its use (splash prefetch).
+        void vitaInsertImage(VFS::Path::NormalizedView path, osg::ref_ptr<osg::Image> image);
+#endif
 
         osg::Image* getWarningImage();
 
