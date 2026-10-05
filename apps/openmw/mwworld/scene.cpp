@@ -35,7 +35,9 @@
 #include "../mwmechanics/aipackage.hpp"
 #include "../mwmechanics/summoning.hpp"
 #include "../mwmechanics/creaturestats.hpp"
+#include <components/esm3/loadmgef.hpp>
 #include <components/esm3/loadstat.hpp>
+#include <components/esm3/loadweap.hpp>
 #include <components/vita/VitaShader.h>
 #include <components/sceneutil/attach.hpp>
 #include <components/vita/CellCullCallback.h>
@@ -6083,6 +6085,55 @@ namespace MWWorld
                             std::chrono::steady_clock::now() - pin0)
                             .count());
                     Vita::breadcrumb(pbuf);
+                }
+                // Spell visuals load on cast, on the main thread inside input
+                // handling (a 200-300ms frame per first-cast effect). The set
+                // is small and fixed by content: pin every effect's cast, hit,
+                // area and bolt models and its particle texture.
+                {
+                    const MWWorld::ESMStore& store = mWorld.getStore();
+                    std::vector<std::string> fx;
+                    const auto pushModel = [&](const std::string& model) {
+                        if (model.empty())
+                            return;
+                        const VFS::Path::Normalized p
+                            = Misc::ResourceHelpers::correctMeshPath(VFS::Path::Normalized(model));
+                        if (svfs->exists(p))
+                            fx.push_back(p.value());
+                    };
+                    const auto pushStatic = [&](const ESM::RefId& id, std::string_view fallback) {
+                        const ESM::Static* st = store.get<ESM::Static>().search(
+                            id.empty() ? ESM::RefId::stringRefId(fallback) : id);
+                        if (st != nullptr)
+                            pushModel(st->mModel);
+                    };
+                    for (const ESM::MagicEffect& effect : store.get<ESM::MagicEffect>())
+                    {
+                        pushStatic(effect.mCasting, "VFX_DefaultCast");
+                        pushStatic(effect.mHit, "VFX_DefaultHit");
+                        pushStatic(effect.mArea, "VFX_DefaultArea");
+                        const ESM::Weapon* bolt = store.get<ESM::Weapon>().search(
+                            effect.mBolt.empty() ? ESM::RefId::stringRefId("VFX_DefaultBolt") : effect.mBolt);
+                        if (bolt != nullptr)
+                            pushModel(bolt->mModel);
+                        if (!effect.mParticle.empty())
+                        {
+                            const VFS::Path::Normalized tex = Misc::ResourceHelpers::correctTexturePath(
+                                VFS::Path::Normalized(effect.mParticle), *svfs);
+                            if (svfs->exists(tex))
+                                fx.push_back(tex.value());
+                        }
+                    }
+                    std::sort(fx.begin(), fx.end());
+                    fx.erase(std::unique(fx.begin(), fx.end()), fx.end());
+                    const auto fx0 = std::chrono::steady_clock::now();
+                    const int pinnedFx = mPreloader->vitaPinPermanent(fx);
+                    char fbuf[96];
+                    snprintf(fbuf, sizeof(fbuf), "[SpellFxWarm] pinned %d/%d %dms", pinnedFx, (int)fx.size(),
+                        (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - fx0)
+                            .count());
+                    Vita::breadcrumb(fbuf);
                 }
             }
             // Post-screen grace: small worker batches while first visible

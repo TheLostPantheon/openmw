@@ -21,7 +21,7 @@ def series(lines, tag, key):
     out = []
     for l in lines:
         if tag in l:
-            m = re.search(r"\b" + key + r"=([\d.]+)", l)
+            m = re.search(r"(?:^|[\s(])" + re.escape(key) + r"=([\d.]+)", l)
             if m:
                 out.append(float(m.group(1)))
     return out
@@ -64,7 +64,11 @@ def summarize(path):
             # GL worker / GPU
             ("gl_job (draw+swap)", "[PhaseAvg]", "rnd"), ("gl_draw", "[GlJob]", "draw"),
             ("gpu_qdepth", "[Gpu]", "qd"), ("gpu_swap_block", "[Gpu]", "blk"),
-            ("cull_frame_stat", "[Frame]", "cull")]:
+            ("cull_frame_stat", "[Frame]", "cull"),
+            # cull cost by subtree (VitaCullTimer)
+            ("cull.total", "[CullTree]", "total"), ("cull.sky_other", "[CullTree]", "sky/other"),
+            ("cull.terrain_water_fx", "[CullTree]", "terrain/water/fx"), ("cull.statics", "[CullTree]", "statics"),
+            ("cull.actors", "[CullTree]", "actors")]:
         v = [x for x in series(L, tag, key) if x >= 0]
         s[name] = round(statistics.median(v), 1) if v else None
     adds = {"fit": 0, "urg": 0, "starve": 0}
@@ -83,6 +87,8 @@ def summarize(path):
     s["actor_worst_add_ms"] = max(worst) if worst else None
     waits = [float(x.group(1)) for l in L for x in [re.search(r"\[ActorWait\].* waited ([\d.]+)s", l)] if x]
     s["actor_waits_over_1s"] = len(waits)
+    s["threads"] = "; ".join(l.split("] ", 2)[-1] for l in L if "[Thread]" in l)[:200] or None
+    s["spell_fx_preload"] = next((l.split("] ", 2)[-1] for l in L if "[SpellFxWarm]" in l), None)
     s["hydrate_ticks_over_400ms"] = sum("[Hydrate] tick" in l for l in L)
     s["crossings"] = sum("[Crossing] seamless=" in l for l in L)
     s["mem_watchdog_events"] = sum("[MemWatchdog]" in l for l in L)

@@ -1,6 +1,7 @@
 #ifdef __vita__
 
 #include "VitaMemAudit.h"
+#include "VitaCullTimer.h"
 #include "VitaInit.h"
 #include "VitaSimWorker.h"
 
@@ -667,6 +668,25 @@ namespace Vita
             auditLog(buf);
         }
         vita_simjob_us = vita_simjob_upd_us = vita_simjob_cull_us = 0;
+        {
+            // Cull cost by subtree (VitaCullTimer.h): derived splits avoid the
+            // per-node timers that skewed what they measured.
+            using namespace Vita;
+            const double k = kReportEveryFrames * 1000.0;
+            const double total = gCullTreeUs[CullTotal] / k, scene = gCullTreeUs[CullScene] / k;
+            const double cells = gCullTreeUs[CullCells] / k, actors = gCullTreeUs[CullActors] / k;
+            snprintf(buf, sizeof(buf),
+                "[CullTree] total=%.2f sky/other=%.2f terrain/water/fx=%.2f statics=%.2f actors=%.2f (%u actor "
+                "visits) ms/frame",
+                total, total - scene, scene - cells, cells - actors, actors,
+                gCullTreeVisits[CullActors] / kReportEveryFrames);
+            auditLog(buf);
+            for (int i = 0; i < CullTreeCount; ++i)
+            {
+                gCullTreeUs[i] = 0;
+                gCullTreeVisits[i] = 0;
+            }
+        }
         vita_sim_script_us = vita_sim_mech_us = vita_sim_phys_us = vita_sim_gscript_us = 0;
 
         // Per-script and per-cull-callback cost breakdowns.

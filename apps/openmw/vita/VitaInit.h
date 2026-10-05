@@ -33,6 +33,11 @@ namespace Vita
     // Must be called before anything else. Sets up clocks, OOM handler, logging.
     void initialize();
 
+    // Pin the calling thread to one user core (0-2): main, sim and GL each
+    // get their own so the pipeline stages never time-slice one core.
+    // Disabled by ux0:data/openmw/nopin.txt (A/B without a rebuild).
+    void pinCurrentThread(int core, const char* name);
+
     // Apply Vita-specific settings overrides (video, shaders, memory, etc.)
     void applySettingsOverrides();
 
