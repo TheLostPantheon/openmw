@@ -13,6 +13,7 @@
 
 #include <psp2/ctrl.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/power.h>
@@ -1391,6 +1392,7 @@ namespace Vita
 
         breadcrumb("BOOT: Vita::initialize() start");
         installCrashReporter();
+        pinCurrentThread(0, "main");
 
         // Latch SELECT early so holding it from launch is never missed.
         pollSelectHeld();
@@ -1549,6 +1551,27 @@ namespace Vita
     void breadcrumb(const char* msg)
     {
         vitaBreadcrumb(msg);
+    }
+
+    void pinCurrentThread(int core, const char* name)
+    {
+        static const bool sDisabled = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/nopin.txt", &st) >= 0;
+        }();
+        char buf[96];
+        if (sDisabled)
+        {
+            snprintf(buf, sizeof(buf), "[Thread] %s: pinning disabled (nopin.txt)", name);
+            breadcrumb(buf);
+            return;
+        }
+        static const int kMasks[3] = { SCE_KERNEL_CPU_MASK_USER_0, SCE_KERNEL_CPU_MASK_USER_1,
+            SCE_KERNEL_CPU_MASK_USER_2 };
+        const int rc = sceKernelChangeThreadCpuAffinityMask(0, kMasks[core % 3]);
+        snprintf(buf, sizeof(buf), "[Thread] %s pinned to core %d (rc=0x%x, prio %d)", name, core % 3, (unsigned)rc,
+            sceKernelGetThreadCurrentPriority());
+        breadcrumb(buf);
     }
 
     int getHeapUsedMBFresh()

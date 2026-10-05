@@ -98,6 +98,7 @@ namespace Vita
     {
         tIsSimThread = true;
         glGuardNameThread("sim");
+        pinCurrentThread(1, "sim");
         {
             char buf[48];
             std::snprintf(buf, sizeof(buf), "[SimWorker] alive tid=0x%x", (unsigned)sceKernelGetThreadId());

@@ -26,6 +26,7 @@ extern uint32_t vita_anim_inst_us, vita_anim_tribip_us, vita_anim_kf_us, vita_an
 #include "vismask.hpp"
 
 #ifdef __vita__
+#include "../vita/VitaCullTimer.h"
 #include "../vita/VitaInit.h"
 #endif
 
@@ -96,6 +97,9 @@ namespace MWRender
         {
             cellnode = new osg::Group;
             cellnode->setName("Cell Root");
+#ifdef __vita__
+            Vita::addCullTimer(cellnode.get(), Vita::CullCells);
+#endif
             mRootNode->addChild(cellnode);
             mCellSceneNodes[ptr.getCell()] = cellnode;
         }
@@ -163,6 +167,9 @@ namespace MWRender
     {
         insertBegin(ptr);
         ptr.getRefData().getBaseNode()->setNodeMask(Mask_Actor);
+#ifdef __vita__
+        Vita::addCullTimer(ptr.getRefData().getBaseNode(), Vita::CullActors);
+#endif
 
         bool animated = true;
         std::string animationMesh
@@ -208,6 +215,9 @@ namespace MWRender
     {
         insertBegin(ptr);
         ptr.getRefData().getBaseNode()->setNodeMask(Mask_Actor);
+#ifdef __vita__
+        Vita::addCullTimer(ptr.getRefData().getBaseNode(), Vita::CullActors);
+#endif
 
         if (ptr.getType() == ESM::REC_NPC_4)
         {

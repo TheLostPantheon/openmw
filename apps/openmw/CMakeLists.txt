@@ -12,6 +12,7 @@ if(VITA)
         vita/VitaGLWorker.cpp
         vita/VitaCrashReport.cpp
         vita/VitaBuildInfo.cpp
+        vita/VitaCullTimer.cpp
     )
 endif()
 

@@ -91,6 +91,7 @@
 
 #ifdef __vita__
 #include <components/vita/VitaShader.h>
+#include "../vita/VitaCullTimer.h"
 #include "../vita/VitaInit.h"
 #include <osg/GL>
 #endif
@@ -422,6 +423,10 @@ namespace MWRender
         sceneRoot->setStartLight(1);
         sceneRoot->setNodeMask(Mask_Scene);
         sceneRoot->setName("Scene Root");
+#ifdef __vita__
+        Vita::addCullTimer(mRootNode, Vita::CullTotal);
+        Vita::addCullTimer(sceneRoot, Vita::CullScene);
+#endif
 
         int shadowCastingTraversalMask = Mask_Scene;
         if (Settings::shadows().mActorShadows)

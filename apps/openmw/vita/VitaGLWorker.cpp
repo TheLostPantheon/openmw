@@ -116,6 +116,7 @@ namespace Vita
     {
         mThreadId.store(sceKernelGetThreadId(), std::memory_order_release);
         glGuardNameThread("gl");
+        pinCurrentThread(2, "gl");
         {
             char buf[48];
             std::snprintf(buf, sizeof(buf), "[GLWorker] alive tid=0x%x", (unsigned)sceKernelGetThreadId());
