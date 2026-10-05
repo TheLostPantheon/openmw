@@ -19,6 +19,9 @@ VITASDK="${VITASDK:-/usr/local/vitasdk}"
 VITAGL_DIR="${VITAGL_DIR:-${HOME}/vitaGL}"
 
 export PATH="${VITASDK}/bin:${PATH}"
+# Must match build-fast.sh: a reconfigure under a different pkg-config
+# changes dependency flags and recompiles the whole tree.
+export PKG_CONFIG="${PKG_CONFIG:-arm-vita-eabi-pkg-config}"
 
 echo "=== OpenMW Vita Build ==="
 echo "Source:  ${SRC_DIR}"
