@@ -104,9 +104,18 @@ if [ ! -f "${ICU_HOST}/bin/icupkg" ]; then
     cd "${BUILD_DIR}"
 fi
 
+# ccache, when installed: unchanged files are cache hits even when a full
+# rebuild is forced (branch switch, clean build, toolchain change).
+CCACHE_ARGS=()
+if command -v ccache &> /dev/null; then
+    CCACHE_ARGS=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+    echo "ccache: on ($(ccache -s 2>/dev/null | grep -iE '^ *(cache size|Cache size)' | head -1 | sed 's/^ *//'))"
+fi
+
 # Configure (matches Docker build exactly)
 echo "=== Configuring ==="
 cmake -DCMAKE_TOOLCHAIN_FILE="${SRC_DIR}/cmake/VitaToolchain.cmake" \
+      "${CCACHE_ARGS[@]}" \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
       -DVITAGL_DIR="${VITAGL_DIR}" \
