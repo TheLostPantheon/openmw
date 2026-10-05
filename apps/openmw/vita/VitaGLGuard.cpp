@@ -28,6 +28,9 @@ namespace
 
     std::atomic<SceUID> sOwnerTid{ -1 };
     std::atomic<unsigned> sOffThreadCalls{ 0 };
+    // Off-thread calls made while the GL worker was inside a job: these are
+    // true concurrent vitaGL use, the kind that corrupts its state.
+    std::atomic<unsigned> sConcurrentCalls{ 0 };
     SceUID sMainTid = -1;
     uint32_t sMainKey = 0;
 
@@ -94,15 +97,18 @@ extern "C" void vita_glguard_slow(const char* name)
     if (tid == owner)
         return; // fast key missed (slow-only mode) but this is the owner
     const unsigned total = sOffThreadCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool glBusy = vita_gl_busy != 0;
+    if (glBusy)
+        sConcurrentCalls.fetch_add(1, std::memory_order_relaxed);
 
     if (firstSeen(name, tid))
     {
         char tScratch[32], oScratch[32];
         char buf[192];
-        std::snprintf(buf, sizeof(buf), "[vglGuard] off-thread GL: %s on %s (0x%x), owner %s, gl=%s", name,
+        std::snprintf(buf, sizeof(buf), "[vglGuard] off-thread GL: %s on %s (0x%x), owner %s, gl=%s%s", name,
             threadName(tid, tScratch, sizeof(tScratch)), (unsigned)tid,
             owner < 0 ? "none (pre-init)" : threadName(owner, oScratch, sizeof(oScratch)),
-            vita_gl_phase ? vita_gl_phase : "?");
+            vita_gl_phase ? vita_gl_phase : "?", glBusy ? " CONCURRENT" : "");
         vitaBreadcrumb(buf);
     }
 
@@ -117,7 +123,8 @@ extern "C" void vita_glguard_slow(const char* name)
     {
         const unsigned prev = sLastSummaryTotal.exchange(total);
         char buf[96];
-        std::snprintf(buf, sizeof(buf), "[vglGuard] off-thread calls +%u (total %u)", total - prev, total);
+        std::snprintf(buf, sizeof(buf), "[vglGuard] off-thread calls +%u (total %u, concurrent %u)", total - prev,
+            total, sConcurrentCalls.load(std::memory_order_relaxed));
         vitaBreadcrumb(buf);
     }
 }

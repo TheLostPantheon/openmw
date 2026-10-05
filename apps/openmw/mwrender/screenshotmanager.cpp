@@ -9,6 +9,7 @@
 #include "../mwbase/environment.hpp"
 #include "../mwbase/world.hpp"
 #ifdef __vita__
+#include "../vita/VitaGLWorker.h"
 #include "../vita/VitaSimWorker.h"
 #endif
 
@@ -138,7 +139,11 @@ namespace MWRender
         mViewer->getCamera()->setFinalDrawCallback(mDrawCompleteCallback);
         mViewer->eventTraversal();
         mViewer->updateTraversal();
+#ifdef __vita__
+        Vita::renderingTraversalsOnGL(*mViewer);
+#else
         mViewer->renderingTraversals();
+#endif
         mDrawCompleteCallback->waitTillDone();
 
         // now that we've "used up" the current frame, get a fresh frame number for the next frame() following after the
