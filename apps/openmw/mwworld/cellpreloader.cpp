@@ -1423,10 +1423,43 @@ namespace MWWorld
         vitaEnforceBudgetLocked(kVitaWarmPoolBudget, 2);
     }
 
+    int CellPreloader::vitaPinPermanent(const std::vector<std::string>& paths)
+    {
+        int added = 0;
+        for (const std::string& path : paths)
+        {
+            {
+                const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
+                if (mVitaPinnedSet.count(path) > 0)
+                    continue;
+            }
+            VitaCommonRef ref;
+            try
+            {
+                // Load outside the lock: workers contend on it.
+                vitaLoadWarmResource(path, ref.tmpl, ref.shape);
+            }
+            catch (const std::exception& e)
+            {
+                Log(Debug::Warning) << "Permanent pin failed '" << path << "': " << e.what();
+                continue;
+            }
+            if (!ref.tmpl)
+                continue;
+            const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
+            if (mVitaPinnedSet.emplace(path, std::move(ref)).second)
+                ++added;
+        }
+        return added;
+    }
+
     osg::ref_ptr<const osg::Referenced> CellPreloader::vitaHoldWarm(const std::string& path) const
     {
         const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
-        auto it = mVitaCommonSet.find(path);
+        auto it = mVitaPinnedSet.find(path);
+        if (it != mVitaPinnedSet.end())
+            return it->second.tmpl;
+        it = mVitaCommonSet.find(path);
         if (it != mVitaCommonSet.end() && it->second.tmpl)
             return it->second.tmpl;
         it = mVitaRegionSet.find(path);
@@ -1441,6 +1474,8 @@ namespace MWWorld
     bool CellPreloader::vitaIsCommonWarm(const std::string& path) const
     {
         const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
+        if (mVitaPinnedSet.count(path) > 0)
+            return true;
         auto it = mVitaCommonSet.find(path);
         if (it != mVitaCommonSet.end() && it->second.tmpl)
             return true;

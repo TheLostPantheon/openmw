@@ -164,6 +164,11 @@ namespace MWWorld
         /// Warm template ref (pool or Ready ledger), or null. Callers pin it
         /// across gate->add so pool eviction between them cannot cold-load.
         osg::ref_ptr<const osg::Referenced> vitaHoldWarm(const std::string& path) const;
+        /// Session-permanent pins: assets every actor of a kind reaches for
+        /// (race skeletons, shared kf). Loaded synchronously -- call only
+        /// under a loading screen. Outside every pool budget and relief
+        /// path, so pressure can never re-cool them. Returns paths added.
+        int vitaPinPermanent(const std::vector<std::string>& paths);
         /// Total template+shape bytes pinned by the warm pools.
         std::size_t vitaWarmPoolBytes() const;
         /// Evict lowest value-per-byte entries until under target.
@@ -239,6 +244,7 @@ namespace MWWorld
         };
         std::map<std::string, VitaCommonRef> mVitaCommonSet;
         std::map<std::string, VitaCommonRef> mVitaRegionSet;
+        std::map<std::string, VitaCommonRef> mVitaPinnedSet; // never evicted
         std::vector<std::pair<std::string, unsigned>> mVitaGeneralPackage;
         std::map<std::string, std::vector<std::pair<std::string, unsigned>>> mVitaRegionPackages;
         struct VitaDemandEntry
