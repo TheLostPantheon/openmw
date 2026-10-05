@@ -8,6 +8,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 
+#include "VitaGLGuard.h"
 #include "VitaInit.h"
 
 namespace Vita
@@ -81,6 +82,7 @@ namespace Vita
 
     void GLWorker::loop() noexcept
     {
+        glGuardNameThread("gl");
         breadcrumb("[GLWorker] alive");
         while (!mJoinRequest.load(std::memory_order_acquire))
         {

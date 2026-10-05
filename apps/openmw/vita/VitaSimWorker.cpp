@@ -9,6 +9,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 
+#include "VitaGLGuard.h"
 #include "VitaInit.h"
 
 namespace Vita
@@ -96,6 +97,7 @@ namespace Vita
     void SimWorker::loop() noexcept
     {
         tIsSimThread = true;
+        glGuardNameThread("sim");
         breadcrumb("[SimWorker] alive");
 
         while (!mJoinRequest.load(std::memory_order_acquire))

@@ -1,6 +1,7 @@
 #ifdef __vita__
 
 #include "VitaInit.h"
+#include "VitaGLGuard.h"
 #include "VitaGLWorker.h"
 
 #include <cxxabi.h>
@@ -1318,6 +1319,7 @@ namespace Vita
         // makes the linker treat the section as reachable.
         asm volatile("" :: "m"(sceUserMainThreadStackSize));
         asm volatile("" :: "m"(g_vitaSegmentPad));
+        Vita::glGuardNameThread("main");
 
         // Environment setup (must be after main, not in constructors)
         setenv("TMPDIR", "ux0:data/openmw/cache", 1);
@@ -1448,6 +1450,9 @@ namespace Vita
         // Observed crash in dense interior cells (Shulk Egg Mine repro). Bumping the
         // vertex/fragment/VDM rings 2× each. Param buffer left at default 16 MB.
         const auto vitaInitGL = [&] {
+        // vitaGL's owner is whichever thread runs vglInit (no per-thread
+        // contexts): record it for the GL guard before the first GL call.
+        Vita::glGuardSetOwner();
         vglSetParamBufferSize(16 * 1024 * 1024);
         vglSetVDMBufferSize(256 * 1024);                  // 128 KB → 256 KB
         vglSetVertexBufferSize(8 * 1024 * 1024);          //  2 MB → 8 MB (4 MB still crashed; bumped further)
