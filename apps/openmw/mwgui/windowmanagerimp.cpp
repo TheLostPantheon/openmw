@@ -2,6 +2,7 @@
 
 #ifdef __vita__
 #include "../vita/VitaInit.h"
+#include "../vita/VitaGLWorker.h"
 #include "../vita/VitaSimWorker.h"
 #include <psp2/kernel/processmgr.h>
 #endif
@@ -833,7 +834,11 @@ namespace MWGui
                 {
                     mViewer->eventTraversal();
                     mViewer->updateTraversal();
+#ifdef __vita__
+                    Vita::renderingTraversalsOnGL(*mViewer);
+#else
                     mViewer->renderingTraversals();
+#endif
                 }
                 // at the time this function is called we are in the middle of a frame,
                 // so out of order calls are necessary to get a correct frameNumber for the next frame.
@@ -2223,7 +2228,11 @@ namespace MWGui
 
                 mViewer->eventTraversal();
                 mViewer->updateTraversal();
+#ifdef __vita__
+                Vita::renderingTraversalsOnGL(*mViewer);
+#else
                 mViewer->renderingTraversals();
+#endif
             }
             // at the time this function is called we are in the middle of a frame,
             // so out of order calls are necessary to get a correct frameNumber for the next frame.

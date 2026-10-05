@@ -2,6 +2,7 @@
 
 #ifdef __vita__
 #include "../vita/VitaInit.h"
+#include "../vita/VitaGLWorker.h"
 #include "../vita/VitaSimWorker.h"
 #endif
 
@@ -534,7 +535,11 @@ namespace MWGui
         // refer to the advance() and frame() order in Engine::go()
         mViewer->eventTraversal();
         mViewer->updateTraversal();
+#ifdef __vita__
+        Vita::renderingTraversalsOnGL(*mViewer);
+#else
         mViewer->renderingTraversals();
+#endif
         mViewer->advance(mViewer->getFrameStamp()->getSimulationTime());
 
         mLastRenderTime = mTimer.time_m();

@@ -13,6 +13,7 @@
 #include <MyGUI_EditBox.h>
 #include <MyGUI_UString.h>
 
+#include "VitaGLWorker.h"
 #include "VitaInit.h"
 
 namespace
@@ -144,11 +145,16 @@ namespace Vita
         // Poll until dialog finishes. Render a real cleared scene each
         // swap: the common dialog composites onto the frame, and a swap
         // with no scene leaves it nothing valid to draw into.
+        // The swap must happen on the GL owner thread (vitaGL is unlocked).
         while (sceImeDialogGetStatus() == SCE_COMMON_DIALOG_STATUS_RUNNING)
         {
-            glClearColor(0.f, 0.f, 0.f, 1.f);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-            vglSwapBuffers(GL_TRUE);
+            callOnGL(
+                [] {
+                    glClearColor(0.f, 0.f, 0.f, 1.f);
+                    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                    vglSwapBuffers(GL_TRUE);
+                },
+                "ime");
         }
 
         // Get result

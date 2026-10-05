@@ -59,4 +59,6 @@ fi
 echo ""
 echo "=== Build Complete ==="
 echo "eboot.bin: ${BUILD_DIR}/apps/openmw/eboot.bin"
-[ "${WANT_VPK}" -eq 1 ] && echo "VPK:       ${BUILD_DIR}/apps/openmw/openmw.vpk"
+if [ "${WANT_VPK}" -eq 1 ]; then
+    echo "VPK:       ${BUILD_DIR}/apps/openmw/openmw.vpk"
+fi

@@ -818,12 +818,17 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             runSimPhases(frameStart, nextFrame, nextDt, nextPaused);
         });
         mSimPrimed = true;
-        renderer->draw();
-        mViewer->getCamera()->getGraphicsContext()->swapBuffers();
+        osg::GraphicsContext* gc = mViewer->getCamera()->getGraphicsContext();
+        Vita::callOnGL(
+            [renderer, gc] {
+                renderer->draw();
+                gc->swapBuffers();
+            },
+            "draw");
         Vita::setDrawInFlight(false);
     }
     else
-        mViewer->renderingTraversals();
+        Vita::renderingTraversalsOnGL(*mViewer);
     if (!Vita::getGLWorker())
         Vita::noteRenderTime(sceKernelGetProcessTimeWide() - renderStartUs);
 #else
@@ -1620,6 +1625,10 @@ void OMW::Engine::go()
         // Nested render loops (loading, video) must consume a pending
         // culled frame first or the queue serves them a stale scene.
         Vita::setDrainDrawHook([this] {
+            // Nested renders follow on the GL thread; let any async draw job
+            // land first even when no culled frame is pending.
+            if (Vita::GLWorker* glw = Vita::getGLWorker())
+                glw->finish();
             if (!mCullPrimed)
                 return;
             // From sim thread: cull already ran (it precedes sim in the batch);
@@ -1628,7 +1637,7 @@ void OMW::Engine::go()
                 mSimWorker->finish();
             auto* renderer = static_cast<osgViewer::Renderer*>(mViewer->getCamera()->getRenderer());
             if (Vita::GLWorker* glw = Vita::getGLWorker())
-                glw->call([renderer] { renderer->draw(); });
+                glw->call([renderer] { renderer->draw(); }, "drain");
             else
                 renderer->draw();
             mCullPrimed = false;
