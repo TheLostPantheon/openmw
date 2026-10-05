@@ -280,6 +280,28 @@ endif (ANDROID)
 if (VITA)
     # Attr-less pthreads get 256KB stacks (default 32KB; Bullet EPA needs ~30KB).
     target_link_options(openmw PRIVATE "-Wl,--wrap=pthread_create")
+
+    # GL guard (vita/VitaGLGuard.h): wraps every vitaGL entry point listed in
+    # vita/VitaGLGuardList.h with an owner-thread check that logs off-thread
+    # calls. ~8 instructions per GL call when on the owner thread.
+    option(OPENMW_VITA_GL_GUARD "Log vitaGL calls made off the GL owner thread" ON)
+    target_sources(openmw PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vita/VitaGLGuard.cpp)
+    if (OPENMW_VITA_GL_GUARD)
+        set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/vita/VitaGLGuard.cpp
+            PROPERTIES COMPILE_DEFINITIONS OPENMW_VITA_GL_GUARD)
+        set(_vglGuardList "${CMAKE_CURRENT_SOURCE_DIR}/vita/VitaGLGuardList.h")
+        set(_vglGuardWrap "${CMAKE_CURRENT_BINARY_DIR}/vglguard.wrap")
+        file(STRINGS "${_vglGuardList}" _vglGuardLines REGEX "^VGL_GUARD\\(")
+        set(_vglGuardFlags "")
+        foreach(_line ${_vglGuardLines})
+            string(REGEX REPLACE "^VGL_GUARD\\(([A-Za-z0-9_]+)\\).*" "--wrap=\\1" _flag "${_line}")
+            string(APPEND _vglGuardFlags "${_flag}\n")
+        endforeach()
+        file(WRITE "${_vglGuardWrap}" "${_vglGuardFlags}")
+        target_link_options(openmw PRIVATE "-Wl,@${_vglGuardWrap}")
+        set_property(TARGET openmw APPEND PROPERTY LINK_DEPENDS "${_vglGuardWrap}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_vglGuardList}")
+    endif()
     # OSG libs excluded from USED_OSG_COMPONENTS but still needed for linking.
     foreach(_osgextra osgParticle osgShadow)
         if(NOT TARGET ${_osgextra})
