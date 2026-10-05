@@ -1,0 +1,42 @@
+diff --git a/source/buffers.c b/source/buffers.c
+index 9ef4257..8965de8 100644
+--- a/source/buffers.c
++++ b/source/buffers.c
+@@ -359,6 +359,13 @@ void glDeleteBuffers(GLsizei n, const GLuint *gl_buffers) {
+ 	}
+ }
+ 
++// OpenMW Vita: route GL_STATIC_DRAW (and other non-stream, non-dynamic)
++// buffer storage to the RAM pool first instead of CDRAM.
++static GLboolean vgl_static_vbo_ram = GL_FALSE;
++void vglSetStaticVboRam(GLboolean enable) {
++	vgl_static_vbo_ram = enable ? GL_TRUE : GL_FALSE;
++}
++
+ inline void glNamedBufferData(GLuint buffer, GLsizei size, const void *data, GLenum usage) {
+ 	THREAD_SAFE()
+ 
+@@ -398,7 +405,9 @@ inline void glNamedBufferData(GLuint buffer, GLsizei size, const void *data, GLe
+ #if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
+ 		gpu_buf->scratch = GL_FALSE;
+ #endif
+-		gpu_buf->alloc_func = gpu_alloc_mapped_for_gpu;
++		// OpenMW Vita: static geometry may live in the RAM pool so CDRAM
++		// stays free for textures (vglSetStaticVboRam).
++		gpu_buf->alloc_func = vgl_static_vbo_ram ? gpu_alloc_mapped_for_cpu : gpu_alloc_mapped_for_gpu;
+ 		break;
+ 	}
+ 
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index dac9fa0..6ac32c6 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1150,6 +1150,8 @@ void vglAddSemanticBindingHint(const GLchar *const *varying, GLenum type);
+ 
+ // Alloc memory from vitaGL internal memory pools. Needs to be freed with vglFree.
+ void *vglAlloc(uint32_t size, vglMemType type);
++// OpenMW Vita: when enabled, static buffer storage prefers the RAM pool over CDRAM.
++void vglSetStaticVboRam(GLboolean enable);
+ 
+ // Alloc temporary memory from vitaGL internal scratch pool. Allocation is extremely fast if NO_CIRCULAR_POOL is not used. Memory lifetime is guaranteed for 3 frames.
+ void *vglAllocFromScratch(size_t size);

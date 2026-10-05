@@ -24,13 +24,17 @@ extern "C"
     extern unsigned int cullprof_node, cullprof_group, cullprof_transform, cullprof_geode, cullprof_drawable,
         cullprof_dcull, cullprof_leaves, cullprof_sg, cullprof_xf_bone;
     extern unsigned int cullprof_drw_us, cullprof_cb_us, cullprof_xf_us, cullprof_grp_us;
-    extern unsigned int cullprof_xfbound_us;
+    // Weak defaults: these counters came from an OSG patch and a vitaGL
+    // fork lost in the Aug 2026 machine restore. A strong definition (a
+    // future patch) overrides them; until then they report zero.
+    __attribute__((weak)) unsigned int cullprof_xfbound_us = 0;
     extern uint32_t vita_sim_script_us, vita_sim_mech_us, vita_sim_phys_us, vita_sim_gscript_us;
     int cullprof_cb_report(char* buf, unsigned int buflen);
     int vita_script_hist_report(char* buf, unsigned int buflen);
-    extern uint32_t vgl_memo_hits, vgl_memo_miss;
-    extern uint32_t vgl_vprog_hits, vgl_vprog_miss;
-    extern uint32_t vgl_swap_block_us, vgl_swap_block_max, vgl_qdepth_sum, vgl_qdepth_max, vgl_gpu_frames;
+    __attribute__((weak)) uint32_t vgl_memo_hits = 0, vgl_memo_miss = 0;
+    __attribute__((weak)) uint32_t vgl_vprog_hits = 0, vgl_vprog_miss = 0;
+    __attribute__((weak)) uint32_t vgl_swap_block_us = 0, vgl_swap_block_max = 0, vgl_qdepth_sum = 0,
+                                   vgl_qdepth_max = 0, vgl_gpu_frames = 0;
     unsigned int terr_chunks = 0, terr_pass_leaves = 0;
     uint32_t phase_evt_us = 0, phase_upd_us = 0, phase_focus_us = 0, phase_lua_us = 0;
     uint32_t phase_pre_us = 0, phase_pace_us = 0;
