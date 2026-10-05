@@ -19,9 +19,10 @@ set -e
 VITAGL_DIR="${1:-${HOME}/vitaGL}"
 VITASDK="${VITASDK:-/usr/local/vitasdk}"
 VITAGL_REPO="${VITAGL_REPO:-https://github.com/TheLostPantheon/vitaGL.git}"
-# openmw-vita @ 9dbd7e4: upstream 6e7fe40 (2026-07-31, the API generation the
-# app code matches) + vglSetStaticVboRam.
-VITAGL_COMMIT="${VITAGL_COMMIT:-9dbd7e4b5e1caeb0861b92f50ca4a9e1f57c2946}"
+# openmw-vita: upstream 6e7fe40 (2026-07-31, the API generation the app code
+# matches) + vglSetStaticVboRam + synchronous compressed texture transfers
+# + GPU backpressure counters.
+VITAGL_COMMIT="${VITAGL_COMMIT:-5cf5515f9cc25f80baf53f1ae3e6930dd26b058a}"
 
 export VITASDK
 export PATH="${VITASDK}/bin:${PATH}"
@@ -93,6 +94,9 @@ mkdir -p "${VITAGL_DIR}/include"
 if [ "${SRC}" != "${VITAGL_DIR}" ]; then
     cp -f "${SRC}/libvitaGL.a" "${VITAGL_DIR}/libvitaGL.a"
 fi
-cp -f "${SRC}/source/vitaGL.h" "${VITAGL_DIR}/include/vitaGL.h"
+# Copy only on change: nearly every TU includes vitaGL.h (via the GL
+# headers), so a fresh timestamp alone would recompile most of the tree.
+cmp -s "${SRC}/source/vitaGL.h" "${VITAGL_DIR}/include/vitaGL.h" \
+    || cp -f "${SRC}/source/vitaGL.h" "${VITAGL_DIR}/include/vitaGL.h"
 
 echo "[OK] libvitaGL.a at ${VITAGL_DIR}/libvitaGL.a (headers in ${VITAGL_DIR}/include)"

@@ -11,6 +11,7 @@ if(VITA)
         vita/VitaSimWorker.cpp
         vita/VitaGLWorker.cpp
         vita/VitaCrashReport.cpp
+        vita/VitaBuildInfo.cpp
     )
 endif()
 

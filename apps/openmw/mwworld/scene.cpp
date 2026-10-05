@@ -689,9 +689,59 @@ namespace MWWorld
         mPhysics->updateScale(ptr);
     }
 
+#ifdef __vita__
+    namespace
+    {
+        // [SceneAvg]: per-step averages of Scene::update every 150 calls.
+        // Steps: grid, cache, preload, pump (warm pump + unref flush), prep,
+        // hydrate, retire, promo (demotions + promotions), rest (watchdog).
+        struct VitaSceneSplit
+        {
+            static constexpr int kSteps = 9;
+            using Clock = std::chrono::steady_clock;
+            Clock::time_point mT0 = Clock::now();
+            Clock::time_point mMark[kSteps];
+            bool mHas[kSteps] = {};
+            void mark(int step)
+            {
+                mMark[step] = Clock::now();
+                mHas[step] = true;
+            }
+            ~VitaSceneSplit()
+            {
+                static uint64_t sSum[kSteps] = {};
+                static unsigned sCount = 0;
+                Clock::time_point prev = mT0;
+                for (int i = 0; i < kSteps - 1; ++i)
+                {
+                    if (!mHas[i])
+                        continue;
+                    sSum[i] += std::chrono::duration_cast<std::chrono::microseconds>(mMark[i] - prev).count();
+                    prev = mMark[i];
+                }
+                sSum[kSteps - 1] += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - prev).count();
+                if (++sCount < 150)
+                    return;
+                char b[200];
+                const double k = sCount * 1000.0;
+                snprintf(b, sizeof(b),
+                    "[SceneAvg] grid=%.2f cache=%.2f preload=%.2f pump=%.2f prep=%.2f hydrate=%.2f retire=%.2f "
+                    "promo=%.2f rest=%.2f ms/frame",
+                    sSum[0] / k, sSum[1] / k, sSum[2] / k, sSum[3] / k, sSum[4] / k, sSum[5] / k, sSum[6] / k,
+                    sSum[7] / k, sSum[8] / k);
+                Vita::breadcrumb(b);
+                for (uint64_t& v : sSum)
+                    v = 0;
+                sCount = 0;
+            }
+        };
+    }
+#endif
+
     void Scene::update(float duration)
     {
 #ifdef __vita__
+        VitaSceneSplit vitaSplit;
         // Streaming mode is an architecture switch, so it can't flip under a
         // live world. Rebuild through the save path instead — in RAM, so the
         // player's saves and quicksave rotation are untouched.
@@ -753,8 +803,12 @@ namespace MWWorld
 #endif
         }
 
+#ifdef __vita__
+        vitaSplit.mark(0);
+#endif
         mPreloader->updateCache(mRendering.getReferenceTime());
 #ifdef __vita__
+        vitaSplit.mark(1);
         {
             const auto plc0 = std::chrono::steady_clock::now();
             preloadCells(duration);
@@ -772,6 +826,7 @@ namespace MWWorld
         preloadCells(duration);
 #endif
 #ifdef __vita__
+        vitaSplit.mark(2);
         {
             static int sWarmTick = 0;
             static int sFastTick = 0;
@@ -851,10 +906,14 @@ namespace MWWorld
 #endif
 
 #ifdef __vita__
+        vitaSplit.mark(3);
         // Incrementally load deferred ring cells
         processPendingCellLoads();
+        vitaSplit.mark(4);
         vitaBubbleTick(4);
+        vitaSplit.mark(5);
         vitaRetirePump();
+        vitaSplit.mark(6);
 
         // Drain queued cell demotions (cells deferred from interior entry).
         // Gated on no pending loads inside processPendingDemotions itself.
@@ -864,6 +923,7 @@ namespace MWWorld
         // exiting an interior). Promotion priority is NPCs/creatures first
         // so the player sees them as soon as possible.
         processPendingPromotions();
+        vitaSplit.mark(7);
 
         // Memory-pressure watchdog: flush caches when heap is high.
         // Only acts once per threshold crossing to avoid spamming clearCache

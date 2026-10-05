@@ -36,6 +36,7 @@
 extern "C" void vglSetStaticVboRam(unsigned char enable);
 extern "C" uint32_t phase_evt_us, phase_upd_us, phase_focus_us, phase_lua_us, phase_pre_us, phase_pace_us;
 extern "C" uint32_t phase_fin_us, phase_inp_us, phase_unref_us, phase_stats_us;
+extern "C" uint32_t vita_simjob_us, vita_simjob_upd_us, vita_simjob_cull_us;
 extern "C" uint32_t phase_snd_us, phase_lsync_us, phase_state_us;
 extern "C" uint32_t phase_world_us, phase_wm_us;
 extern "C" unsigned int vita_bin2_graphs, vita_bin2_leaves;
@@ -708,6 +709,9 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         const bool havePrev = mCullPrimed;
         Vita::setDrawInFlight(true);
         mSimWorker->run([this, renderer, frameStart, nextFrame, nextDt, nextPaused] {
+            // Sim-job split for [SimSplit]: the main thread's join waits on
+            // this whole job (update traversal + cull + sim phases).
+            const uint64_t jobT0 = sceKernelGetProcessTimeWide();
             if (mVitaWorkerUpdatePending)
             {
                 // Non-hazard update callbacks; must precede cull.
@@ -721,8 +725,13 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
                 mViewer->getSceneData()->accept(*mVitaWorkerUpdateVisitor);
                 mVitaWorkerUpdatePending = false;
             }
+            const uint64_t cullT0 = sceKernelGetProcessTimeWide();
+            vita_simjob_upd_us += (uint32_t)(cullT0 - jobT0);
             renderer->cull();
+            const uint64_t simT0 = sceKernelGetProcessTimeWide();
+            vita_simjob_cull_us += (uint32_t)(simT0 - cullT0);
             runSimPhases(frameStart, nextFrame, nextDt, nextPaused);
+            vita_simjob_us += (uint32_t)(sceKernelGetProcessTimeWide() - jobT0);
         });
         mSimPrimed = true;
         mCullPrimed = true;
