@@ -38,15 +38,15 @@ done
 cd "${BUILD_DIR}"
 
 # Relink if the vitaGL lib is newer than the ELF (CMake can't see it).
-VGL_LIB="${VITASDK:-/home/m/vitasdk}/arm-vita-eabi/lib/libvitaGL.a"
+VGL_LIB="${VITAGL_DIR}/libvitaGL.a"
 ELF="apps/openmw/openmw"
 if [ -f "$VGL_LIB" ] && [ -f "$ELF" ] && [ "$VGL_LIB" -nt "$ELF" ]; then
     echo "=== libvitaGL.a newer than ELF; forcing relink ==="
     rm -f "$ELF" apps/openmw/eboot.bin
 fi
 
-# Recompile the fingerprint TU so __DATE__/__TIME__ match this build.
-touch ../apps/openmw/vita/VitaInit.cpp 2>/dev/null || touch "${SCRIPT_DIR}/../../apps/openmw/vita/VitaInit.cpp" 2>/dev/null || true
+# The build id/stamp lives in one tiny TU (vita/VitaBuildInfo.cpp); its
+# header changes every build, so only that file recompiles.
 
 BUILD_ID="$(bash "${SCRIPT_DIR}/build-id.sh")"
 echo "=== Building eboot.bin (-j$(nproc)), id ${BUILD_ID} ==="

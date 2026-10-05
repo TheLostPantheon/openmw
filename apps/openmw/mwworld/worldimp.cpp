@@ -2137,6 +2137,25 @@ namespace MWWorld
 #ifdef __vita__
         {
             const uint64_t wsEnd = sceKernelGetProcessTimeWide();
+            // [WorldAvg]: per-step averages every 150 updates ([WorldSplit]
+            // below only fires on >500ms frames).
+            static uint64_t sWsSum[6] = {};
+            static unsigned sWsCount = 0;
+            for (int i = 0; i < 5; ++i)
+                sWsSum[i] += wsT[i + 1] - wsT[i];
+            sWsSum[5] += wsEnd - wsT[5];
+            if (++sWsCount >= 150)
+            {
+                char ab[160];
+                const double k = sWsCount * 1000.0;
+                snprintf(ab, sizeof(ab),
+                    "[WorldAvg] wthr=%.2f nav=%.2f plyr=%.2f scene=%.2f rend=%.2f snd=%.2f ms/frame",
+                    sWsSum[0] / k, sWsSum[1] / k, sWsSum[2] / k, sWsSum[3] / k, sWsSum[4] / k, sWsSum[5] / k);
+                Vita::breadcrumb(ab);
+                for (uint64_t& v : sWsSum)
+                    v = 0;
+                sWsCount = 0;
+            }
             if (wsEnd - wsT[0] > 500000ULL)
             {
                 char wb[160];

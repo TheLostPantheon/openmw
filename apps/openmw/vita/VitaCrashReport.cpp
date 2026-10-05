@@ -13,14 +13,9 @@
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/threadmgr.h>
 
+#include "VitaBuildInfo.h"
 #include "VitaGLGuard.h"
 #include "VitaInit.h"
-#if __has_include("VitaBuildId.h")
-#include "VitaBuildId.h"
-#endif
-#ifndef VITA_BUILD_ID
-#define VITA_BUILD_ID "unknown"
-#endif
 
 extern "C" int vitaLogFlushTry(void);
 
@@ -144,7 +139,7 @@ namespace
             static const char* const kType[] = { "Data abort", "Prefetch abort", "Undefined instruction" };
             const SceUID tid = sceKernelGetThreadId();
             const char* tname = Vita::glGuardThreadName(tid);
-            put("=== OpenMW crash ===\nbuild: %s\n", VITA_BUILD_ID);
+            put("=== OpenMW crash ===\nbuild: %s\n", Vita::buildId());
             put("exception: %s\n", c->exceptionType < 3 ? kType[c->exceptionType] : "?");
             if (c->exceptionType == KU_KERNEL_EXCEPTION_TYPE_DATA_ABORT)
                 put("fault: %s of 0x%08x (%s, FSR=0x%x)\n", (c->FSR & (1u << 11)) ? "write" : "read",
@@ -207,11 +202,11 @@ namespace
             return;
         }
         h.buildId[sizeof(h.buildId) - 1] = 0;
-        if (strcmp(h.buildId, VITA_BUILD_ID) != 0)
+        if (strcmp(h.buildId, Vita::buildId()) != 0)
         {
             char buf[160];
             snprintf(buf, sizeof(buf), "[Crash] vita_syms.bin is for %s, not %s: names disabled", h.buildId,
-                VITA_BUILD_ID);
+                Vita::buildId());
             vitaBreadcrumb(buf);
             sceIoClose(fd);
             return;

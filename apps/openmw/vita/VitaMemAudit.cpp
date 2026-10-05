@@ -39,6 +39,7 @@ extern "C"
     uint32_t phase_evt_us = 0, phase_upd_us = 0, phase_focus_us = 0, phase_lua_us = 0;
     uint32_t phase_pre_us = 0, phase_pace_us = 0;
     uint32_t phase_fin_us = 0, phase_inp_us = 0, phase_unref_us = 0, phase_stats_us = 0;
+    uint32_t vita_simjob_us = 0, vita_simjob_upd_us = 0, vita_simjob_cull_us = 0;
     uint32_t phase_snd_us = 0, phase_lsync_us = 0, phase_state_us = 0;
     uint32_t phase_world_us = 0, phase_wm_us = 0;
     unsigned int vita_bin2_graphs = 0, vita_bin2_leaves = 0;
@@ -423,6 +424,10 @@ namespace Vita
         static uint64_t s_sumEvt = 0, s_sumUpd = 0, s_sumFoc = 0, s_sumLua = 0, s_sumPre = 0, s_sumPace = 0,
             s_sumRnd = 0;
         static unsigned s_over40 = 0;
+        // Per-step main-thread averages ([MainAvg]); the [Worst] line only
+        // shows these for the single slowest frame.
+        static uint64_t s_sumInp = 0, s_sumSnd = 0, s_sumLsync = 0, s_sumState = 0, s_sumWorld = 0, s_sumWm = 0,
+            s_sumUnref = 0;
         {
             const uint64_t nowF = sceKernelGetProcessTimeWide();
             if (s_prevFrameUs)
@@ -464,6 +469,13 @@ namespace Vita
             s_sumPre += phase_pre_us;
             s_sumPace += phase_pace_us;
             s_sumRnd += (uint32_t)gLastRenderUs;
+            s_sumInp += phase_inp_us;
+            s_sumSnd += phase_snd_us;
+            s_sumLsync += phase_lsync_us;
+            s_sumState += phase_state_us;
+            s_sumWorld += phase_world_us;
+            s_sumWm += phase_wm_us;
+            s_sumUnref += phase_unref_us;
         }
 
         if (++s_frames < kReportEveryFrames)
@@ -515,6 +527,12 @@ namespace Vita
                 s_sumRnd / n, s_sumEvt / n, s_sumUpd / n, s_sumFoc / n, s_sumLua / n, s_sumPre / n, s_sumPace / n);
             auditLog(buf);
             s_sumEvt = s_sumUpd = s_sumFoc = s_sumLua = s_sumPre = s_sumPace = s_sumRnd = 0;
+            snprintf(buf, sizeof(buf),
+                "[MainAvg] inp=%.1f snd=%.1f lsync=%.1f state=%.1f world=%.1f wm=%.1f unref=%.1f ms/frame",
+                s_sumInp / n, s_sumSnd / n, s_sumLsync / n, s_sumState / n, s_sumWorld / n, s_sumWm / n,
+                s_sumUnref / n);
+            auditLog(buf);
+            s_sumInp = s_sumSnd = s_sumLsync = s_sumState = s_sumWorld = s_sumWm = s_sumUnref = 0;
         }
         s_over40 = 0;
         s_prevWaitUs = 0;
@@ -637,13 +655,18 @@ namespace Vita
         // Sim-worker phase split: what the main thread's join actually waits on.
         if (vita_sim_script_us + vita_sim_mech_us + vita_sim_phys_us > 0)
         {
-            snprintf(buf, sizeof(buf), "[SimSplit] scr=%.1f (glob=%.1f) mech=%.1f phys=%.1f ms/frame",
+            snprintf(buf, sizeof(buf),
+                "[SimSplit] scr=%.1f (glob=%.1f) mech=%.1f phys=%.1f job=%.1f upd=%.1f cull=%.1f ms/frame",
                 (double)vita_sim_script_us / 1000.0 / kReportEveryFrames,
                 (double)vita_sim_gscript_us / 1000.0 / kReportEveryFrames,
                 (double)vita_sim_mech_us / 1000.0 / kReportEveryFrames,
-                (double)vita_sim_phys_us / 1000.0 / kReportEveryFrames);
+                (double)vita_sim_phys_us / 1000.0 / kReportEveryFrames,
+                (double)vita_simjob_us / 1000.0 / kReportEveryFrames,
+                (double)vita_simjob_upd_us / 1000.0 / kReportEveryFrames,
+                (double)vita_simjob_cull_us / 1000.0 / kReportEveryFrames);
             auditLog(buf);
         }
+        vita_simjob_us = vita_simjob_upd_us = vita_simjob_cull_us = 0;
         vita_sim_script_us = vita_sim_mech_us = vita_sim_phys_us = vita_sim_gscript_us = 0;
 
         // Per-script and per-cull-callback cost breakdowns.

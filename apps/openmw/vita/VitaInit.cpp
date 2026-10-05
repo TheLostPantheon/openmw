@@ -4,13 +4,7 @@
 #include "VitaCrashReport.h"
 #include "VitaGLGuard.h"
 #include "VitaGLWorker.h"
-// Written by scripts/vita/build-id.sh before each build (not in git).
-#if __has_include("VitaBuildId.h")
-#include "VitaBuildId.h"
-#endif
-#ifndef VITA_BUILD_ID
-#define VITA_BUILD_ID "unknown"
-#endif
+#include "VitaBuildInfo.h"
 
 #include <cxxabi.h>
 #include <pthread.h>
@@ -1530,11 +1524,11 @@ namespace Vita
             vitaInitGL();
         {
             char bstamp[96];
-            snprintf(bstamp, sizeof(bstamp), "BOOT: build %s %s", __DATE__, __TIME__);
+            snprintf(bstamp, sizeof(bstamp), "BOOT: build %s", buildStamp());
             breadcrumb(bstamp);
             // Matches the ELF archived by scripts/vita/archive-build.sh;
             // scripts/vita/vita_crash.py finds symbols by this line.
-            snprintf(bstamp, sizeof(bstamp), "[Build] id=%s", VITA_BUILD_ID);
+            snprintf(bstamp, sizeof(bstamp), "[Build] id=%s", buildId());
             breadcrumb(bstamp);
         }
         breadcrumb("BOOT: vitaGL initialized");
