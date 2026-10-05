@@ -20,6 +20,10 @@ namespace Vita
 
     /// Off-thread GL calls seen since boot (every call, not just first ones).
     unsigned glGuardOffThreadCalls();
+
+    /// Name registered for a thread id by glGuardNameThread, or nullptr.
+    /// Lock-free; safe from crash handlers.
+    const char* glGuardThreadName(int tid);
 }
 
 #endif // __vita__

@@ -182,9 +182,20 @@ def tool_delete(args):
     return f"deleted {path} (backed up to {saved})"
 
 
+def tool_crash(args):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import vita_crash
+    return vita_crash.run(elf=args.get("elf"), delete=not args.get("keep_on_device", False))
+
+
 def tool_deploy(args):
     local = args.get("eboot") or os.path.join(REPO, "build-vita", "apps", "openmw", "eboot.bin")
-    return put(local, f"{APP_DIR}/eboot.bin")
+    msg = put(local, f"{APP_DIR}/eboot.bin")
+    # The crash reporter's symbol table must match the eboot's build id.
+    syms = os.path.join(os.path.dirname(os.path.expanduser(local)), "vita_syms.bin")
+    if os.path.isfile(syms):
+        msg += "\n" + put(syms, f"{APP_DIR}/vita_syms.bin")
+    return msg
 
 
 TOOLS = {
@@ -201,8 +212,13 @@ TOOLS = {
                  {"local": {"type": "string"}, "remote": {"type": "string"}}, ["local", "remote"]),
     "vita_delete": (tool_delete, "Delete a file on the Vita after backing it up locally.",
                     {"remote": {"type": "string"}}, ["remote"]),
-    "vita_deploy": (tool_deploy, "Deploy an eboot.bin to ux0:/app/OMWV00001 (default: build-vita/apps/openmw/"
-                    "eboot.bin). Backs up the installed eboot first, verifies size.",
+    "vita_crash": (tool_crash, "Fetch the newest psp2core crash dump (plus boot.log, crash.txt) from the Vita and "
+                   "return a symbolized report: crashed thread backtrace, all threads, log tail. Finds the ELF by "
+                   "the build id in boot.log. Archives inputs locally and removes dumps from the device.",
+                   {"elf": {"type": "string", "description": "Override the ELF used for symbols"},
+                    "keep_on_device": {"type": "boolean", "description": "Leave dumps on the Vita"}}, []),
+    "vita_deploy": (tool_deploy, "Deploy an eboot.bin (and the vita_syms.bin beside it) to ux0:/app/OMWV00001 "
+                    "(default: build-vita/apps/openmw/). Backs up the installed files first, verifies size.",
                     {"eboot": {"type": "string", "description": "Local eboot.bin path"}}, []),
 }
 

@@ -137,15 +137,18 @@ echo "=== Building OSG ==="
 make -C _deps/osg-build -j$(nproc)
 
 # Build eboot.bin
-echo "=== Building OpenMW ==="
+BUILD_ID="$(bash "${SCRIPT_DIR}/build-id.sh")"
+echo "=== Building OpenMW (id ${BUILD_ID}) ==="
 make -j$(nproc) eboot.bin-self
 
 # Build VPK (needed for ATTRIBUTE2 extra memory mode)
 echo "=== Building VPK ==="
 make openmw.vpk-vpk
 
+bash "${SCRIPT_DIR}/archive-build.sh" "${BUILD_ID}"
+
 echo ""
-echo "=== Build Complete ==="
+echo "=== Build Complete (${BUILD_ID}) ==="
 echo "eboot.bin: ${BUILD_DIR}/apps/openmw/eboot.bin"
 echo "VPK:       ${BUILD_DIR}/apps/openmw/openmw.vpk"
 echo ""
