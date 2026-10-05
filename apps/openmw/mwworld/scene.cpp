@@ -2611,6 +2611,34 @@ namespace MWWorld
     static int sVitaLivePhys = 0;
     static unsigned sVitaContactAdds = 0;
 
+    // ---- Actor pacing dials ----
+    // Actors used to have two failure modes pulling against each other:
+    // Lane B skipped whenever the last frame was over 1.5x target (every
+    // frame in a 20fps town), so actors starved; and once admitted, an add
+    // ran unbudgeted, so it hitched. Lane B now admits an actor when its
+    // learned cost fits the grant left this tick, and a starvation floor
+    // guarantees a minimum arrival rate whatever the frame rate.
+    // Cost estimates seed the learned per-kind add cost (ms) until the first
+    // measurement; kActorCostLearn is the EMA weight of a new sample (1/N).
+    constexpr float kActorCostSeedNpcMs = 12.f;
+    constexpr float kActorCostSeedCreaMs = 6.f;
+    constexpr int kActorCostLearn = 4;
+    // Grant floor for an actor add: never ask a composite to fit in less.
+    constexpr float kActorMinFitMs = 4.f;
+    // Starvation floor: a waiting actor is admitted regardless of grant or
+    // frame health once this long has passed since the last actor add.
+    // ~3 arrivals/s minimum; lower = faster towns, more frequent hitches.
+    constexpr int kActorStarveMs = 333;
+    // Inside this radius presence beats the frame: admit immediately.
+    constexpr float kActorUrgentR = 900.f;
+    // Ring-3 NPC data builds (ensureCustomData) per guard pass.
+    constexpr std::size_t kActorDataPerPass = 2;
+    // Cells entering the actor domain (scripts, respawn, sound warm) per tick.
+    constexpr int kActorDomainEntriesPerTick = 1;
+    // Telemetry for [ActorPace] (reset each report).
+    static uint32_t sVitaActorDataUs = 0;
+    static unsigned sVitaActorDataBuilds = 0;
+
     void Scene::vitaActorWarmPaths(const Ptr& ptr, std::vector<std::string>& out) const
     {
         const VFS::Manager* vfs = mRendering.getResourceSystem()->getVFS();
@@ -2651,6 +2679,15 @@ namespace MWWorld
                 skf.changeExtension(kfExt);
                 if (vfs->exists(skf))
                     out.push_back(skf.value());
+                // NpcAnimation also layers the shared xbase_anim kf under
+                // every non-werewolf 3rd-person NPC, and the swim kf under
+                // argonians; female/beast skeletons differ from it, so it
+                // was never in this list and could load cold mid-assembly.
+                for (const VFS::Path::Normalized& extraKf : { Settings::models().mXbaseanimkf.get(),
+                         beast && npc->mRace.contains("argonian") ? Settings::models().mXargonianswimknakf.get()
+                                                                  : VFS::Path::Normalized() })
+                    if (!extraKf.empty() && extraKf != skf && vfs->exists(extraKf))
+                        out.push_back(extraKf.value());
                 if (!npc->mModel.empty())
                 {
                     // Custom model: it is the skeleton, and its own kf too.
@@ -3114,6 +3151,7 @@ namespace MWWorld
                     MWWorld::Ptr nearMiss;
                     float nearBestD2 = rNear * rNear;
                     int actorWarmFiled = 0;
+                    std::vector<std::pair<float, MWWorld::Ptr>> dataCands;
                     for (CellStore* gc : cells)
                     {
                         if (!gc->getCell()->isExterior()
@@ -3140,6 +3178,16 @@ namespace MWWorld
                             if (actor && d2 < rActorWarm * rActorWarm && actorWarmFiled < 12
                                 && sRing3Warm.count(ptr.mRef) == 0)
                             {
+                                // An NPC's first inventory read runs its whole
+                                // ensureCustomData (spells, autocalc, AI fill,
+                                // leveled rolls, autoEquip). Unbounded here, a
+                                // town edge built dozens in one pass; defer to
+                                // the nearest few, below.
+                                if (ptr.getType() == ESM::REC_NPC_ && ptr.getRefData().getCustomData() == nullptr)
+                                {
+                                    dataCands.emplace_back(d2, ptr);
+                                    return true;
+                                }
                                 std::vector<std::string> paths;
                                 vitaActorWarmPaths(ptr, paths);
                                 bool allWarm = true;
@@ -3152,6 +3200,39 @@ namespace MWWorld
                             }
                             return true;
                         });
+                    }
+                    // Deferred NPC data builds: nearest first, kActorDataPerPass
+                    // per guard pass, inside this tick's grant once the first
+                    // is done. Lane B builds its own pick on demand anyway.
+                    if (!dataCands.empty())
+                    {
+                        const std::size_t take = std::min<std::size_t>(dataCands.size(), kActorDataPerPass);
+                        std::partial_sort(dataCands.begin(), dataCands.begin() + take, dataCands.end(),
+                            [](const auto& a, const auto& b) { return a.first < b.first; });
+                        for (std::size_t i = 0; i < take; ++i)
+                        {
+                            if (i > 0 && Clock::now() >= deadline)
+                                break;
+                            const auto& [d2, ptr] = dataCands[i];
+                            const auto data0 = Clock::now();
+                            std::vector<std::string> paths;
+                            vitaActorWarmPaths(ptr, paths);
+                            const uint32_t dataUs = vitaUsSince(data0);
+                            sVitaActorDataUs += dataUs;
+                            ++sVitaActorDataBuilds;
+                            if (dataUs > 10000)
+                            {
+                                char db[112];
+                                snprintf(db, sizeof(db), "[ActorData] %s %ums",
+                                    ptr.getCellRef().getRefId().toDebugString().c_str(), dataUs / 1000);
+                                Vita::breadcrumb(db);
+                            }
+                            bool allWarm = true;
+                            for (const std::string& ap : paths)
+                                allWarm = warmPath(ap, d2) && allWarm;
+                            if (allWarm)
+                                sRing3Warm.insert(ptr.mRef);
+                        }
                     }
                     if (!nearMiss.isEmpty())
                     {
@@ -3715,6 +3796,7 @@ namespace MWWorld
 
         // ---- Lane A ----        // ---- Lane A ----
         const auto laneA0 = Clock::now();
+        int domainEntries = 0;
         for (std::size_t ci = 0; ci < n; ++ci)
         {
             if (Clock::now() >= deadline)
@@ -3734,8 +3816,14 @@ namespace MWWorld
             const bool inSceneDomain = mVitaPhysDomain.count(&cell) > 0;
             if (!wantFull && !inActorDomain && !wantStruct && !inSceneDomain)
                 continue;
-            if (wantFull && !inActorDomain)
+            // Domain entry (local scripts, respawn, sound warm) is a lump per
+            // cell; a crossing that brings several cells into rIn at once
+            // paid them all in one tick. Admit kActorDomainEntriesPerTick;
+            // the rest enter on following ticks (Lane B needs domain first).
+            const bool enterDomain = wantFull && !inActorDomain && domainEntries < kActorDomainEntriesPerTick;
+            if (enterDomain)
             {
+                ++domainEntries;
                 SegTimer segDom(&sSegDomUs);
                 mVitaActorDomain.insert(&cell);
                 mWorld.getLocalScripts().addCell(&cell);
@@ -3949,14 +4037,49 @@ namespace MWWorld
         // GL precompile is owned by the resource loader: SceneManager
         // submits each TEMPLATE on load (scenemanager.cpp), and instances
         // share its GL objects — so per-instance submission was redundant.
-        // ---- Lane B: one actor per healthy tick, nearest wins globally ----
+        // ---- Lane B: at most one actor per tick, nearest wins globally ----
         sSegLaneAUs = (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - laneA0).count();
+        // Pacing (see the actor pacing dials): admit when the learned add
+        // cost fits the grant left, when the actor is inside the urgent
+        // radius, or when the pipeline has starved for kActorStarveMs.
+        // "Satisfied" = last add, or last tick nothing was waiting.
+        static Clock::time_point sActorSatisfied{};
+        static float sActorCostNpcMs = kActorCostSeedNpcMs;
+        static float sActorCostCreaMs = kActorCostSeedCreaMs;
+        static unsigned sPaceFit = 0, sPaceUrgent = 0, sPaceStarve = 0, sPaceDeferFit = 0, sPaceDeferHealth = 0;
+        static uint32_t sPaceWorstUs = 0;
+        {
+            static Clock::time_point sLastPace{};
+            if (tick0 - sLastPace >= std::chrono::seconds(10))
+            {
+                sLastPace = tick0;
+                char pb[192];
+                snprintf(pb, sizeof(pb),
+                    "[ActorPace] add fit=%u urg=%u starve=%u defer fit=%u hp=%u est npc=%.1f cre=%.1fms "
+                    "worst=%ums data=%u/%ums dom=%u",
+                    sPaceFit, sPaceUrgent, sPaceStarve, sPaceDeferFit, sPaceDeferHealth, sActorCostNpcMs,
+                    sActorCostCreaMs, sPaceWorstUs / 1000, sVitaActorDataBuilds, sVitaActorDataUs / 1000,
+                    (unsigned)mVitaActorDomain.size());
+                Vita::breadcrumb(pb);
+                sPaceFit = sPaceUrgent = sPaceStarve = sPaceDeferFit = sPaceDeferHealth = 0;
+                sPaceWorstUs = 0;
+                sVitaActorDataBuilds = 0;
+                sVitaActorDataUs = 0;
+            }
+        }
+        const bool actorStarved = sActorSatisfied.time_since_epoch().count() != 0
+            && tick0 - sActorSatisfied >= std::chrono::milliseconds(kActorStarveMs);
         // Bar tracks the frame target: a hardcoded 30 skipped every tick
-        // once the controller settled frames at 34-35ms.
+        // once the controller settled frames at 34-35ms. A slow frame only
+        // defers actors until the starvation floor; at 20fps the old bar
+        // (1.5x target = 45ms) failed every tick and towns never filled.
         const float actorFps = Settings::cells().mTargetFramerate;
         const int actorHealthyMs = actorFps > 1.f ? (int)(1000.f / actorFps) * 3 / 2 : 45;
-        if (!bigBudget && frameDt >= actorHealthyMs)
+        if (!bigBudget && frameDt >= actorHealthyMs && !actorStarved)
+        {
+            ++sPaceDeferHealth;
             return vitaOps;
+        }
         SegTimer segActor(&sSegActorUs);
         int actorBudget = bigBudget ? 1000 : 1;
         std::vector<osg::ref_ptr<const osg::Referenced>> actorPins;
@@ -4004,26 +4127,50 @@ namespace MWWorld
                 });
             }
             if (best.isEmpty())
+            {
+                sActorSatisfied = Clock::now(); // nothing waiting: not starving
                 return vitaOps;
+            }
             if (!warmOrRequest(best, bestD2))
                 return vitaOps; // skeleton warming; try next tick
+            std::vector<std::string> actorPaths;
             {
                 // Composite assembly must never cold-load on the main thread:
                 // gate on every asset the construction will reach for.
-                std::vector<std::string> actorPaths;
                 vitaActorWarmPaths(best, actorPaths);
                 bool assetsWarm = true;
                 for (const std::string& ap : actorPaths)
                     assetsWarm = warmPath(ap, bestD2) && assetsWarm;
                 if (!assetsWarm)
                     return vitaOps; // actor assets streaming; assemble next tick
-                // PIN every part across the add: the floating pool budget
-                // may evict a part between this gate and assembly (same
-                // tick), which cold-loaded a whole composite (~1s stutter).
-                for (const std::string& ap : actorPaths)
-                    if (osg::ref_ptr<const osg::Referenced> h = mPreloader->vitaHoldWarm(ap))
-                        actorPins.push_back(std::move(h));
             }
+            const bool bestIsNpc = best.getType() == ESM::REC_NPC_;
+            float& costMs = bestIsNpc ? sActorCostNpcMs : sActorCostCreaMs;
+            if (!bigBudget)
+            {
+                // Assets are warm (demand filed either way); now decide if
+                // this tick can afford the composite.
+                const float leftMs
+                    = std::chrono::duration<float, std::milli>(deadline - Clock::now()).count();
+                if (bestD2 < kActorUrgentR * kActorUrgentR)
+                    ++sPaceUrgent;
+                else if (leftMs >= std::max(costMs, kActorMinFitMs))
+                    ++sPaceFit;
+                else if (actorStarved)
+                    ++sPaceStarve;
+                else
+                {
+                    ++sPaceDeferFit;
+                    return vitaOps;
+                }
+            }
+            // PIN every part across the add: the floating pool budget may
+            // evict a part between this gate and assembly (same tick), which
+            // cold-loaded a whole composite (~1s stutter).
+            for (const std::string& ap : actorPaths)
+                if (osg::ref_ptr<const osg::Referenced> h = mPreloader->vitaHoldWarm(ap))
+                    actorPins.push_back(std::move(h));
+            const auto actorAdd0 = Clock::now();
             try
             {
                 addObject(best, mWorld, mPagedRefs, *mPhysics, mRendering);
@@ -4035,6 +4182,12 @@ namespace MWWorld
             catch (const std::exception& e)
             {
                 Log(Debug::Error) << "actor hydrate fail '" << best.getCellRef().getRefId() << "': " << e.what();
+            }
+            {
+                const uint32_t addUs = vitaUsSince(actorAdd0);
+                sPaceWorstUs = std::max(sPaceWorstUs, addUs);
+                costMs += (addUs / 1000.f - costMs) / kActorCostLearn;
+                sActorSatisfied = Clock::now();
             }
             if (best.getRefData().getBaseNode() == nullptr)
                 mVitaBareAfterAdd.insert(best.mRef);
@@ -5831,6 +5984,45 @@ namespace MWWorld
                     char wbuf[64];
                     snprintf(wbuf, sizeof(wbuf), "[WeatherWarm] pinned %d assets", (int)mVitaWeatherPins.size());
                     Vita::breadcrumb(wbuf);
+                }
+                // Every NPC of a body type reaches for the same skeleton,
+                // its kf and the shared xbase_anim kf. Pool relief kept
+                // re-cooling them ([ActorCold] first=xbase_anim.nif, 60-90
+                // parts cold), stalling every waiting actor at once. Pin
+                // the fixed set for the session: they are resident whenever
+                // any NPC is anyway.
+                {
+                    std::vector<std::string> actorCore;
+                    const auto pushPath = [&](const VFS::Path::Normalized& p) {
+                        if (!p.empty() && svfs->exists(p))
+                            actorCore.push_back(p.value());
+                    };
+                    // Physics / getModel gate: NPCs report the base skeleton.
+                    pushPath(Settings::models().mBaseanim.get());
+                    pushPath(Settings::models().mBaseanimkna.get());
+                    for (const bool female : { false, true })
+                        for (const bool beast : { false, true })
+                        {
+                            const VFS::Path::Normalized skel = Misc::ResourceHelpers::correctActorModelPath(
+                                VFS::Path::toNormalized(MWRender::getActorSkeleton(false, female, beast, false)),
+                                svfs);
+                            pushPath(skel);
+                            VFS::Path::Normalized skf(skel);
+                            skf.changeExtension(kfExt);
+                            pushPath(skf);
+                        }
+                    pushPath(Settings::models().mXbaseanimkf.get());
+                    pushPath(Settings::models().mXargonianswimknakf.get());
+                    std::sort(actorCore.begin(), actorCore.end());
+                    actorCore.erase(std::unique(actorCore.begin(), actorCore.end()), actorCore.end());
+                    const auto pin0 = std::chrono::steady_clock::now();
+                    const int pinned = mPreloader->vitaPinPermanent(actorCore);
+                    char pbuf[96];
+                    snprintf(pbuf, sizeof(pbuf), "[ActorCore] pinned %d/%d %dms", pinned, (int)actorCore.size(),
+                        (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - pin0)
+                            .count());
+                    Vita::breadcrumb(pbuf);
                 }
             }
             // Post-screen grace: small worker batches while first visible
