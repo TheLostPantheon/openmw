@@ -360,6 +360,23 @@ if ((BUILD_COMPONENTS_TESTS OR BUILD_OPENCS_TESTS OR BUILD_OPENMW_TESTS) AND OPE
     find_package(GMock 1.10 REQUIRED)
 endif()
 
+if(VITA)
+    # vitaGL's header must come from the same tree as the library we link
+    # (VITAGL_DIR, built by scripts/vita-deps/build-vitagl.sh, which copies
+    # vitaGL.h to VITAGL_DIR/include). The SDK's stock vitaGL.h silently
+    # shadowed it: a different vitaGL version than the one linked. Set before
+    # extern/ so OSG compiles against it too.
+    if(NOT VITAGL_DIR)
+        set(VITAGL_DIR "$ENV{VITAGL_DIR}")
+    endif()
+    if(VITAGL_DIR AND EXISTS "${VITAGL_DIR}/include/vitaGL.h")
+        include_directories(BEFORE "${VITAGL_DIR}/include")
+    else()
+        message(WARNING "vitaGL headers not found in ${VITAGL_DIR}/include: falling back to the SDK's vitaGL.h, "
+            "which may not match the linked library. Rebuild with scripts/vita-deps/build-vitagl.sh.")
+    endif()
+endif()
+
 add_subdirectory(extern)
 
 # Sound setup
