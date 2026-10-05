@@ -98,7 +98,11 @@ namespace Vita
     {
         tIsSimThread = true;
         glGuardNameThread("sim");
-        breadcrumb("[SimWorker] alive");
+        {
+            char buf[48];
+            std::snprintf(buf, sizeof(buf), "[SimWorker] alive tid=0x%x", (unsigned)sceKernelGetThreadId());
+            breadcrumb(buf);
+        }
 
         while (!mJoinRequest.load(std::memory_order_acquire))
         {

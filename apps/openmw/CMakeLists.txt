@@ -10,6 +10,7 @@ if(VITA)
         vita/VitaMemAudit.cpp
         vita/VitaSimWorker.cpp
         vita/VitaGLWorker.cpp
+        vita/VitaCrashReport.cpp
     )
 endif()
 
@@ -280,6 +281,9 @@ endif (ANDROID)
 if (VITA)
     # Attr-less pthreads get 256KB stacks (default 32KB; Bullet EPA needs ~30KB).
     target_link_options(openmw PRIVATE "-Wl,--wrap=pthread_create")
+    # Crash reporter (vita/VitaCrashReport.cpp): weak stub, so the app still
+    # loads on consoles without kubridge (the reporter just stays unarmed).
+    target_link_libraries(openmw-lib kubridge_stub_weak)
 
     # GL guard (vita/VitaGLGuard.h): wraps every vitaGL entry point listed in
     # vita/VitaGLGuardList.h with an owner-thread check that logs off-thread

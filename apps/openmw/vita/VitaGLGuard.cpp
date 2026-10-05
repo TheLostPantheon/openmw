@@ -168,6 +168,15 @@ namespace Vita
         vitaBreadcrumb(buf);
     }
 
+    const char* glGuardThreadName(int tid)
+    {
+        const int n = std::min(sNamedCount.load(std::memory_order_acquire), kMaxNamed);
+        for (int i = 0; i < n; ++i)
+            if (sNamed[i].mTid.load(std::memory_order_relaxed) == tid)
+                return sNamed[i].mName;
+        return nullptr;
+    }
+
     unsigned glGuardOffThreadCalls()
     {
         return sOffThreadCalls.load(std::memory_order_relaxed);

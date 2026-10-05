@@ -21,6 +21,11 @@ extern volatile int vita_sim_busy;
 extern volatile int vita_draw_inflight;
 extern volatile unsigned long long vita_gl_job_start_us;
 extern const char* volatile vita_gl_phase;
+// Main thread's current phase (see vitaMainPhase); read by crash/deadman reports.
+extern const char* volatile vita_main_phase;
+// Flush the log ring if its locks can be taken within a bounded spin (crash
+// handlers: never wait on a lock the faulting thread may hold). 1 = flushed.
+int vitaLogFlushTry(void);
 }
 
 namespace Vita

@@ -1,8 +1,16 @@
 #ifdef __vita__
 
 #include "VitaInit.h"
+#include "VitaCrashReport.h"
 #include "VitaGLGuard.h"
 #include "VitaGLWorker.h"
+// Written by scripts/vita/build-id.sh before each build (not in git).
+#if __has_include("VitaBuildId.h")
+#include "VitaBuildId.h"
+#endif
+#ifndef VITA_BUILD_ID
+#define VITA_BUILD_ID "unknown"
+#endif
 
 #include <cxxabi.h>
 #include <pthread.h>
@@ -256,6 +264,40 @@ namespace
             ++s_logDropped;
         s_logLock.clear(std::memory_order_release);
     }
+}
+
+extern "C" int vitaLogFlushTry(void)
+{
+    // Bounded spins on both locks; the crashing thread may hold one.
+    for (int i = 0; s_logIoLock.test_and_set(std::memory_order_acquire); ++i)
+        if (i > 200000)
+            return 0;
+    bool haveData = false;
+    for (int i = 0; s_logLock.test_and_set(std::memory_order_acquire); ++i)
+        if (i > 200000)
+        {
+            s_logIoLock.clear(std::memory_order_release);
+            return 0;
+        }
+    const size_t len = s_logHead;
+    if (len > 0)
+    {
+        memcpy(s_logFlushBuf, s_logRing, len);
+        haveData = true;
+    }
+    s_logHead = 0;
+    s_logLock.clear(std::memory_order_release);
+    if (haveData)
+    {
+        SceUID fd = sceIoOpen("ux0:data/openmw/boot.log", SCE_O_WRONLY | SCE_O_APPEND | SCE_O_CREAT, 0777);
+        if (fd >= 0)
+        {
+            sceIoWrite(fd, s_logFlushBuf, len);
+            sceIoClose(fd);
+        }
+    }
+    s_logIoLock.clear(std::memory_order_release);
+    return 1;
 }
 
 extern "C" void vitaLogFlushNow(void)
@@ -1354,6 +1396,7 @@ namespace Vita
         sceIoRename("ux0:data/openmw/debug.log", "ux0:data/openmw/debug.log.prev");
 
         breadcrumb("BOOT: Vita::initialize() start");
+        installCrashReporter();
 
         // Latch SELECT early so holding it from launch is never missed.
         pollSelectHeld();
@@ -1488,6 +1531,10 @@ namespace Vita
         {
             char bstamp[96];
             snprintf(bstamp, sizeof(bstamp), "BOOT: build %s %s", __DATE__, __TIME__);
+            breadcrumb(bstamp);
+            // Matches the ELF archived by scripts/vita/archive-build.sh;
+            // scripts/vita/vita_crash.py finds symbols by this line.
+            snprintf(bstamp, sizeof(bstamp), "[Build] id=%s", VITA_BUILD_ID);
             breadcrumb(bstamp);
         }
         breadcrumb("BOOT: vitaGL initialized");

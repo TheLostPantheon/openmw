@@ -48,7 +48,8 @@ fi
 # Recompile the fingerprint TU so __DATE__/__TIME__ match this build.
 touch ../apps/openmw/vita/VitaInit.cpp 2>/dev/null || touch "${SCRIPT_DIR}/../../apps/openmw/vita/VitaInit.cpp" 2>/dev/null || true
 
-echo "=== Building eboot.bin (-j$(nproc)) ==="
+BUILD_ID="$(bash "${SCRIPT_DIR}/build-id.sh")"
+echo "=== Building eboot.bin (-j$(nproc)), id ${BUILD_ID} ==="
 make -j"$(nproc)" eboot.bin-self
 
 if [ "${WANT_VPK}" -eq 1 ]; then
@@ -56,8 +57,10 @@ if [ "${WANT_VPK}" -eq 1 ]; then
     make -j"$(nproc)" openmw.vpk-vpk
 fi
 
+bash "${SCRIPT_DIR}/archive-build.sh" "${BUILD_ID}"
+
 echo ""
-echo "=== Build Complete ==="
+echo "=== Build Complete (${BUILD_ID}) ==="
 echo "eboot.bin: ${BUILD_DIR}/apps/openmw/eboot.bin"
 if [ "${WANT_VPK}" -eq 1 ]; then
     echo "VPK:       ${BUILD_DIR}/apps/openmw/openmw.vpk"

@@ -4305,3 +4305,6 @@ openmw*.velf
 /mods/Project Atlas/Project Atlas-45399-0-7-5-1747751438/fomod/ModuleConfig.xml
 /mods/Project Atlas/Project Atlas-45399-0-7-5-1747751438/README.md
 /mods/
+
+# Generated per build by scripts/vita/build-id.sh
+/apps/openmw/vita/VitaBuildId.h
