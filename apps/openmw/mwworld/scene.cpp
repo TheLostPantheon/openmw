@@ -11,6 +11,7 @@
 #ifdef __vita__
 #include <malloc.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/io/stat.h>
 #include <osg/Billboard>
 #include <osg/Geometry>
 #include <osg/LOD>
@@ -251,9 +252,55 @@ namespace
         HydSegCount
     };
     uint64_t sVitaHydWinUs[HydSegCount] = {};
+    // The most recent hydrate tick's segments, for the [SceneSpike] line.
+    uint32_t sVitaHydLastUs[HydSegCount] = {};
+    char sVitaHydLastWorst[64] = {};
     // Bumped on unloadCell: invalidates the far-band candidate cache
     // (it holds Ptrs; a Ptr into an unloaded cell is a dangling ref).
     unsigned sVitaFarCandGen = 0;
+    // Bumped whenever an object gets a render node: re-arms the contact
+    // ring, which only acts on rendered objects that lack a collider.
+    unsigned sVitaRenderGen = 0;
+
+    // Scan windows (ms) for the contact ring and radial scan. Experiment
+    // toggle ux0:data/openmw/scanms.txt holding "<contact> <radial>"
+    // (default 3 2): sizes what the scans cost the frame in the city.
+    void vitaScanWindowsMs(int& contactMs, int& radialMs)
+    {
+        static int sContact = 3, sRadial = 2;
+        static const bool sRead = [] {
+            if (FILE* f = fopen("ux0:data/openmw/scanms.txt", "r"))
+            {
+                int c = 0, r = 0;
+                if (fscanf(f, "%d %d", &c, &r) == 2 && c >= 0 && r >= 0)
+                {
+                    sContact = c;
+                    sRadial = r;
+                    char b[80];
+                    snprintf(b, sizeof(b), "[Hydrate] scan windows contact=%dms radial=%dms (scanms.txt)", c, r);
+                    Vita::breadcrumb(b);
+                }
+                fclose(f);
+            }
+            return true;
+        }();
+        (void)sRead;
+        contactMs = sContact;
+        radialMs = sRadial;
+    }
+
+    // Idle gates on the contact ring and radial scan (vitaBubbleTick):
+    // ux0:data/openmw/noscanidle.txt turns them off for A/B.
+    bool vitaScanIdleEnabled()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            const bool on = sceIoGetstat("ux0:data/openmw/noscanidle.txt", &st) < 0;
+            Vita::breadcrumb(on ? "[Hydrate] scan idle gates on" : "[Hydrate] scan idle gates off (noscanidle.txt)");
+            return on;
+        }();
+        return sOn;
+    }
 
     inline uint32_t vitaUsSince(const std::chrono::steady_clock::time_point& t0)
     {
@@ -297,6 +344,7 @@ namespace
         else
             ptr.getRefData().setBaseNode(pagedNode);
 #ifdef __vita__
+        ++sVitaRenderGen;
         {
             const uint32_t rendUs = vitaUsSince(add0);
             sVitaAddRendUs += rendUs;
@@ -739,7 +787,42 @@ namespace MWWorld
                     sSum[i] += std::chrono::duration_cast<std::chrono::microseconds>(mMark[i] - prev).count();
                     prev = mMark[i];
                 }
-                sSum[kSteps - 1] += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - prev).count();
+                const Clock::time_point end = Clock::now();
+                sSum[kSteps - 1] += std::chrono::duration_cast<std::chrono::microseconds>(end - prev).count();
+                {
+                    // One slow Scene::update names its step, hydrate segment
+                    // and slowest add: the averages hide what makes hitches.
+                    const auto ms = [](Clock::duration d) {
+                        return (unsigned)std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
+                    };
+                    const unsigned totalMs = ms(end - mT0);
+                    if (totalMs >= 60)
+                    {
+                        unsigned stepMs[kSteps] = {};
+                        Clock::time_point p = mT0;
+                        for (int i = 0; i < kSteps - 1; ++i)
+                        {
+                            if (!mHas[i])
+                                continue;
+                            stepMs[i] = ms(mMark[i] - p);
+                            p = mMark[i];
+                        }
+                        stepMs[kSteps - 1] = ms(end - p);
+                        const uint32_t* h = sVitaHydLastUs;
+                        char b[256];
+                        snprintf(b, sizeof(b),
+                            "[SceneSpike] %ums grid=%u cache=%u preload=%u pump=%u prep=%u hydrate=%u retire=%u "
+                            "promo=%u rest=%u | hyd guard=%u ct=%u rad=%u A=%u B=%u worst=%s",
+                            totalMs, stepMs[0], stepMs[1], stepMs[2], stepMs[3], stepMs[4], stepMs[5], stepMs[6],
+                            stepMs[7], stepMs[8], h[HydGuard] / 1000, h[HydContact] / 1000, h[HydRadial] / 1000,
+                            h[HydLaneA] / 1000, h[HydLaneB] / 1000, sVitaHydLastWorst);
+                        Vita::breadcrumb(b);
+                    }
+                    // Per-update snapshot: an update without a hydrate tick
+                    // must not report the previous tick's segments.
+                    std::fill(std::begin(sVitaHydLastUs), std::end(sVitaHydLastUs), 0u);
+                    sVitaHydLastWorst[0] = 0;
+                }
                 if (++sCount < 150)
                     return;
                 char b[256];
@@ -3025,7 +3108,12 @@ namespace MWWorld
                 const uint32_t segs[HydSegCount] = { sSegGuardUs, sSegContactUs, sSegRadialUs, sSegLaneAUs, sSegDomUs,
                     sSegActorUs, sVitaAddRendUs, sVitaAddMechUs, sVitaAddPhysUs, sVitaAddLuaUs, sVitaAddNavUs };
                 for (int i = 0; i < HydSegCount; ++i)
+                {
                     sVitaHydWinUs[i] += segs[i];
+                    sVitaHydLastUs[i] = segs[i];
+                }
+                snprintf(sVitaHydLastWorst, sizeof(sVitaHydLastWorst), "%s:%ums", sVitaAddWorstTag,
+                    sVitaAddWorstUs / 1000);
                 if (ms > 400)
                 {
                     char buf[208];
@@ -3469,9 +3557,37 @@ namespace MWWorld
             // everything visible (phys was tracking objs 1:1).
             const float rWarm = std::clamp(1500.f + vitaPlayerSpeed * 1.8f, 1500.f, 6000.f);
             const float rContact = 1800.f;
-            const auto contactDeadline = Clock::now() + std::chrono::milliseconds(3);
-            for (std::size_t ci = 0; ci < n && Clock::now() < contactDeadline; ++ci)
+            // Idle gate: a full pass that added nothing and requested nothing
+            // stays valid until the player moves 100 units, a shape arrives,
+            // something new gets a render node, or 1 s passes. Rechecking
+            // every object in reach each frame cost ~3 ms of main-thread time
+            // while finding nothing ([HydSplit] contact, 2026-10-16).
+            static bool sContactIdle = false;
+            static osg::Vec3f sContactIdlePos;
+            static unsigned sContactIdleEpoch = 0, sContactIdleRenderGen = 0;
+            static Clock::time_point sContactIdleAt{};
+            const unsigned contactEpoch = mPreloader->vitaDemandReadyEpoch();
+            if (sContactIdle)
             {
+                const float cmx = pp.x() - sContactIdlePos.x();
+                const float cmy = pp.y() - sContactIdlePos.y();
+                sContactIdle = cmx * cmx + cmy * cmy < 100.f * 100.f && contactEpoch == sContactIdleEpoch
+                    && sVitaRenderGen == sContactIdleRenderGen
+                    && tick0 - sContactIdleAt < std::chrono::milliseconds(1000);
+            }
+            const unsigned contactAdds0 = sVitaContactAdds;
+            int contactPending = 0;
+            bool contactComplete = true;
+            int vitaContactMs = 3, vitaRadialMs = 2;
+            vitaScanWindowsMs(vitaContactMs, vitaRadialMs);
+            const auto contactDeadline = Clock::now() + std::chrono::milliseconds(vitaContactMs);
+            for (std::size_t ci = 0; !sContactIdle && ci < n; ++ci)
+            {
+                if (Clock::now() >= contactDeadline)
+                {
+                    contactComplete = false;
+                    break;
+                }
                 CellStore& cell = *cells[(ci + sStartRot) % n];
                 if (!cell.getCell()->isExterior())
                     continue;
@@ -3479,7 +3595,10 @@ namespace MWWorld
                     continue;
                 cell.forEach([&](const MWWorld::Ptr& ptr) {
                     if (Clock::now() >= contactDeadline)
+                    {
+                        contactComplete = false;
                         return false;
+                    }
                     if (!isLiteType(ptr.getType()) || isPagedRef(ptr))
                         return true;
                     if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
@@ -3497,7 +3616,10 @@ namespace MWWorld
                     const VFS::Path::Normalized pm = getModel(ptr);
                     const bool shapeReady = pm.empty() || mPreloader->vitaShapeCached(std::string(pm.value()));
                     if (!shapeReady && !warmPath(std::string(pm.value()), d2))
+                    {
+                        ++contactPending;
                         return true; // requested; body waits for the ring
+                    }
                     if (d2 > rContact * rContact)
                         return true; // warmed only — body comes with proximity
                     try
@@ -3517,6 +3639,16 @@ namespace MWWorld
                     }
                     return true;
                 });
+            }
+            // Arm the idle gate only after a complete pass that did nothing.
+            if (!sContactIdle && contactComplete && contactPending == 0 && sVitaContactAdds == contactAdds0
+                && vitaScanIdleEnabled())
+            {
+                sContactIdle = true;
+                sContactIdlePos = pp;
+                sContactIdleEpoch = contactEpoch;
+                sContactIdleRenderGen = sVitaRenderGen;
+                sContactIdleAt = tick0;
             }
         }
 
@@ -3560,6 +3692,13 @@ namespace MWWorld
             static std::size_t sRadScanRot = 0;
             static std::size_t sRadScanN = 0;
             static bool sRadScanInProgress = false;
+            // The last COMPLETED scan listed nothing: the reach is fully
+            // hydrated. An empty list then means "done", not "stale": it
+            // used to restart the scan every tick, 2 ms of main-thread time
+            // per frame finding nothing ([RadQ] scan=prog cands=0, 33 of 39
+            // samples on the 2026-10-16 route). Done waits for movement, a
+            // delivery, a cell-set change or 2 s.
+            static bool sRadScanFoundNothing = false;
             const float rmx = pp.x() - sRadScanPos.x();
             const float rmy = pp.y() - sRadScanPos.y();
             const unsigned radEpoch = mPreloader->vitaDemandReadyEpoch();
@@ -3580,8 +3719,9 @@ namespace MWWorld
             // the next staleness rescan corrects coverage.
             const bool radHardReset = sRadScanGen != sVitaFarCandGen;
             const bool radStale = rmx * rmx + rmy * rmy > 200.f * 200.f
-                || tick0 - sRadScanAt > std::chrono::milliseconds(750) || radEpoch != sRadScanEpoch
-                || sRadCands.empty();
+                || tick0 - sRadScanAt > std::chrono::milliseconds(sRadScanFoundNothing ? 2000 : 750)
+                || radEpoch != sRadScanEpoch || (sRadCands.empty() && !sRadScanFoundNothing)
+                || (sRadScanFoundNothing && n != sRadScanN);
             if (radHardReset || (radStale && !sRadScanInProgress))
             {
                 sRadScanPos = pp;
@@ -3602,7 +3742,9 @@ namespace MWWorld
             // expired on arrival — the scan never ran even once (RadQ
             // telemetry: scan=prog cands=0 forever; the whole queue was a
             // silent no-op while other lanes masked it).
-            const auto scanDeadline = Clock::now() + std::chrono::milliseconds(2);
+            int vitaContactMs = 3, vitaRadialMs = 2;
+            vitaScanWindowsMs(vitaContactMs, vitaRadialMs);
+            const auto scanDeadline = Clock::now() + std::chrono::milliseconds(vitaRadialMs);
             for (; sRadScanInProgress && sRadScanCursor < n && Clock::now() < scanDeadline;)
             {
                 CellStore& cell = *cells[(sRadScanCursor + sRadScanRot) % n];
@@ -3716,7 +3858,10 @@ namespace MWWorld
                 ++sRadScanCursor;
             }
             if (sRadScanInProgress && sRadScanCursor >= n)
+            {
                 sRadScanInProgress = false;
+                sRadScanFoundNothing = sRadCands.empty() && vitaScanIdleEnabled();
+            }
             std::sort(sRadCands.begin(), sRadCands.end(),
                 [](const RadialCand& a, const RadialCand& b) { return a.key < b.key; });
             // Drop entries another lane made live since the last refresh.

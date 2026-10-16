@@ -495,6 +495,13 @@ namespace MWBase
 
         virtual float getPhysicsFrameRateDt() const = 0;
 
+#ifdef __vita__
+        /// Wait for an in-flight async physics step. Main thread, sim job
+        /// joined: lets a caller move an actor's collision object without
+        /// racing the physics worker (benchmark replay, VitaBench.cpp).
+        virtual void vitaWaitPhysics() {}
+#endif
+
         virtual bool findInteriorPositionInWorldSpace(const MWWorld::CellStore* cell, osg::Vec3f& result) = 0;
 
         /// Teleports \a ptr to the closest reference of \a id (e.g. DivineMarker, PrisonMarker, TempleMarker)

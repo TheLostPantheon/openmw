@@ -32,8 +32,29 @@
 
 #ifdef __vita__
 #include <psp2/kernel/processmgr.h>
-// [MainAvg] luagc: the explicit per-frame GC step (apps/openmw/vita/VitaMemAudit.cpp).
-extern "C" uint32_t vita_lua_gc_us;
+// [MainAvg] luagc: the explicit per-frame GC step, luamem: Lua heap in KB
+// (apps/openmw/vita/VitaMemAudit.cpp).
+extern "C" uint32_t vita_lua_gc_us, vita_lua_kb;
+
+namespace
+{
+    // ux0:data/openmw/luagc.txt holding a number overrides
+    // "gc steps per frame" for A/B (benchmark --set luagc.txt=N).
+    int vitaGcStepsOverride()
+    {
+        static const int sSteps = [] {
+            int n = -1;
+            if (FILE* f = fopen("ux0:data/openmw/luagc.txt", "r"))
+            {
+                if (fscanf(f, "%d", &n) != 1)
+                    n = -1;
+                fclose(f);
+            }
+            return n;
+        }();
+        return sSteps;
+    }
+}
 #endif
 #include "../mwworld/esmstore.hpp"
 #include "../mwworld/player.hpp"
@@ -186,7 +207,13 @@ namespace MWLua
 
     void LuaManager::update()
     {
+#ifdef __vita__
+        const int vitaSteps = vitaGcStepsOverride();
+        vita_lua_kb = (uint32_t)lua_gc(mLua.unsafeState(), LUA_GCCOUNT, 0);
+        if (const int steps = vitaSteps >= 0 ? vitaSteps : Settings::lua().mGcStepsPerFrame; steps > 0)
+#else
         if (const int steps = Settings::lua().mGcStepsPerFrame; steps > 0)
+#endif
         {
 #ifdef __vita__
             const uint64_t gcT0 = sceKernelGetProcessTimeWide();

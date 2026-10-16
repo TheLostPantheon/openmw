@@ -803,6 +803,13 @@ namespace MWPhysics
                 mTaskScheduler->updateSingleAabb(found->second);
     }
 
+#ifdef __vita__
+    void PhysicsSystem::vitaWaitForWorkers()
+    {
+        mTaskScheduler->waitForWorkers();
+    }
+#endif
+
     void PhysicsSystem::debugDraw()
     {
         if (mDebugDrawEnabled)

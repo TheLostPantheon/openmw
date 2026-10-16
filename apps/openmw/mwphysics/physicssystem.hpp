@@ -207,6 +207,10 @@ namespace MWPhysics
         /// Apply new positions to actors
         void moveActors();
         void debugDraw();
+#ifdef __vita__
+        /// Block until the async physics step in flight (if any) is done.
+        void vitaWaitForWorkers();
+#endif
 
         std::vector<MWWorld::Ptr> getCollisions(const MWWorld::ConstPtr& ptr, int collisionGroup,
             int collisionMask) const; ///< get handles this object collides with

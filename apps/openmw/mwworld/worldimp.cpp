@@ -3752,6 +3752,13 @@ namespace MWWorld
         return mPhysics->mPhysicsDt;
     }
 
+#ifdef __vita__
+    void World::vitaWaitPhysics()
+    {
+        mPhysics->vitaWaitForWorkers();
+    }
+#endif
+
     bool World::findInteriorPositionInWorldSpace(const MWWorld::CellStore* cell, osg::Vec3f& result)
     {
         if (cell->isExterior())

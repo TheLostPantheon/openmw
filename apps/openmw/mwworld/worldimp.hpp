@@ -601,6 +601,9 @@ namespace MWWorld
         float getSunPercentage() const override;
 
         float getPhysicsFrameRateDt() const override;
+#ifdef __vita__
+        void vitaWaitPhysics() override;
+#endif
 
         bool findInteriorPositionInWorldSpace(const MWWorld::CellStore* cell, osg::Vec3f& result) override;
 

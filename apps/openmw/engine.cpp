@@ -24,6 +24,7 @@
 #include <components/debug/gldebug.hpp>
 
 #ifdef __vita__
+#include "vita/VitaBench.h"
 #include "vita/VitaCullTimer.h"
 #include "vita/VitaInit.h"
 #include "vita/VitaMemAudit.h"
@@ -386,6 +387,9 @@ void OMW::Engine::runSimPhases(osg::Timer_t frameStart, unsigned frameNumber, fl
 {
     const osg::Timer* const timer = osg::Timer::instance();
     osg::Stats* const stats = mViewer->getViewerStats();
+#ifdef __vita__
+    Vita::benchApplyMove(); // no-op unless replaying a benchmark route
+#endif
 
         {
             ScopedProfile<UserStatsType::Script> profile(frameStart, frameNumber, *timer, *stats);
@@ -618,6 +622,8 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         // Finish overlapped sim (and cull, when it runs on GL) before
         // touching game state.
         vitaJoinFrame();
+        // Benchmark record/replay (VitaBench.h): no-op unless toggled.
+        Vita::benchTick(frametime);
         phase_fin_us = (uint32_t)(sceKernelGetProcessTimeWide() - vitaFrameT0);
         vitaMainPhase("input");
 #endif
@@ -1857,6 +1863,11 @@ void OMW::Engine::go()
 
     // Start the game
     VITA_CRUMB("go() starting game");
+#ifdef __vita__
+    // Benchmark replay (bench.txt): straight into the newest save.
+    if (mSaveGameFile.empty())
+        mSaveGameFile = Vita::benchSaveToLoad(mCfgMgr.getUserDataPath() / "saves");
+#endif
     if (!mSaveGameFile.empty())
     {
         mStateManager->loadGame(mSaveGameFile);

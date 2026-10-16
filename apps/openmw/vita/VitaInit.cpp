@@ -1,6 +1,7 @@
 #ifdef __vita__
 
 #include "VitaInit.h"
+#include "VitaLogServer.h"
 #include "VitaCrashReport.h"
 #include "VitaGLGuard.h"
 #include "VitaGLWorker.h"
@@ -1393,6 +1394,7 @@ namespace Vita
         breadcrumb("BOOT: Vita::initialize() start");
         installCrashReporter();
         pinCurrentThread(0, "main");
+        startLogServerIfEnabled();
 
         // Latch SELECT early so holding it from launch is never missed.
         pollSelectHeld();

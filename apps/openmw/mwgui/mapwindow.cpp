@@ -2,6 +2,10 @@
 
 #include <algorithm>
 
+#ifdef __vita__
+#include <psp2/io/stat.h>
+#endif
+
 #include <osg/Texture2D>
 
 #include <MyGUI_Button.h>
@@ -333,6 +337,19 @@ namespace MWGui
         MyGUI::IntPoint pos = mCompass->getPosition() + MyGUI::IntPoint{ 16, 16 };
         MyGUI::IntSize viewsize = mLocalMap->getSize();
         MyGUI::IntPoint viewOffset((viewsize.width / 2) - pos.left, (viewsize.height / 2) - pos.top);
+#ifdef __vita__
+        // ScrollView::setViewOffset repositions every child unconditionally:
+        // each frame the player moved, every map tile and door marker was
+        // re-laid out and the whole GUI rebuilt (MarkerWidget/ImageBox top
+        // the [GuiDirtyW] table), though the offset only changes per pixel.
+        // ux0:data/openmw/noguiskip.txt turns the skip off for A/B.
+        static const bool sSkipSame = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/noguiskip.txt", &st) < 0;
+        }();
+        if (sSkipSame && viewOffset == mLocalMap->getViewOffset())
+            return;
+#endif
         mLocalMap->setViewOffset(viewOffset);
     }
 

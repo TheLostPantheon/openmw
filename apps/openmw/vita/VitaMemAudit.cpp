@@ -50,6 +50,9 @@ extern "C"
     uint32_t vita_cullfence_us = 0, vita_gl_cull_us = 0, vita_cullongl_frames = 0;
     // Lua's explicit per-frame GC step (luamanagerimp.cpp), part of [PhaseAvg] lua.
     uint32_t vita_lua_gc_us = 0;
+    uint32_t vita_lua_kb = 0; // Lua heap size (LUA_GCCOUNT), last frame
+    // PlayGroup calls on objects with no animation controller (mwmechanics/objects.cpp).
+    unsigned int vita_playgroup_missing = 0;
     extern unsigned int osg_vita_cow_mutations, osg_vita_cow_foreign;
     uint32_t phase_snd_us = 0, phase_lsync_us = 0, phase_state_us = 0;
     uint32_t phase_world_us = 0, phase_wm_us = 0;
@@ -557,9 +560,10 @@ namespace Vita
             auditLog(buf);
             s_sumEvt = s_sumUpd = s_sumFoc = s_sumLua = s_sumPre = s_sumPace = s_sumRnd = 0;
             snprintf(buf, sizeof(buf),
-                "[MainAvg] inp=%.1f snd=%.1f lsync=%.1f state=%.1f world=%.1f wm=%.1f unref=%.1f luagc=%.2f ms/frame",
+                "[MainAvg] inp=%.1f snd=%.1f lsync=%.1f state=%.1f world=%.1f wm=%.1f unref=%.1f luagc=%.2f ms/frame "
+                "luamem=%uKB",
                 s_sumInp / n, s_sumSnd / n, s_sumLsync / n, s_sumState / n, s_sumWorld / n, s_sumWm / n,
-                s_sumUnref / n, vita_lua_gc_us / n);
+                s_sumUnref / n, vita_lua_gc_us / n, vita_lua_kb);
             vita_lua_gc_us = 0;
             auditLog(buf);
             s_sumInp = s_sumSnd = s_sumLsync = s_sumState = s_sumWorld = s_sumWm = s_sumUnref = 0;
@@ -743,9 +747,10 @@ namespace Vita
             char hb[224];
             if (vita_script_hist_report(hb, sizeof(hb)) > 0)
             {
-                snprintf(buf, sizeof(buf), "[ScriptHist] %s", hb);
+                snprintf(buf, sizeof(buf), "[ScriptHist] %s pgmiss=%u", hb, vita_playgroup_missing);
                 auditLog(buf);
             }
+            vita_playgroup_missing = 0;
             if (cullprof_cb_report(hb, sizeof(hb)) > 0)
             {
                 snprintf(buf, sizeof(buf), "[CullCb] %s", hb);

@@ -13,6 +13,8 @@ if(VITA)
         vita/VitaCrashReport.cpp
         vita/VitaBuildInfo.cpp
         vita/VitaCullTimer.cpp
+        vita/VitaLogServer.cpp
+        vita/VitaBench.cpp
     )
 endif()
 
@@ -286,6 +288,8 @@ if (VITA)
     # Crash reporter (vita/VitaCrashReport.cpp): weak stub, so the app still
     # loads on consoles without kubridge (the reporter just stays unarmed).
     target_link_libraries(openmw-lib kubridge_stub_weak)
+    # Log server (vita/VitaLogServer.cpp): loads the net module on demand.
+    target_link_libraries(openmw-lib SceNet_stub)
 
     # GL guard (vita/VitaGLGuard.h): wraps every vitaGL entry point listed in
     # vita/VitaGLGuardList.h with an owner-thread check that logs off-thread

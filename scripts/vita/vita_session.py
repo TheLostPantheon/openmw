@@ -53,7 +53,7 @@ def summarize(path):
             ("main.input", "[MainAvg]", "inp"), ("main.sound", "[MainAvg]", "snd"),
             ("main.luasync", "[MainAvg]", "lsync"), ("main.state", "[MainAvg]", "state"),
             ("main.world", "[MainAvg]", "world"), ("main.gui", "[MainAvg]", "wm"),
-            ("main.unref", "[MainAvg]", "unref"), ("main.lua_gc_step", "[MainAvg]", "luagc"),
+            ("main.unref", "[MainAvg]", "unref"), ("main.lua_gc_step", "[MainAvg]", "luagc"), ("main.lua_mem_kb", "[MainAvg]", "luamem"),
             ("world.weather", "[WorldAvg]", "wthr"), ("world.player", "[WorldAvg]", "plyr"),
             ("world.scene", "[WorldAvg]", "scene"), ("world.rendering", "[WorldAvg]", "rend"),
             ("world.sound", "[WorldAvg]", "snd"),

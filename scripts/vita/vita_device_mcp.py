@@ -8,7 +8,8 @@ an eboot. Every overwrite or delete first copies the remote file into
 (a lost build once survived only as the eboot on the Vita).
 
 No dependencies beyond the standard library. Configure with env vars:
-  VITA_FTP_HOST (default 192.168.0.50), VITA_FTP_PORT (default 1337),
+  VITA_FTP_HOST (default: the last address found, else 192.168.0.48; a
+  failed connect scans the /24 for the FTP port), VITA_FTP_PORT (default 1337),
   VITA_BACKUP_DIR (default ~/Dev/vita/device-backups/auto).
 VitaShell's FTP server must be running (SELECT in VitaShell) and the Vita
 awake.
@@ -22,7 +23,19 @@ import os
 import re
 import sys
 
-HOST = os.environ.get("VITA_FTP_HOST", "192.168.0.50")
+# The Vita's DHCP address changes; the last one found is remembered here.
+HOST_CACHE = os.path.expanduser("~/.config/vita-agent/ftp_host")
+
+
+def _remembered_host():
+    try:
+        with open(HOST_CACHE) as f:
+            return f.read().strip() or "192.168.0.48"
+    except OSError:
+        return "192.168.0.48"
+
+
+HOST = os.environ.get("VITA_FTP_HOST") or _remembered_host()
 PORT = int(os.environ.get("VITA_FTP_PORT", "1337"))
 BACKUP_ROOT = os.path.expanduser(os.environ.get("VITA_BACKUP_DIR", "~/Dev/vita/device-backups/auto"))
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -35,15 +48,46 @@ class DeviceError(Exception):
     pass
 
 
+def discover_host():
+    """Scan HOST's /24 for VitaShell's FTP port; remember and return the hit."""
+    import concurrent.futures
+    import socket
+
+    prefix = HOST.rsplit(".", 1)[0]
+
+    def probe(i):
+        h = f"{prefix}.{i}"
+        try:
+            socket.create_connection((h, PORT), timeout=1.0).close()
+            return h
+        except OSError:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(64) as ex:
+        for h in ex.map(probe, range(1, 255)):
+            if h:
+                os.makedirs(os.path.dirname(HOST_CACHE), exist_ok=True)
+                with open(HOST_CACHE, "w") as f:
+                    f.write(h + "\n")
+                return h
+    return None
+
+
 def connect():
+    global HOST
     ftp = ftplib.FTP()
     try:
         ftp.connect(HOST, PORT, timeout=15)
-        ftp.login()
     except OSError as e:
-        raise DeviceError(
-            f"cannot reach VitaShell FTP at {HOST}:{PORT} ({e}). "
-            "Open VitaShell, press SELECT to start FTP, and keep the Vita awake.")
+        found = None if os.environ.get("VITA_FTP_HOST") else discover_host()
+        if not found:
+            raise DeviceError(
+                f"cannot reach VitaShell FTP at {HOST}:{PORT} ({e}). "
+                "Open VitaShell, press SELECT to start FTP, and keep the Vita awake.")
+        HOST = found
+        ftp = ftplib.FTP()
+        ftp.connect(HOST, PORT, timeout=15)
+    ftp.login()
     return ftp
 
 
