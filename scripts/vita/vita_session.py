@@ -35,6 +35,8 @@ def summarize(path):
     ts = [int(x.group(1)) for l in L for x in [re.match(r"\[(\d+)\]", l)] if x]
     s["runtime_min"] = round(ts[-1] / 60000, 1) if ts else 0
     s["deadman"] = sum("[Deadman]" in l for l in L)
+    vf = [l for l in L if "[VglFail]" in l]
+    s["vgl_failures"] = vf[-1].split("[VglFail] ", 1)[-1] if vf else "none"
     s["crash_lines"] = sum(bool(re.search(r"\[Crash\] (Data|Prefetch|Undefined)", l)) for l in L)
     g = [l for l in L if "[vglGuard] off-thread calls" in l]
     s["guard"] = g[-1].split("] ", 1)[-1] if g else "none"
@@ -51,13 +53,18 @@ def summarize(path):
             ("main.input", "[MainAvg]", "inp"), ("main.sound", "[MainAvg]", "snd"),
             ("main.luasync", "[MainAvg]", "lsync"), ("main.state", "[MainAvg]", "state"),
             ("main.world", "[MainAvg]", "world"), ("main.gui", "[MainAvg]", "wm"),
-            ("main.unref", "[MainAvg]", "unref"),
+            ("main.unref", "[MainAvg]", "unref"), ("main.lua_gc_step", "[MainAvg]", "luagc"),
             ("world.weather", "[WorldAvg]", "wthr"), ("world.player", "[WorldAvg]", "plyr"),
             ("world.scene", "[WorldAvg]", "scene"), ("world.rendering", "[WorldAvg]", "rend"),
             ("world.sound", "[WorldAvg]", "snd"),
             ("scene.preload", "[SceneAvg]", "preload"), ("scene.pump", "[SceneAvg]", "pump"),
             ("scene.prep", "[SceneAvg]", "prep"), ("scene.hydrate", "[SceneAvg]", "hydrate"),
             ("scene.retire", "[SceneAvg]", "retire"), ("scene.rest", "[SceneAvg]", "rest"),
+            ("hyd.guard_scan", "[HydSplit]", "guard"), ("hyd.contact", "[HydSplit]", "contact"),
+            ("hyd.radial", "[HydSplit]", "radial"), ("hyd.laneA", "[HydSplit]", "laneA"),
+            ("hyd.laneB_actors", "[HydSplit]", "laneB"), ("hyd.add_rend", "[HydSplit]", "rend"),
+            ("hyd.add_mech", "[HydSplit]", "mech"), ("hyd.add_phys", "[HydSplit]", "phys"),
+            ("hyd.add_lua", "[HydSplit]", "lua"), ("hyd.add_nav", "[HydSplit]", "nav"),
             # sim worker job (main joins on all of it)
             ("sim_job_total", "[SimSplit]", "job"), ("sim.update_trav", "[SimSplit]", "upd"),
             ("sim.cull", "[SimSplit]", "cull"), ("sim.script", "[SimSplit]", "scr"),
@@ -69,9 +76,12 @@ def summarize(path):
             # GL worker / GPU
             ("gl_job (draw+swap)", "[PhaseAvg]", "rnd"), ("gl_draw", "[GlJob]", "draw"),
             ("gpu_qdepth", "[Gpu]", "qd"), ("gpu_swap_block", "[Gpu]", "blk"),
+            ("vgl_rendertargets_live", "[Vgl]", "rt"),
             ("cull_frame_stat", "[Frame]", "cull"),
             # cull cost by subtree (VitaCullTimer)
-            ("cull.total", "[CullTree]", "total"), ("cull.sky_other", "[CullTree]", "sky/other"),
+            ("cull.total", "[CullTree]", "total"), ("cull.sky_other (old logs)", "[CullTree]", "sky/other"),
+            ("cull.gui", "[CullTree]", "gui"), ("cull.other", "[CullTree]", "other"),
+            ("gui_walk_ms", "[Scene]", "guiwalk"),
             ("cull.terrain_water_fx", "[CullTree]", "terrain/water/fx"), ("cull.statics", "[CullTree]", "statics"),
             ("cull.actors", "[CullTree]", "actors")]:
         v = [x for x in series(L, tag, key) if x >= 0]

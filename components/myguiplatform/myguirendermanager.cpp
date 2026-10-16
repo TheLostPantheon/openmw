@@ -24,6 +24,7 @@
 #ifdef __vita__
 #include <MyGUI_ISubWidget.h>
 #include <MyGUI_Widget.h>
+#include <psp2/kernel/processmgr.h>
 namespace Vita { bool isSimThread(); }
 #endif
 
@@ -523,6 +524,8 @@ namespace MyGUIPlatform
 #ifdef __vita__
     uint32_t g_vitaGuiWalks = 0;
     uint32_t g_vitaGuiSkips = 0;
+    // Time spent in full walks (batch rebuilds), for [Scene] guiwalk.
+    uint32_t g_vitaGuiWalkUs = 0;
     // Dirty attribution: every sub-widget dirty site reports (via the
     // MyGUI probe macro). Keyed by owning widget name/type + parent chain
     // + thread; top rows printed per audit window.
@@ -643,10 +646,14 @@ namespace MyGUIPlatform
             }
         }
         ++g_vitaGuiWalks;
+        const uint64_t walkT0 = sceKernelGetProcessTimeWide();
 #endif
         begin();
         onRenderToTarget(this, mUpdate);
         end();
+#ifdef __vita__
+        g_vitaGuiWalkUs += (uint32_t)(sceKernelGetProcessTimeWide() - walkT0);
+#endif
 
         mUpdate = false;
     }

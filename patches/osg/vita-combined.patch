@@ -1796,35 +1796,36 @@ diff -ruN '--exclude=.git' pristine-osg/src/osg/Group.cpp b/src/osg/Group.cpp
      if (index >= _children.size())
      {
          index = _children.size();      // set correct index value to be passed to the "childInserted" method
-@@ -97,6 +253,7 @@
+@@ -96,6 +252,7 @@
+     else
      {
          _children.insert(_children.begin()+index, child);
-     }
 +    }
+     }
  
      // register as parent of child.
-     child->addParent(this);
-@@ -195,7 +352,19 @@
+@@ -195,6 +352,20 @@
  
          childRemoved(pos,endOfRemoveRange-pos);
  
 +#ifdef __vita__
-+        // Hold the removed children past the lock (dropping a last reference
-+        // runs destructors) and park them while a cull may still point at them.
-+        NodeList vitaRemoved(_children.begin()+pos, _children.begin()+endOfRemoveRange);
++        if (osg_vita_cow_cull)
 +        {
++            // Hold the removed children past the lock (dropping a last
++            // reference runs destructors) and park them while a cull may
++            // still point at them.
++            NodeList vitaRemoved(_children.begin()+pos, _children.begin()+endOfRemoveRange);
 +            VitaWriteLock lock;
 +            _children.erase(_children.begin()+pos,_children.begin()+endOfRemoveRange);
 +            for (NodeList::iterator itr = vitaRemoved.begin(); itr != vitaRemoved.end(); ++itr)
 +                lock.park(itr->get());
 +        }
-+#else
-         _children.erase(_children.begin()+pos,_children.begin()+endOfRemoveRange);
++        else
 +#endif
+         _children.erase(_children.begin()+pos,_children.begin()+endOfRemoveRange);
  
          if (updateCallbackRemoved)
-         {
-@@ -250,7 +419,13 @@
+@@ -250,7 +421,13 @@
  
          // note ref_ptr<> automatically handles decrementing origNode's reference count,
          // and inccrementing newNode's reference count.

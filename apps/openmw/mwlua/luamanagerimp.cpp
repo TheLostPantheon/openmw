@@ -29,6 +29,12 @@
 #include "../mwrender/postprocessor.hpp"
 
 #include "../mwworld/datetimemanager.hpp"
+
+#ifdef __vita__
+#include <psp2/kernel/processmgr.h>
+// [MainAvg] luagc: the explicit per-frame GC step (apps/openmw/vita/VitaMemAudit.cpp).
+extern "C" uint32_t vita_lua_gc_us;
+#endif
 #include "../mwworld/esmstore.hpp"
 #include "../mwworld/player.hpp"
 #include "../mwworld/ptr.hpp"
@@ -181,7 +187,15 @@ namespace MWLua
     void LuaManager::update()
     {
         if (const int steps = Settings::lua().mGcStepsPerFrame; steps > 0)
+        {
+#ifdef __vita__
+            const uint64_t gcT0 = sceKernelGetProcessTimeWide();
+#endif
             lua_gc(mLua.unsafeState(), LUA_GCSTEP, steps);
+#ifdef __vita__
+            vita_lua_gc_us += (uint32_t)(sceKernelGetProcessTimeWide() - gcT0);
+#endif
+        }
 
         if (mPlayer.isEmpty())
             return; // The game is not started yet.

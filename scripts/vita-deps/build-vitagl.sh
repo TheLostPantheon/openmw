@@ -21,8 +21,9 @@ VITASDK="${VITASDK:-/usr/local/vitasdk}"
 VITAGL_REPO="${VITAGL_REPO:-https://github.com/TheLostPantheon/vitaGL.git}"
 # openmw-vita: upstream 6e7fe40 (2026-07-31, the API generation the app code
 # matches) + vglSetStaticVboRam + synchronous compressed texture transfers
-# + GPU backpressure counters.
-VITAGL_COMMIT="${VITAGL_COMMIT:-5cf5515f9cc25f80baf53f1ae3e6930dd26b058a}"
+# + GPU backpressure counters + guarded default uniform reservations
+# (failed scene starts no longer crash) with failure counters.
+VITAGL_COMMIT="${VITAGL_COMMIT:-6283dcb495642dbdbf0de5cc43c1669ee71729ae}"
 
 export VITASDK
 export PATH="${VITASDK}/bin:${PATH}"

@@ -24,6 +24,7 @@
 #include <components/debug/gldebug.hpp>
 
 #ifdef __vita__
+#include "vita/VitaCullTimer.h"
 #include "vita/VitaInit.h"
 #include "vita/VitaMemAudit.h"
 #include "vita/VitaSimWorker.h"
@@ -258,25 +259,56 @@ namespace
 namespace
 {
     std::mutex sVitaScriptHistMutex;
-    std::map<ESM::RefId, uint32_t> sVitaScriptHist;
+    struct VitaScriptCost
+    {
+        uint32_t mUs = 0;
+        uint32_t mRuns = 0;
+    };
+    std::map<ESM::RefId, VitaScriptCost> sVitaScriptHist;
+
+    // Ambient tier: cosmetic scripts vetted to run every 4th frame near the
+    // player too (the far tier's phase spreading and dt scaling). Vanilla
+    // OutsideBanner rolls a random animation for every banner in every loaded
+    // cell each frame (6-7 ms/frame in Balmora). Its PlayGroup calls (mode 0)
+    // only queue what plays when the current loop ends, it has no OnActivate
+    // and reads no elapsed time, so a 4th-frame rate changes nothing visible.
+    // Only add scripts that meet the same bar: a script that reacts to
+    // activation or input must see every frame.
+    // ux0:data/openmw/noambient.txt turns the tier off for A/B.
+    bool vitaAmbientScript(const ESM::RefId& script)
+    {
+        static const bool sEnabled = [] {
+            SceIoStat st;
+            const bool on = sceIoGetstat("ux0:data/openmw/noambient.txt", &st) < 0;
+            Vita::breadcrumb(on ? "[Scripts] ambient tier on" : "[Scripts] ambient tier off (noambient.txt)");
+            return on;
+        }();
+        static const ESM::RefId sAmbient[] = { ESM::RefId::stringRefId("OutsideBanner") };
+        if (!sEnabled)
+            return false;
+        for (const ESM::RefId& id : sAmbient)
+            if (script == id)
+                return true;
+        return false;
+    }
 }
 
 extern "C" int vita_script_hist_report(char* buf, unsigned int buflen)
 {
-    // Top 6 by time this window, then reset.
+    // Top 6 by time this window as name=ms/runs, then reset.
     const std::lock_guard<std::mutex> lock(sVitaScriptHistMutex);
     int written = 0;
     for (int rank = 0; rank < 6; ++rank)
     {
         auto best = sVitaScriptHist.end();
         for (auto it = sVitaScriptHist.begin(); it != sVitaScriptHist.end(); ++it)
-            if (it->second > 0 && (best == sVitaScriptHist.end() || it->second > best->second))
+            if (it->second.mUs > 0 && (best == sVitaScriptHist.end() || it->second.mUs > best->second.mUs))
                 best = it;
         if (best == sVitaScriptHist.end())
             break;
-        int n = snprintf(buf + written, buflen - written, "%s%s=%ums", written ? " " : "",
-            best->first.toDebugString().c_str(), best->second / 1000);
-        best->second = 0;
+        int n = snprintf(buf + written, buflen - written, "%s%s=%ums/%u", written ? " " : "",
+            best->first.toDebugString().c_str(), best->second.mUs / 1000, best->second.mRuns);
+        best->second.mUs = 0;
         if (n < 0 || (unsigned)n >= buflen - written)
             break;
         written += n;
@@ -293,8 +325,9 @@ void OMW::Engine::executeLocalScripts()
     localScripts.startIteration();
     std::pair<ESM::RefId, MWWorld::Ptr> script;
 #ifdef __vita__
-    // Far-tier scheduling: scripted objects beyond kNearR tick every 4th
-    // frame with dt scaled 4x (thread-local, opcodes see correct elapsed).
+    // Far-tier scheduling: scripted objects beyond kNearR, and ambient
+    // scripts anywhere (vitaAmbientScript), tick every 4th frame with dt
+    // scaled 4x (thread-local, opcodes see correct elapsed).
     static unsigned sScriptFrame = 0;
     ++sScriptFrame;
     constexpr float kNearR = 2048.f;
@@ -309,6 +342,7 @@ void OMW::Engine::executeLocalScripts()
             const osg::Vec3f op = script.second.getRefData().getPosition().asVec3();
             farTier = (op - playerPos).length2() > kNearR * kNearR;
         }
+        farTier = farTier || vitaAmbientScript(script.first);
         if (farTier)
         {
             const unsigned phase = (unsigned)((uintptr_t)script.second.mRef >> 4);
@@ -325,7 +359,9 @@ void OMW::Engine::executeLocalScripts()
         const uint32_t sus = (uint32_t)stimer->delta_u(st0, stimer->tick());
         {
             const std::lock_guard<std::mutex> lock(sVitaScriptHistMutex);
-            sVitaScriptHist[script.first] += sus;
+            VitaScriptCost& cost = sVitaScriptHist[script.first];
+            cost.mUs += sus;
+            ++cost.mRuns;
         }
 #else
         MWScript::InterpreterContext interpreterContext(&script.second.getRefData().getLocals(), script.second);
@@ -1497,6 +1533,9 @@ void OMW::Engine::prepareEngine()
     guiRoot->setNodeMask(MWRender::Mask_GUI);
     mStereoManager->disableStereoForNode(guiRoot);
     rootNode->addChild(guiRoot);
+#ifdef __vita__
+    Vita::addCullTimer(guiRoot, Vita::CullGui);
+#endif
 
 #ifdef __vita__
     Vita::logMemoryStatus("Post-VFS");

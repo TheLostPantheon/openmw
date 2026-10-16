@@ -233,6 +233,24 @@ namespace
     uint32_t sVitaAddRendUs = 0, sVitaAddMechUs = 0, sVitaAddPhysUs = 0, sVitaAddLuaUs = 0, sVitaAddNavUs = 0;
     uint32_t sVitaAddWorstUs = 0;
     char sVitaAddWorstTag[48] = {};
+    // [HydSplit]: hydrate tick segments and add phases summed over the
+    // [SceneAvg] window (filled when each tick ends, printed with SceneAvg).
+    enum VitaHydSeg
+    {
+        HydGuard, // innermost guarantee: guard disc + ring-3 actor warm scan
+        HydContact, // contact ring (own small budget)
+        HydRadial, // radial scan (own small budget)
+        HydLaneA, // lane A statics/items, including HydDom
+        HydDom, // domain entries (part of lane A)
+        HydLaneB, // lane B actors
+        HydAddRend, // per-add phases, across all lanes
+        HydAddMech,
+        HydAddPhys,
+        HydAddLua,
+        HydAddNav,
+        HydSegCount
+    };
+    uint64_t sVitaHydWinUs[HydSegCount] = {};
     // Bumped on unloadCell: invalidates the far-band candidate cache
     // (it holds Ptrs; a Ptr into an unloaded cell is a dangling ref).
     unsigned sVitaFarCandGen = 0;
@@ -724,7 +742,7 @@ namespace MWWorld
                 sSum[kSteps - 1] += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - prev).count();
                 if (++sCount < 150)
                     return;
-                char b[200];
+                char b[256];
                 const double k = sCount * 1000.0;
                 snprintf(b, sizeof(b),
                     "[SceneAvg] grid=%.2f cache=%.2f preload=%.2f pump=%.2f prep=%.2f hydrate=%.2f retire=%.2f "
@@ -732,6 +750,19 @@ namespace MWWorld
                     sSum[0] / k, sSum[1] / k, sSum[2] / k, sSum[3] / k, sSum[4] / k, sSum[5] / k, sSum[6] / k,
                     sSum[7] / k, sSum[8] / k);
                 Vita::breadcrumb(b);
+                // Where hydrate goes: budget-exempt scans first, then the
+                // budgeted lanes; add phases split instancing (rend) from the
+                // live-state commits (mech/phys/lua/nav).
+                const uint64_t* h = sVitaHydWinUs;
+                snprintf(b, sizeof(b),
+                    "[HydSplit] guard=%.2f contact=%.2f radial=%.2f laneA=%.2f (dom=%.2f) laneB=%.2f | add rend=%.2f "
+                    "mech=%.2f phys=%.2f lua=%.2f nav=%.2f ms/frame",
+                    h[HydGuard] / k, h[HydContact] / k, h[HydRadial] / k, h[HydLaneA] / k, h[HydDom] / k,
+                    h[HydLaneB] / k, h[HydAddRend] / k, h[HydAddMech] / k, h[HydAddPhys] / k, h[HydAddLua] / k,
+                    h[HydAddNav] / k);
+                Vita::breadcrumb(b);
+                for (uint64_t& v : sVitaHydWinUs)
+                    v = 0;
                 for (uint64_t& v : sSum)
                     v = 0;
                 sCount = 0;
@@ -2963,8 +2994,8 @@ namespace MWWorld
                 sLastGrantMs = maxMs;
             }
         }
-        static uint32_t sSegShellUs, sSegLaneAUs, sSegDomUs, sSegActorUs;
-        sSegShellUs = sSegLaneAUs = sSegDomUs = sSegActorUs = 0;
+        static uint32_t sSegGuardUs, sSegContactUs, sSegRadialUs, sSegLaneAUs, sSegDomUs, sSegActorUs;
+        sSegGuardUs = sSegContactUs = sSegRadialUs = sSegLaneAUs = sSegDomUs = sSegActorUs = 0;
         sVitaAddRendUs = sVitaAddMechUs = sVitaAddPhysUs = sVitaAddLuaUs = sVitaAddNavUs = 0;
         sVitaAddWorstUs = 0;
         sVitaAddWorstTag[0] = 0;
@@ -2991,13 +3022,18 @@ namespace MWWorld
                 const int ms
                     = (int)std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - mStart).count();
                 *mSpendOut = ms;
+                const uint32_t segs[HydSegCount] = { sSegGuardUs, sSegContactUs, sSegRadialUs, sSegLaneAUs, sSegDomUs,
+                    sSegActorUs, sVitaAddRendUs, sVitaAddMechUs, sVitaAddPhysUs, sVitaAddLuaUs, sVitaAddNavUs };
+                for (int i = 0; i < HydSegCount; ++i)
+                    sVitaHydWinUs[i] += segs[i];
                 if (ms > 400)
                 {
-                    char buf[192];
+                    char buf[208];
                     snprintf(buf, sizeof(buf),
-                        "[Hydrate] tick %dms sh=%u A=%u dom=%u B=%u | rend=%u mech=%u phys=%u lua=%u nav=%u "
-                        "worst=%s:%ums",
-                        ms, sSegShellUs / 1000, sSegLaneAUs / 1000, sSegDomUs / 1000, sSegActorUs / 1000,
+                        "[Hydrate] tick %dms guard=%u ct=%u rad=%u A=%u dom=%u B=%u | rend=%u mech=%u phys=%u lua=%u "
+                        "nav=%u worst=%s:%ums",
+                        ms, sSegGuardUs / 1000, sSegContactUs / 1000, sSegRadialUs / 1000, sSegLaneAUs / 1000,
+                        sSegDomUs / 1000, sSegActorUs / 1000,
                         sVitaAddRendUs / 1000, sVitaAddMechUs / 1000, sVitaAddPhysUs / 1000, sVitaAddLuaUs / 1000,
                         sVitaAddNavUs / 1000, sVitaAddWorstTag, sVitaAddWorstUs / 1000);
                     Vita::breadcrumb(buf);
@@ -3171,6 +3207,7 @@ namespace MWWorld
         // limiting -- it stops when deliveries stop -- and the interval
         // floor keeps a busy ledger from making this per-tick.
         {
+            SegTimer segGuard(&sSegGuardUs);
             constexpr float rGuard = 1100.f;
             constexpr float rGuardReach = 1500.f; // big-static extension, to rStructIn
             constexpr int kGuardAdds = 4;
@@ -3425,7 +3462,7 @@ namespace MWWorld
         // visible streaming. Targets rendered-but-collider-less objects
         // (far-rendered earlier, approached fast). Own small budget.
         {
-            SegTimer segContact(&sSegShellUs);
+            SegTimer segContact(&sSegContactUs);
             // Two radii, one pass. The wide one only WARMS shapes so they
             // beat the ~1.5s demand latency at speed; bodies are only
             // instantiated in the contact ring, or phys ends up on
@@ -3495,7 +3532,7 @@ namespace MWWorld
         // banded shells + far band + Lane A hydrate branches, whose
         // band/tier/cell-rotation composition was the pop-in patchwork.
         {
-            SegTimer segRadial(&sSegShellUs);
+            SegTimer segRadial(&sSegRadialUs);
             struct RadialCand
             {
                 MWWorld::Ptr ptr;

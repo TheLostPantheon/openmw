@@ -16,13 +16,14 @@ namespace Vita
     /// timers were too costly (they skewed what they measured); these sit on
     /// a few dozen subtree roots per frame. Nested categories overlap:
     /// statics = cells - actors, terrain/water/effects = scene - cells,
-    /// sky/other = total - scene.
+    /// other = total - scene - gui.
     enum CullTreeCategory
     {
         CullTotal = 0, // whole scene graph (root)
         CullScene, // scene root (lit world)
         CullCells, // every cell root (all objects)
         CullActors, // actor base nodes (subset of cells)
+        CullGui, // GUI root (MyGUI rebuilds its batches during cull)
         CullTreeCount
     };
 
