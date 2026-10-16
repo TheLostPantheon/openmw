@@ -5,8 +5,11 @@
 
 #include <cstdint>
 
+#include <cstddef>
+
 namespace osg
 {
+    class Group;
     class Node;
 }
 
@@ -33,6 +36,15 @@ namespace Vita
     /// Time cull traversals of `node` under `category` (adds a nested cull
     /// callback; safe to call on nodes that already have one).
     void addCullTimer(osg::Node* node, CullTreeCategory category);
+
+    /// [Subtrees]: cull and update time per named subtree, for the direct
+    /// children of `root` and of its "Scene Root" child (sky, terrain,
+    /// water, cell objects, effects, player...). Idempotent: call it each
+    /// audit to cover nodes created later. Update timers only go on
+    /// subtrees the update traversal already visits.
+    void attachSubtreeTimers(osg::Group* root);
+    /// Top subtrees by cull+update time over `frames` frames, then reset.
+    int subtreeReport(char* buf, std::size_t len, unsigned frames);
 }
 
 #endif // __vita__
