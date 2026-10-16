@@ -25,6 +25,18 @@ namespace LuaUtil
 
 namespace ESM
 {
+#ifdef __vita__
+    /// [StoreLoad] diagnostics: while sOn (set around a cell store load),
+    /// stream reads and string-id interning accumulate their time here.
+    namespace VitaEsmTiming
+    {
+        extern bool sOn;
+        extern unsigned long long sReadUs, sIdUs;
+        extern unsigned sReads, sIds;
+        unsigned long long nowUs();
+    }
+#endif
+
     template <class T>
     struct GetArray
     {
@@ -327,6 +339,16 @@ namespace ESM
 
         void getExact(void* x, std::size_t size)
         {
+#ifdef __vita__
+            if (VitaEsmTiming::sOn)
+            {
+                const unsigned long long t0 = VitaEsmTiming::nowUs();
+                mEsm->read(static_cast<char*>(x), static_cast<std::streamsize>(size));
+                VitaEsmTiming::sReadUs += VitaEsmTiming::nowUs() - t0;
+                ++VitaEsmTiming::sReads;
+                return;
+            }
+#endif
             mEsm->read(static_cast<char*>(x), static_cast<std::streamsize>(size));
         }
 
@@ -349,7 +371,7 @@ namespace ESM
             if (bytes > std::size(buffer))
                 mEsm->seekg(getFileOffset() + bytes);
             else
-                mEsm->read(buffer, bytes);
+                getExact(buffer, bytes);
         }
 
         /// Used for error handling

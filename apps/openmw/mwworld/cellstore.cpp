@@ -41,6 +41,12 @@
 #include <components/esm3/npcstate.hpp>
 #include <components/esm3/objectstate.hpp>
 #include <components/esm3/readerscache.hpp>
+#ifdef __vita__
+#include <cstdio>
+#include <psp2/kernel/processmgr.h>
+
+#include "../vita/VitaInit.h"
+#endif
 
 #include <components/esm4/loadachr.hpp>
 #include <components/esm4/loadacti.hpp>
@@ -781,6 +787,16 @@ namespace MWWorld
         return mMergedRefs.size();
     }
 
+#ifdef __vita__
+    namespace
+    {
+        // [StoreLoad]: a store load parses every ref on the calling thread;
+        // split into ESM decode and insertion (lookups, LiveCellRef).
+        uint64_t sStoreDecodeUs = 0, sStoreInsertUs = 0;
+        unsigned sStoreRefs = 0;
+    }
+#endif
+
     void CellStore::load()
     {
         if (mState != State_Loaded)
@@ -788,7 +804,35 @@ namespace MWWorld
             if (mState == State_Preloaded)
                 mIds.clear();
 
+#ifdef __vita__
+            sStoreDecodeUs = sStoreInsertUs = 0;
+            sStoreRefs = 0;
+            // Only the main thread loads stores; the timing hooks are global.
+            ESM::VitaEsmTiming::sReadUs = ESM::VitaEsmTiming::sIdUs = 0;
+            ESM::VitaEsmTiming::sReads = ESM::VitaEsmTiming::sIds = 0;
+            ESM::VitaEsmTiming::sOn = true;
+            const uint64_t t0 = sceKernelGetProcessTimeWide();
+#endif
             loadRefs();
+#ifdef __vita__
+            ESM::VitaEsmTiming::sOn = false;
+            const uint64_t t1 = sceKernelGetProcessTimeWide();
+            if (t1 - t0 >= 20000)
+            {
+                char rb[96];
+                snprintf(rb, sizeof(rb), "[StoreLoad]   reads=%u %ums ids=%u %ums",
+                    ESM::VitaEsmTiming::sReads, (unsigned)(ESM::VitaEsmTiming::sReadUs / 1000),
+                    ESM::VitaEsmTiming::sIds, (unsigned)(ESM::VitaEsmTiming::sIdUs / 1000));
+                Vita::breadcrumb(rb);
+                char buf[192];
+                const std::string_view desc = getCell()->getDescription();
+                snprintf(buf, sizeof(buf), "[StoreLoad] %.*s refs=%u total=%ums decode=%ums insert=%ums other=%ums",
+                    (int)std::min<std::size_t>(desc.size(), 64), desc.data(), sStoreRefs, (unsigned)((t1 - t0) / 1000),
+                    (unsigned)(sStoreDecodeUs / 1000), (unsigned)(sStoreInsertUs / 1000),
+                    (unsigned)((t1 - t0 - sStoreDecodeUs - sStoreInsertUs) / 1000));
+                Vita::breadcrumb(buf);
+            }
+#endif
 
             mState = State_Loaded;
         }
@@ -908,9 +952,16 @@ namespace MWWorld
                 ESM::MovedCellRef cMRef;
                 bool deleted = false;
                 bool moved = false;
+#ifdef __vita__
+                uint64_t tDecode = sceKernelGetProcessTimeWide();
+#endif
                 while (ESM::Cell::getNextRef(
                     *reader, ref, deleted, cMRef, moved, ESM::Cell::GetNextRefMode::LoadOnlyNotMoved))
                 {
+#ifdef __vita__
+                    const uint64_t tInsert = sceKernelGetProcessTimeWide();
+                    sStoreDecodeUs += tInsert - tDecode;
+#endif
                     if (moved)
                         continue;
 
@@ -923,6 +974,11 @@ namespace MWWorld
                     }
 
                     loadRef(ref, deleted, refNumToID);
+#ifdef __vita__
+                    tDecode = sceKernelGetProcessTimeWide();
+                    sStoreInsertUs += tDecode - tInsert;
+                    ++sStoreRefs;
+#endif
                 }
             }
             catch (std::exception& e)

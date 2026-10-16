@@ -89,6 +89,7 @@ static void countDrawables(const osg::Node* node, unsigned int& drawableCount, u
 #include <components/esm3/loadarmo.hpp>
 #include <components/esm3/loadbody.hpp>
 #include <components/esm3/loadclot.hpp>
+#include <components/resource/keyframemanager.hpp>
 #include <components/resource/resourcesystem.hpp>
 #include <components/vfs/manager.hpp>
 #include <components/resource/scenemanager.hpp>
@@ -304,6 +305,47 @@ namespace
             const bool on = sceIoGetstat("ux0:data/openmw/noscanidle.txt", &st) < 0;
             Vita::breadcrumb(on ? "[Hydrate] scan idle gates on" : "[Hydrate] scan idle gates off (noscanidle.txt)");
             return on;
+        }();
+        return sOn;
+    }
+
+    // Memory governor (watchdog block in Scene::update): under heap pressure
+    // the resource caches expire sooner on the worker's once-a-second expiry
+    // pass, instead of the watchdog dropping every unreferenced entry in one
+    // main-thread frame. ux0:data/openmw/nomemgov.txt turns it off for A/B.
+    bool vitaMemGovEnabled()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            const bool on = sceIoGetstat("ux0:data/openmw/nomemgov.txt", &st) < 0;
+            Vita::breadcrumb(on ? "[MemGov] on" : "[MemGov] off (nomemgov.txt)");
+            return on;
+        }();
+        return sOn;
+    }
+
+    // Guard pass fixes (hydrate tick): actor-list scans outside the near ring,
+    // memoized actor part lists, a warm memo that survives deliveries, and a
+    // slower delivery re-arm. ux0:data/openmw/noguardfix.txt turns them off.
+    bool vitaGuardFixEnabled()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            const bool on = sceIoGetstat("ux0:data/openmw/noguardfix.txt", &st) < 0;
+            Vita::breadcrumb(on ? "[GuardSplit] guard fixes on" : "[GuardSplit] guard fixes off (noguardfix.txt)");
+            return on;
+        }();
+        return sOn;
+    }
+
+    // The resident-set audits a watchdog flush logged first walk every cell
+    // store and cached template: 30-40 ms of each flush's stall, for
+    // diagnostics only. ux0:data/openmw/memaudit.txt turns them back on.
+    bool vitaMemAuditEnabled()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/memaudit.txt", &st) >= 0;
         }();
         return sOn;
     }
@@ -1087,6 +1129,54 @@ namespace MWWorld
                 Vita::breadcrumb("[MemWatchdog] Latch re-armed");
             }
 
+            // Memory governor: shorten the cache expiry delay with heap
+            // pressure, so the worker's once-a-second expiry pass frees the
+            // least recently used entries a thin age band at a time, off the
+            // main thread. Base expiry up to budget-30, kGovMinExpiry at the
+            // flush trigger (budget-20), eased at kGovRate seconds per
+            // second so no single pass expires a large backlog. The flush
+            // below stays the fallback.
+            if (vitaMemGovEnabled())
+            {
+                constexpr double kGovMinExpiry = 2.0;
+                constexpr double kGovRate = 2.0;
+                const double base = Settings::cells().mCacheExpiryDelay;
+                static double sGovExpiry = -1.0, sGovApplied = -1.0;
+                static uint64_t sGovLastUs = 0, sGovLogUs = 0;
+                if (sGovExpiry < 0.0)
+                    sGovExpiry = sGovApplied = base;
+                const int softMB = budget - 30;
+                const int hardMB = budget - 20;
+                double target = base;
+                if (usedMB > softMB)
+                {
+                    const double t = std::min(1.0, double(usedMB - softMB) / double(hardMB - softMB));
+                    target = base + (kGovMinExpiry - base) * t;
+                }
+                const double dt = sGovLastUs ? std::min(0.25, double(nowUs - sGovLastUs) / 1e6) : 0.0;
+                sGovLastUs = nowUs;
+                const double step = kGovRate * dt;
+                sGovExpiry = target < sGovExpiry ? std::max(target, sGovExpiry - step)
+                                                 : std::min(target, sGovExpiry + step);
+                if (std::abs(sGovExpiry - sGovApplied) >= 0.25 || (sGovExpiry == base && sGovApplied != base))
+                {
+                    Resource::ResourceSystem* rs = mRendering.getResourceSystem();
+                    rs->setExpiryDelay(sGovExpiry);
+                    // Keyframes keep the base delay: re-parsing them is what
+                    // made the flush skip them too.
+                    rs->getKeyframeManager()->setExpiryDelay(base);
+                    sGovApplied = sGovExpiry;
+                }
+                if (sGovApplied < base && nowUs - sGovLogUs > 5000000)
+                {
+                    sGovLogUs = nowUs;
+                    char gb[96];
+                    snprintf(gb, sizeof(gb), "[MemGov] heap=%dMB expiry=%.1fs (target %.1fs)", usedMB, sGovApplied,
+                        target);
+                    Vita::breadcrumb(gb);
+                }
+            }
+
             // vitaGL pool exhaustion enters gpu_alloc's unsafe path
             // (sceGxmFinish + 1s sleep per failed alloc — seconds frozen at
             // the GL fence). Fire the battery BEFORE an allocation can fail.
@@ -1151,9 +1241,22 @@ namespace MWWorld
                         mPreloader->vitaRelievePressure(afterMB >= budget - 12);
                 }
                 const auto wdFlush0 = std::chrono::steady_clock::now();
+                // Step split for the flush line: audit, evict, unref, cache,
+                // trim (the flush is one of the largest single-frame stalls).
+                uint64_t wdT = sceKernelGetProcessTimeWide();
+                uint32_t wdSplit[5] = {};
+                const auto wdLap = [&wdT](uint32_t& out) {
+                    const uint64_t now = sceKernelGetProcessTimeWide();
+                    out = (uint32_t)((now - wdT) / 1000);
+                    wdT = now;
+                };
                 // Snapshot what is resident before the flush wipes it.
-                Vita::auditWorldModel(mWorld.getWorldModel());
-                Vita::auditResourceCaches(mRendering.getResourceSystem());
+                if (vitaMemAuditEnabled())
+                {
+                    Vita::auditWorldModel(mWorld.getWorldModel());
+                    Vita::auditResourceCaches(mRendering.getResourceSystem());
+                }
+                wdLap(wdSplit[0]);
                 {
                     const auto watchdogProtected = vitaProtectedCells();
                     const std::size_t swept = mWorld.getWorldModel().evictSweptCellStores(watchdogProtected);
@@ -1168,12 +1271,15 @@ namespace MWWorld
                         Vita::breadcrumb(evictBuf);
                     }
                 }
+                wdLap(wdSplit[1]);
                 vitaMainPhase("flush");
                 mRendering.flushUnrefQueueImmediate();
+                wdLap(wdSplit[2]);
                 mRendering.getResourceSystem()->clearCache();
                 // Static caches that bypass OSG expiry; cleared explicitly.
                 MWMechanics::AiPackage::clearPathgridCache();
                 MWRender::clearAnimationModelCache();
+                wdLap(wdSplit[3]);
                 // Coalesce free chunks after the bulk-free. Texture
                 // decompression on Vita allocates varied-size RGBA buffers
                 // (64 KB to ~2.3 MB depending on texture-detail preset),
@@ -1186,6 +1292,7 @@ namespace MWWorld
                 // sbrk on Vita) but reclaims contiguous capacity.
                 vitaMainPhase("trim");
                 malloc_trim(0);
+                wdLap(wdSplit[4]);
                 s_cachesFlushed = true;
                 s_lastFlushTimeUs = nowUs;
                 ++s_flushCount;
@@ -1196,8 +1303,10 @@ namespace MWWorld
                     std::chrono::steady_clock::now() - wdFlush0)
                                      .count();
                 snprintf(buf, sizeof(buf),
-                    "[MemWatchdog] flush #%d: %dMB->%dMB (-%dMB) budget=%dMB %dms",
-                    s_flushCount, usedMB, usedAfterMB, usedMB - usedAfterMB, budget, wdMs);
+                    "[MemWatchdog] flush #%d: %dMB->%dMB (-%dMB) budget=%dMB %dms (audit=%u evict=%u unref=%u "
+                    "cache=%u trim=%u)",
+                    s_flushCount, usedMB, usedAfterMB, usedMB - usedAfterMB, budget, wdMs, wdSplit[0], wdSplit[1],
+                    wdSplit[2], wdSplit[3], wdSplit[4]);
                 Vita::breadcrumb(buf);
                 // Best moment to try replenishing the emergency reserve:
                 // we just freed and coalesced. The previous code only
@@ -2817,9 +2926,34 @@ namespace MWWorld
     constexpr std::size_t kActorDataPerPass = 2;
     // Cells entering the actor domain (scripts, respawn, sound warm) per tick.
     constexpr int kActorDomainEntriesPerTick = 1;
+    // Ticks lane B sits out after its nearest actor's assets were not ready:
+    // they stream for hundreds of ms, and each check rescans and regates.
+    constexpr unsigned kActorLaneBackoffTicks = 3;
     // Telemetry for [ActorPace] (reset each report).
     static uint32_t sVitaActorDataUs = 0;
     static unsigned sVitaActorDataBuilds = 0;
+    // Lane B split: nearest-waiting-actor scan, asset gate (warm checks +
+    // pacing decision), the add itself; lane runs and runs that added.
+    static uint32_t sVitaLaneScanUs = 0, sVitaLaneGateUs = 0, sVitaLaneAddUs = 0;
+    static unsigned sVitaLaneRuns = 0, sVitaLaneScans = 0, sVitaLaneAdds = 0;
+    static unsigned sVitaLaneBackoff = 0;
+    // [GuardSplit] (reported with [ActorPace]): guard passes, their time,
+    // the ring scan (rings 1+3) with ring 3's warm checks inside it, the
+    // guard disc scan + adds; data builds and the near-ring add are the rest.
+    struct VitaGuardSplit
+    {
+        unsigned mPasses = 0, mRing3Actors = 0, mAdds = 0;
+        uint32_t mPassUs = 0, mRingUs = 0, mRing3Us = 0, mDiscUs = 0;
+    };
+    static VitaGuardSplit sGuardSplit;
+    // warmPath callee split (whole tick, all callers): common-warm check,
+    // bound lookup, demand touch -- each takes the preloader's mutex.
+    struct VitaWarmSplit
+    {
+        unsigned mCalls = 0, mColdSkips = 0;
+        uint32_t mCommonUs = 0, mBoundUs = 0, mDemandUs = 0, mMaxUs = 0;
+    };
+    static VitaWarmSplit sWarmSplit;
 
     void Scene::vitaActorWarmPaths(const Ptr& ptr, std::vector<std::string>& out) const
     {
@@ -3190,6 +3324,24 @@ namespace MWWorld
         const auto isActorType = [](unsigned int t) {
             return t == ESM::REC_NPC_ || t == ESM::REC_CREA || t == ESM::REC_LEVC;
         };
+        // Actor part lists (vitaActorWarmPaths: VFS lookups, inventory walk)
+        // reused for 2 s: the guard's ring 3 re-gates the same approaching
+        // actors on every pass while their assets stream.
+        static std::unordered_map<const LiveCellRefBase*, std::pair<Clock::time_point, std::vector<std::string>>>
+            sActorPathsMemo;
+        if (sActorPathsMemo.size() > 512)
+            sActorPathsMemo.clear(); // only here: references handed out below live within this tick
+        const bool guardFix = vitaGuardFixEnabled();
+        const auto actorPathsFor = [&](const MWWorld::Ptr& ptr) -> const std::vector<std::string>& {
+            auto& e = sActorPathsMemo[ptr.mRef];
+            if (e.first.time_since_epoch().count() == 0 || tick0 - e.first > std::chrono::seconds(2))
+            {
+                e.second.clear();
+                vitaActorWarmPaths(ptr, e.second);
+                e.first = tick0;
+            }
+            return e.second;
+        };
         // THE INVARIANT: the main thread never loads cold templates. Cold
         // models enter the demand ledger; objects hydrate when Ready.
         // alwaysWarm distinguishes "was never cold" from "was cold, now
@@ -3202,14 +3354,24 @@ namespace MWWorld
                     *alwaysWarm = true;
                 return true;
             }
+            ++sWarmSplit.mCalls;
             if (vitaTickCold.count(path) > 0)
+            {
+                ++sWarmSplit.mColdSkips;
                 return false;
-            if (mPreloader->vitaIsCommonWarm(path))
+            }
+            const auto w0 = Clock::now();
+            const bool commonWarm = mPreloader->vitaIsCommonWarm(path);
+            const uint32_t commonUs = vitaUsSince(w0);
+            sWarmSplit.mCommonUs += commonUs;
+            sWarmSplit.mMaxUs = std::max(sWarmSplit.mMaxUs, commonUs);
+            if (commonWarm)
             {
                 if (alwaysWarm)
                     *alwaysWarm = true;
                 return true;
             }
+            const auto w1 = Clock::now();
             // Salience priority: a tower at 4000 outranks a pitcher at 600.
             // Architecture/landform by name class loads ahead of clutter at
             // equal salience (x0.5 prio), so delivery order follows the same
@@ -3223,7 +3385,15 @@ namespace MWWorld
                 if (name.rfind("ex_", 0) == 0 || name.rfind("in_", 0) == 0 || name.rfind("terrain_", 0) == 0)
                     prio *= 0.5f;
             }
-            if (mPreloader->vitaDemandTouch(path, prio) == CellPreloader::VitaDemandState::Ready)
+            const auto w2 = Clock::now();
+            const uint32_t boundUs
+                = (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(w2 - w1).count();
+            sWarmSplit.mBoundUs += boundUs;
+            const bool ready = mPreloader->vitaDemandTouch(path, prio) == CellPreloader::VitaDemandState::Ready;
+            const uint32_t demandUs = vitaUsSince(w2);
+            sWarmSplit.mDemandUs += demandUs;
+            sWarmSplit.mMaxUs = std::max({ sWarmSplit.mMaxUs, boundUs, demandUs });
+            if (ready)
                 return true;
             vitaTickCold.insert(std::move(path));
             return false;
@@ -3313,10 +3483,15 @@ namespace MWWorld
             const float gmx = pp.x() - sGuardPos.x();
             const float gmy = pp.y() - sGuardPos.y();
             const bool guardStale = tick0 - sGuardLast >= std::chrono::milliseconds(500);
-            const bool guardArmed = gmx * gmx + gmy * gmy > 200.f * 200.f
-                || readyEpoch != sGuardReadyEpoch || guardStale;
-            if (guardArmed && tick0 - sGuardLast >= std::chrono::milliseconds(50))
+            const bool guardMoved = gmx * gmx + gmy * gmy > 200.f * 200.f;
+            const bool guardArmed = guardMoved || readyEpoch != sGuardReadyEpoch || guardStale;
+            // Arriving in a town the loader delivers every frame; a pass per
+            // delivery rescanned every nearby ref ~20 times a second.
+            const auto guardMinGap = std::chrono::milliseconds(guardFix && !guardMoved ? 200 : 50);
+            if (guardArmed && tick0 - sGuardLast >= guardMinGap)
             {
+                const auto gs0 = Clock::now();
+                ++sGuardSplit.mPasses;
                 sGuardPos = pp;
                 sGuardReadyEpoch = readyEpoch;
                 sGuardLast = tick0;
@@ -3336,7 +3511,19 @@ namespace MWWorld
                 // dropped whenever the ready epoch moves (new deliveries).
                 static std::set<const LiveCellRefBase*> sRing3Warm;
                 static unsigned sRing3Epoch = 0;
-                if (readyEpoch != sRing3Epoch)
+                static Clock::time_point sRing3Cleared{};
+                if (guardFix)
+                {
+                    // Deliveries only warm things; a stale entry just stops
+                    // ring 3 pre-warming that actor, and Lane B re-gates
+                    // every part before an add anyway. Refresh on a timer.
+                    if (tick0 - sRing3Cleared > std::chrono::seconds(5))
+                    {
+                        sRing3Cleared = tick0;
+                        sRing3Warm.clear();
+                    }
+                }
+                else if (readyEpoch != sRing3Epoch)
                 {
                     sRing3Epoch = readyEpoch;
                     sRing3Warm.clear();
@@ -3348,10 +3535,10 @@ namespace MWWorld
                     std::vector<std::pair<float, MWWorld::Ptr>> dataCands;
                     for (CellStore* gc : cells)
                     {
-                        if (!gc->getCell()->isExterior()
-                            || vitaCellEdge2(*gc, pp) > rActorWarm * rActorWarm)
+                        const float edge2 = gc->getCell()->isExterior() ? vitaCellEdge2(*gc, pp) : 0.f;
+                        if (!gc->getCell()->isExterior() || edge2 > rActorWarm * rActorWarm)
                             continue;
-                        gc->forEach([&](const MWWorld::Ptr& ptr) {
+                        const auto ringVisit = [&](const MWWorld::Ptr& ptr) {
                             if (ptr.getRefData().getBaseNode() != nullptr)
                                 return true;
                             if (isPagedRef(ptr) || ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
@@ -3382,8 +3569,11 @@ namespace MWWorld
                                     dataCands.emplace_back(d2, ptr);
                                     return true;
                                 }
-                                std::vector<std::string> paths;
-                                vitaActorWarmPaths(ptr, paths);
+                                const auto r30 = Clock::now();
+                                std::vector<std::string> ownPaths;
+                                if (!guardFix)
+                                    vitaActorWarmPaths(ptr, ownPaths);
+                                const std::vector<std::string>& paths = guardFix ? actorPathsFor(ptr) : ownPaths;
                                 bool allWarm = true;
                                 for (const std::string& ap : paths)
                                     allWarm = warmPath(ap, d2) && allWarm;
@@ -3391,10 +3581,25 @@ namespace MWWorld
                                     ++actorWarmFiled;
                                 else
                                     sRing3Warm.insert(ptr.mRef);
+                                sGuardSplit.mRing3Us += vitaUsSince(r30);
+                                ++sGuardSplit.mRing3Actors;
                             }
                             return true;
-                        });
+                        };
+                        // Ring 1 (any type) only reaches cells within rNear;
+                        // beyond it only ring 3's actors matter, so walk the
+                        // actor lists instead of every static and item.
+                        if (!guardFix || edge2 <= rNear * rNear)
+                            gc->forEach(ringVisit);
+                        else
+                        {
+                            gc->forEachType<ESM::NPC>(ringVisit);
+                            gc->forEachType<ESM::Creature>(ringVisit);
+                            gc->forEachType<ESM::CreatureLevList>(ringVisit);
+                        }
                     }
+                    const auto gs1 = Clock::now();
+                    sGuardSplit.mRingUs += (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(gs1 - gs0).count();
                     // Deferred NPC data builds: nearest first, kActorDataPerPass
                     // per guard pass, inside this tick's grant once the first
                     // is done. Lane B builds its own pick on demand anyway.
@@ -3435,8 +3640,10 @@ namespace MWWorld
                         bool warm = warmOrRequest(nearMiss, nearBestD2);
                         if (warm && isActorType(nearMiss.getType()))
                         {
-                            std::vector<std::string> paths;
-                            vitaActorWarmPaths(nearMiss, paths);
+                            std::vector<std::string> ownPaths;
+                            if (!guardFix)
+                                vitaActorWarmPaths(nearMiss, ownPaths);
+                            const std::vector<std::string>& paths = guardFix ? actorPathsFor(nearMiss) : ownPaths;
                             for (const std::string& ap : paths)
                                 warm = warmPath(ap, nearBestD2) && warm;
                         }
@@ -3467,6 +3674,7 @@ namespace MWWorld
                     }
                 }
 
+                const auto gs2 = Clock::now();
                 int guardAdds = 0;
                 const auto guardAdd = [&](const MWWorld::Ptr& ptr) {
                     try
@@ -3544,6 +3752,10 @@ namespace MWWorld
                 const int guardGaps = guardAdds;
                 for (int i = 0; i < guardWarmN && guardAdds < kGuardAdds; ++i)
                     guardAdd(guardWarm[i]);
+                const auto gs3 = Clock::now();
+                sGuardSplit.mDiscUs += (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(gs3 - gs2).count();
+                sGuardSplit.mAdds += (unsigned)guardAdds;
+                sGuardSplit.mPassUs += (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(gs3 - gs0).count();
                 if (guardAdds > 0)
                 {
                     char gbuf[64];
@@ -4304,18 +4516,37 @@ namespace MWWorld
             if (tick0 - sLastPace >= std::chrono::seconds(10))
             {
                 sLastPace = tick0;
-                char pb[192];
+                char pb[256];
                 snprintf(pb, sizeof(pb),
                     "[ActorPace] add fit=%u urg=%u starve=%u defer fit=%u hp=%u est npc=%.1f cre=%.1fms "
-                    "worst=%ums data=%u/%ums dom=%u",
+                    "worst=%ums data=%u/%ums dom=%u | lane runs=%u scans=%u adds=%u scan=%ums gate=%ums add=%ums",
                     sPaceFit, sPaceUrgent, sPaceStarve, sPaceDeferFit, sPaceDeferHealth, sActorCostNpcMs,
                     sActorCostCreaMs, sPaceWorstUs / 1000, sVitaActorDataBuilds, sVitaActorDataUs / 1000,
-                    (unsigned)mVitaActorDomain.size());
+                    (unsigned)mVitaActorDomain.size(), sVitaLaneRuns, sVitaLaneScans, sVitaLaneAdds,
+                    sVitaLaneScanUs / 1000, sVitaLaneGateUs / 1000, sVitaLaneAddUs / 1000);
                 Vita::breadcrumb(pb);
                 sPaceFit = sPaceUrgent = sPaceStarve = sPaceDeferFit = sPaceDeferHealth = 0;
                 sPaceWorstUs = 0;
                 sVitaActorDataBuilds = 0;
                 sVitaActorDataUs = 0;
+                sVitaLaneScanUs = sVitaLaneGateUs = sVitaLaneAddUs = 0;
+                sVitaLaneRuns = sVitaLaneScans = sVitaLaneAdds = 0;
+                snprintf(pb, sizeof(pb),
+                    "[GuardSplit] passes=%u total=%ums ring=%ums (ring3 %ums, %u actor checks) disc=%ums adds=%u "
+                    "other=%ums",
+                    sGuardSplit.mPasses, sGuardSplit.mPassUs / 1000, sGuardSplit.mRingUs / 1000,
+                    sGuardSplit.mRing3Us / 1000, sGuardSplit.mRing3Actors, sGuardSplit.mDiscUs / 1000,
+                    sGuardSplit.mAdds,
+                    (sGuardSplit.mPassUs - std::min(sGuardSplit.mPassUs, sGuardSplit.mRingUs + sGuardSplit.mDiscUs))
+                        / 1000);
+                Vita::breadcrumb(pb);
+                sGuardSplit = VitaGuardSplit();
+                snprintf(pb, sizeof(pb),
+                    "[WarmSplit] calls=%u coldskip=%u common=%ums bound=%ums demand=%ums worst=%uus",
+                    sWarmSplit.mCalls, sWarmSplit.mColdSkips, sWarmSplit.mCommonUs / 1000, sWarmSplit.mBoundUs / 1000,
+                    sWarmSplit.mDemandUs / 1000, sWarmSplit.mMaxUs);
+                Vita::breadcrumb(pb);
+                sWarmSplit = VitaWarmSplit();
             }
         }
         const bool actorStarved = sActorSatisfied.time_since_epoch().count() != 0
@@ -4331,14 +4562,22 @@ namespace MWWorld
             ++sPaceDeferHealth;
             return vitaOps;
         }
+        if (!bigBudget && sVitaLaneBackoff > 0)
+        {
+            --sVitaLaneBackoff;
+            return vitaOps;
+        }
         SegTimer segActor(&sSegActorUs);
         int actorBudget = bigBudget ? 1000 : 1;
         std::vector<osg::ref_ptr<const osg::Referenced>> actorPins;
+        ++sVitaLaneRuns;
         while (actorBudget > 0)
         {
             actorPins.clear();
             if (bigBudget && Clock::now() >= deadline)
                 return vitaOps;
+            const auto laneScan0 = Clock::now();
+            ++sVitaLaneScans;
             MWWorld::Ptr best;
             float bestD2 = rActorIn * rActorIn;
             for (std::size_t ci = 0; ci < n; ++ci)
@@ -4356,9 +4595,10 @@ namespace MWWorld
                     if (ex * ex + ey * ey > (rIn + 512.f) * (rIn + 512.f))
                         continue; // out of actor reach; scan cost stays bounded
                 }
-                cell.forEach([&](const MWWorld::Ptr& ptr) {
-                    if (!isActorType(ptr.getType()))
-                        return true;
+                // Actor lists only (NPC, creature, levelled creature): a full
+                // forEach walked every static, door and item in reach each
+                // tick to find a handful of actors.
+                const auto visitActor = [&](const MWWorld::Ptr& ptr) {
                     if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
                         return true;
                     if (ptr.getRefData().getBaseNode() != nullptr)
@@ -4375,25 +4615,59 @@ namespace MWWorld
                         best = ptr;
                     }
                     return true;
-                });
+                };
+                cell.forEachType<ESM::NPC>(visitActor);
+                cell.forEachType<ESM::Creature>(visitActor);
+                cell.forEachType<ESM::CreatureLevList>(visitActor);
             }
+            sVitaLaneScanUs += vitaUsSince(laneScan0);
             if (best.isEmpty())
             {
                 sActorSatisfied = Clock::now(); // nothing waiting: not starving
                 return vitaOps;
             }
+            const auto laneGate0 = Clock::now();
+            // Every exit before the add is gate time.
+            struct GateTimer
+            {
+                Clock::time_point t0;
+                bool done = false;
+                ~GateTimer()
+                {
+                    if (!done)
+                        sVitaLaneGateUs += vitaUsSince(t0);
+                }
+            } gateTimer{ laneGate0 };
             if (!warmOrRequest(best, bestD2))
-                return vitaOps; // skeleton warming; try next tick
-            std::vector<std::string> actorPaths;
+            {
+                sVitaLaneBackoff = kActorLaneBackoffTicks;
+                return vitaOps; // skeleton warming; try in a few ticks
+            }
+            // The same actor is gated tick after tick while its assets
+            // stream: rebuild its part list (VFS lookups, inventory walk) at
+            // most every 2 s, not every tick.
+            static const MWWorld::LiveCellRefBase* sPathsFor = nullptr;
+            static Clock::time_point sPathsAt{};
+            static std::vector<std::string> sPaths;
+            if (best.mRef != sPathsFor || Clock::now() - sPathsAt > std::chrono::seconds(2))
+            {
+                sPaths.clear();
+                vitaActorWarmPaths(best, sPaths);
+                sPathsFor = best.mRef;
+                sPathsAt = Clock::now();
+            }
+            const std::vector<std::string>& actorPaths = sPaths;
             {
                 // Composite assembly must never cold-load on the main thread:
                 // gate on every asset the construction will reach for.
-                vitaActorWarmPaths(best, actorPaths);
                 bool assetsWarm = true;
                 for (const std::string& ap : actorPaths)
                     assetsWarm = warmPath(ap, bestD2) && assetsWarm;
                 if (!assetsWarm)
-                    return vitaOps; // actor assets streaming; assemble next tick
+                {
+                    sVitaLaneBackoff = kActorLaneBackoffTicks;
+                    return vitaOps; // actor assets streaming; assemble in a few ticks
+                }
             }
             const bool bestIsNpc = best.getType() == ESM::REC_NPC_;
             float& costMs = bestIsNpc ? sActorCostNpcMs : sActorCostCreaMs;
@@ -4422,6 +4696,9 @@ namespace MWWorld
                 if (osg::ref_ptr<const osg::Referenced> h = mPreloader->vitaHoldWarm(ap))
                     actorPins.push_back(std::move(h));
             const auto actorAdd0 = Clock::now();
+            sVitaLaneGateUs += vitaUsSince(laneGate0);
+            gateTimer.done = true;
+            ++sVitaLaneAdds;
             try
             {
                 addObject(best, mWorld, mPagedRefs, *mPhysics, mRendering);
@@ -4436,6 +4713,7 @@ namespace MWWorld
             }
             {
                 const uint32_t addUs = vitaUsSince(actorAdd0);
+                sVitaLaneAddUs += addUs;
                 sPaceWorstUs = std::max(sPaceWorstUs, addUs);
                 costMs += (addUs / 1000.f - costMs) / kActorCostLearn;
                 sActorSatisfied = Clock::now();
