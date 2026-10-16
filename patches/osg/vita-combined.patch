@@ -1616,3 +1616,226 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/RenderLeaf.cpp b/src/osgUtil
      }
  
      if (_dynamic)
+diff -ruN '--exclude=.git' pristine-osg/src/osg/Group.cpp b/src/osg/Group.cpp
+--- a/src/osg/Group.cpp
++++ b/src/osg/Group.cpp
+@@ -23,6 +23,131 @@
+ 
+ #include <algorithm>
+ 
++#ifdef __vita__
++#include <atomic>
++#include <thread>
++#include <vector>
++
++// OpenMW Vita: cull can run on the GL thread while the sim thread changes the
++// scene graph (scripts enabling/placing objects, spell effects, equipment).
++// On the registered cull thread, a cull traversal of a Group iterates a
++// snapshot of its child list taken under a lock; writers take the same lock
++// around the child-list write. Snapshots hold raw pointers (a reference per
++// child would cost two barriered atomics each, thousands per frame), so
++// children the live-scene writer (the sim thread) or the cull thread removes
++// while a cull is in flight are parked in a graveyard, and the engine releases
++// them with osg_vita_cow_drain() once the cull is done. Other threads (work
++// queue loaders, optimizer passes) edit private graphs a cull never sees:
++// their removals release at once, on their own thread, as stock OSG does.
++// Parking those once let main destroy a node mid-pass while a loader's
++// optimizer still reached it through a parent list (use-after-free).
++extern "C"
++{
++    // TPIDRURO of the thread whose culls snapshot (0 = off); set on that
++    // thread by osg_vita_cow_enable().
++    unsigned int osg_vita_cow_cull = 0;
++    // TPIDRURO of the thread that edits the live scene while a cull runs
++    // (the sim thread); set on it by osg_vita_cow_set_writer().
++    unsigned int osg_vita_cow_writer = 0;
++    volatile int osg_vita_cull_in_flight = 0;
++    // Structural changes made while a cull was in flight (telemetry: proof
++    // the snapshot path is exercised).
++    unsigned int osg_vita_cow_mutations = 0;
++    // Cull traversals on another thread while snapshotting is on; they
++    // iterate unprotected, so this should stay 0.
++    unsigned int osg_vita_cow_foreign = 0;
++}
++
++namespace
++{
++    inline unsigned int vitaThreadKey()
++    {
++        unsigned int v;
++        asm volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(v));
++        return v;
++    }
++
++    // Threads whose removals a cull may still point at.
++    inline bool vitaLiveWriter()
++    {
++        const unsigned int key = vitaThreadKey();
++        return key == osg_vita_cow_cull || key == osg_vita_cow_writer;
++    }
++
++    std::atomic_flag sVitaChildLock = ATOMIC_FLAG_INIT;
++
++    struct VitaChildLock
++    {
++        bool mOn;
++        VitaChildLock()
++            : mOn(osg_vita_cow_cull != 0)
++        {
++            if (!mOn)
++                return;
++            for (unsigned spins = 0; sVitaChildLock.test_and_set(std::memory_order_acquire); ++spins)
++            {
++                if (spins > 256)
++                    std::this_thread::yield();
++            }
++        }
++        ~VitaChildLock()
++        {
++            if (mOn)
++                sVitaChildLock.clear(std::memory_order_release);
++        }
++    };
++
++    // Removed children a cull may still point at; guarded by sVitaChildLock.
++    osg::NodeList sVitaGraveyard;
++
++    struct VitaWriteLock : VitaChildLock
++    {
++        const bool mInFlight;
++        VitaWriteLock()
++            : mInFlight(mOn && osg_vita_cull_in_flight && vitaLiveWriter())
++        {
++            if (mInFlight)
++                ++osg_vita_cow_mutations;
++        }
++        void park(osg::Node* removed)
++        {
++            if (mInFlight)
++                sVitaGraveyard.push_back(removed);
++        }
++    };
++
++    // The cull thread's snapshots, one stack for all traversal depths: a
++    // level appends its children, iterates them by index (a nested level
++    // may reallocate the buffer) and truncates back. Only the registered
++    // cull thread touches it; capacity is kept, so steady state does not
++    // allocate.
++    std::vector<osg::Node*> sVitaCullStack;
++}
++
++extern "C" void osg_vita_cow_enable(int on)
++{
++    osg_vita_cow_cull = on ? vitaThreadKey() : 0u;
++}
++
++extern "C" void osg_vita_cow_set_writer(void)
++{
++    osg_vita_cow_writer = vitaThreadKey();
++}
++
++extern "C" void osg_vita_cow_drain(void)
++{
++    osg::NodeList released;
++    {
++        VitaChildLock lock;
++        if (osg_vita_cull_in_flight)
++            return;
++        released.swap(sVitaGraveyard);
++    }
++    // Last references drop here, outside the lock: destructors may edit
++    // other groups.
++}
++#endif
++
+ using namespace osg;
+ 
+ Group::Group()
+@@ -56,6 +181,33 @@
+ 
+ void Group::traverse(NodeVisitor& nv)
+ {
++#ifdef __vita__
++    if (osg_vita_cow_cull && nv.getVisitorType() == NodeVisitor::CULL_VISITOR)
++    {
++        if (vitaThreadKey() == osg_vita_cow_cull)
++        {
++            const size_t base = sVitaCullStack.size();
++            // Outermost level: flag the cull before the first snapshot (the
++            // lock's release publishes it to writers).
++            if (base == 0)
++                osg_vita_cull_in_flight = 1;
++            {
++                VitaChildLock lock;
++                for (NodeList::iterator itr = _children.begin(); itr != _children.end(); ++itr)
++                    sVitaCullStack.push_back(itr->get());
++            }
++            const size_t end = sVitaCullStack.size();
++            for (size_t i = base; i < end; ++i)
++                sVitaCullStack[i]->accept(nv);
++            sVitaCullStack.resize(base);
++            // Release: every use of a snapshot pointer precedes the clear.
++            if (base == 0)
++                __atomic_store_n(&osg_vita_cull_in_flight, 0, __ATOMIC_RELEASE);
++            return;
++        }
++        ++osg_vita_cow_foreign;
++    }
++#endif
+     for(NodeList::iterator itr=_children.begin();
+         itr!=_children.end();
+         ++itr)
+@@ -88,6 +240,10 @@
+ 
+ 
+     // note ref_ptr<> automatically handles incrementing child's reference count.
++    {
++#ifdef __vita__
++        VitaWriteLock lock;
++#endif
+     if (index >= _children.size())
+     {
+         index = _children.size();      // set correct index value to be passed to the "childInserted" method
+@@ -97,6 +253,7 @@
+     {
+         _children.insert(_children.begin()+index, child);
+     }
++    }
+ 
+     // register as parent of child.
+     child->addParent(this);
+@@ -195,7 +352,19 @@
+ 
+         childRemoved(pos,endOfRemoveRange-pos);
+ 
++#ifdef __vita__
++        // Hold the removed children past the lock (dropping a last reference
++        // runs destructors) and park them while a cull may still point at them.
++        NodeList vitaRemoved(_children.begin()+pos, _children.begin()+endOfRemoveRange);
++        {
++            VitaWriteLock lock;
++            _children.erase(_children.begin()+pos,_children.begin()+endOfRemoveRange);
++            for (NodeList::iterator itr = vitaRemoved.begin(); itr != vitaRemoved.end(); ++itr)
++                lock.park(itr->get());
++        }
++#else
+         _children.erase(_children.begin()+pos,_children.begin()+endOfRemoveRange);
++#endif
+ 
+         if (updateCallbackRemoved)
+         {
+@@ -250,7 +419,13 @@
+ 
+         // note ref_ptr<> automatically handles decrementing origNode's reference count,
+         // and inccrementing newNode's reference count.
+-        _children[i] = newNode;
++        {
++#ifdef __vita__
++            VitaWriteLock lock;
++            lock.park(origNode.get());
++#endif
++            _children[i] = newNode;
++        }
+ 
+         // register as parent of child.
+         newNode->addParent(this);

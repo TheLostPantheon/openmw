@@ -41,6 +41,10 @@ extern "C"
     uint32_t phase_pre_us = 0, phase_pace_us = 0;
     uint32_t phase_fin_us = 0, phase_inp_us = 0, phase_unref_us = 0, phase_stats_us = 0;
     uint32_t vita_simjob_us = 0, vita_simjob_upd_us = 0, vita_simjob_cull_us = 0;
+    // Cull-on-GL pipeline (engine.cpp): main's wait on the cull fence, cull
+    // time on the GL thread, frames run in that mode; OSG patch counters.
+    uint32_t vita_cullfence_us = 0, vita_gl_cull_us = 0, vita_cullongl_frames = 0;
+    extern unsigned int osg_vita_cow_mutations, osg_vita_cow_foreign;
     uint32_t phase_snd_us = 0, phase_lsync_us = 0, phase_state_us = 0;
     uint32_t phase_world_us = 0, phase_wm_us = 0;
     unsigned int vita_bin2_graphs = 0, vita_bin2_leaves = 0;
@@ -668,6 +672,20 @@ namespace Vita
             auditLog(buf);
         }
         vita_simjob_us = vita_simjob_upd_us = vita_simjob_cull_us = 0;
+        if (vita_cullongl_frames > 0)
+        {
+            // Cull on GL: fence = main blocked on the cull after joining the
+            // sim job (cull outlasting sim); cow = structural changes made
+            // under an in-flight cull; foreign = unprotected culls (want 0).
+            snprintf(buf, sizeof(buf),
+                "[Pipe] gl frames=%u fence=%.1f glcull=%.1f ms/frame cowmut=%u foreign=%u",
+                vita_cullongl_frames, (double)vita_cullfence_us / 1000.0 / kReportEveryFrames,
+                (double)vita_gl_cull_us / 1000.0 / kReportEveryFrames, osg_vita_cow_mutations,
+                osg_vita_cow_foreign);
+            auditLog(buf);
+        }
+        vita_cullfence_us = vita_gl_cull_us = vita_cullongl_frames = 0;
+        osg_vita_cow_mutations = osg_vita_cow_foreign = 0;
         {
             // Cull cost by subtree (VitaCullTimer.h): derived splits avoid the
             // per-node timers that skewed what they measured.

@@ -93,6 +93,7 @@
 #include <components/vita/VitaShader.h>
 #include "../vita/VitaCullTimer.h"
 #include "../vita/VitaInit.h"
+#include "../vita/VitaSimWorker.h"
 #include <osg/GL>
 #endif
 
@@ -1093,21 +1094,80 @@ namespace MWRender
             mCamera->rotateCameraToTrackingPtr();
         }
 
+#ifdef __vita__
+        if (vitaDeferTransform())
+        {
+            mVitaDeferred.push_back(
+                { VitaDeferredTransform::Attitude, false, ptr.getRefData().getBaseNode(), {}, rot });
+            return;
+        }
+#endif
         ptr.getRefData().getBaseNode()->setAttitude(rot);
     }
 
     void RenderingManager::moveObject(const MWWorld::Ptr& ptr, const osg::Vec3f& pos)
     {
+#ifdef __vita__
+        if (vitaDeferTransform())
+        {
+            mVitaDeferred.push_back(
+                { VitaDeferredTransform::Position, false, ptr.getRefData().getBaseNode(), pos, {} });
+            return;
+        }
+#endif
         ptr.getRefData().getBaseNode()->setPosition(pos);
     }
 
     void RenderingManager::scaleObject(const MWWorld::Ptr& ptr, const osg::Vec3f& scale)
     {
+#ifdef __vita__
+        if (vitaDeferTransform())
+        {
+            // The camera height follows the node's scale: refresh it once
+            // the scale lands.
+            mVitaDeferred.push_back({ VitaDeferredTransform::Scale, ptr == mCamera->getTrackingPtr(),
+                ptr.getRefData().getBaseNode(), scale, {} });
+            return;
+        }
+#endif
         ptr.getRefData().getBaseNode()->setScale(scale);
 
         if (ptr == mCamera->getTrackingPtr()) // update height of camera
             mCamera->processViewChange();
     }
+
+#ifdef __vita__
+    bool RenderingManager::vitaDeferTransform() const
+    {
+        return mVitaDeferSimTransforms && Vita::isSimThread();
+    }
+
+    void RenderingManager::vitaApplyDeferredTransforms()
+    {
+        // In queue order: a node moved twice in one frame ends where the
+        // last write put it.
+        bool trackingScaled = false;
+        for (const VitaDeferredTransform& t : mVitaDeferred)
+        {
+            switch (t.mKind)
+            {
+                case VitaDeferredTransform::Position:
+                    t.mNode->setPosition(t.mVec);
+                    break;
+                case VitaDeferredTransform::Attitude:
+                    t.mNode->setAttitude(t.mQuat);
+                    break;
+                case VitaDeferredTransform::Scale:
+                    t.mNode->setScale(t.mVec);
+                    trackingScaled |= t.mTracking;
+                    break;
+            }
+        }
+        mVitaDeferred.clear();
+        if (trackingScaled)
+            mCamera->processViewChange();
+    }
+#endif
 
     void RenderingManager::removeObject(const MWWorld::Ptr& ptr)
     {

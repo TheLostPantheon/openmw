@@ -38,6 +38,7 @@ def summarize(path):
     s["crash_lines"] = sum(bool(re.search(r"\[Crash\] (Data|Prefetch|Undefined)", l)) for l in L)
     g = [l for l in L if "[vglGuard] off-thread calls" in l]
     s["guard"] = g[-1].split("] ", 1)[-1] if g else "none"
+    s["pipeline"] = next((l.split("[Pipeline] ", 1)[-1] for l in L if "[Pipeline] " in l), "?")
     frames = [v for v in series(L, "[Frame]", "avg") if v > 0]
     s["frame_ms_median"] = round(statistics.median(frames), 1) if frames else None
     s["frame_ms_p90"] = pct(frames, 0.9)
@@ -61,6 +62,10 @@ def summarize(path):
             ("sim_job_total", "[SimSplit]", "job"), ("sim.update_trav", "[SimSplit]", "upd"),
             ("sim.cull", "[SimSplit]", "cull"), ("sim.script", "[SimSplit]", "scr"),
             ("sim.mech", "[SimSplit]", "mech"), ("sim.phys", "[SimSplit]", "phys"),
+            # cull on GL thread (cullongl.txt): main's cull fence, GL cull,
+            # structural changes under an in-flight cull, unprotected culls
+            ("pipe.cull_fence", "[Pipe]", "fence"), ("pipe.gl_cull", "[Pipe]", "glcull"),
+            ("pipe.cow_mutations", "[Pipe]", "cowmut"), ("pipe.foreign_culls", "[Pipe]", "foreign"),
             # GL worker / GPU
             ("gl_job (draw+swap)", "[PhaseAvg]", "rnd"), ("gl_draw", "[GlJob]", "draw"),
             ("gpu_qdepth", "[Gpu]", "qd"), ("gpu_swap_block", "[Gpu]", "blk"),
