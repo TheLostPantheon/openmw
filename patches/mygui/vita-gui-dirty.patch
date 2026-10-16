@@ -15,9 +15,9 @@
  		virtual void resizeView(const IntSize& _viewSize) = 0;
  
  	protected:
---- a/MyGUIEngine/include/MyGUI_ISubWidget.h	2026-08-18 11:42:15.432749561 -0600
-+++ b/MyGUIEngine/include/MyGUI_ISubWidget.h	2026-08-18 11:42:15.410749561 -0600
-@@ -15,6 +15,16 @@
+--- a/MyGUIEngine/include/MyGUI_ISubWidget.h
++++ b/MyGUIEngine/include/MyGUI_ISubWidget.h
+@@ -15,6 +15,23 @@
  #include "MyGUI_IStateInfo.h"
  #include "MyGUI_IObject.h"
  
@@ -27,8 +27,15 @@
 +namespace MyGUI { class ISubWidget; }
 +extern "C" void vitaGuiSubDirty(MyGUI::ISubWidget* sub) __attribute__((weak));
 +#define VITA_GUI_DIRTY_NOTE(sub) do { if (vitaGuiSubDirty) vitaGuiSubDirty(sub); } while (0)
++// Bumped wherever a layer, layer node or render item is marked out of date,
++// so the renderer can skip its per-frame isOutOfDate walk of every layer
++// while it has not moved. An expression: usable after an unbraced if.
++// Defined in MyGUI_RenderItem.cpp.
++extern "C" volatile unsigned int vita_gui_dirty_gen;
++#define VITA_GUI_GEN_BUMP() (++vita_gui_dirty_gen)
 +#else
 +#define VITA_GUI_DIRTY_NOTE(sub) do { } while (0)
++#define VITA_GUI_GEN_BUMP() ((void)0)
 +#endif
 +
  namespace MyGUI
@@ -279,9 +286,59 @@
  	}
  
  	void PolygonalSkin::_rebuildGeometry()
---- a/MyGUIEngine/src/MyGUI_RenderItem.cpp	2026-08-18 11:42:15.432749561 -0600
-+++ b/MyGUIEngine/src/MyGUI_RenderItem.cpp	2026-08-18 11:42:15.410749561 -0600
-@@ -191,7 +191,9 @@
+--- a/MyGUIEngine/src/MyGUI_RenderItem.cpp
++++ b/MyGUIEngine/src/MyGUI_RenderItem.cpp
+@@ -7,11 +7,16 @@
+ #include "MyGUI_Precompiled.h"
+ #include "MyGUI_RenderItem.h"
+ #include "MyGUI_LayerNode.h"
++#include "MyGUI_ISubWidget.h"
+ #include "MyGUI_LayerManager.h"
+ #include "MyGUI_Gui.h"
+ #include "MyGUI_RenderManager.h"
+ #include "MyGUI_DataManager.h"
+ 
++#ifdef __vita__
++extern "C" volatile unsigned int vita_gui_dirty_gen = 0;
++#endif
++
+ namespace MyGUI
+ {
+ 
+@@ -92,7 +97,7 @@
+ 			{
+ 				mNeedVertexCount -= (*iter).second;
+ 				mDrawItems.erase(iter);
+-				mOutOfDate = true;
++				mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 				mVertexBuffer->setVertexCount(mNeedVertexCount);
+ 
+@@ -121,7 +126,7 @@
+ 
+ 		mDrawItems.emplace_back(_item, _count);
+ 		mNeedVertexCount += _count;
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 		mVertexBuffer->setVertexCount(mNeedVertexCount);
+ 	}
+@@ -138,7 +143,7 @@
+ 					mNeedVertexCount -= item.second;
+ 					mNeedVertexCount += _count;
+ 					item.second = _count;
+-					mOutOfDate = true;
++					mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 					mVertexBuffer->setVertexCount(mNeedVertexCount);
+ 				}
+@@ -186,12 +191,14 @@
+ 
+ 	void RenderItem::outOfDate()
+ 	{
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 	}
  
  	bool RenderItem::isOutOfDate() const
  	{
@@ -366,9 +423,44 @@
  	}
  
  	inline float len(float x, float y)
---- a/MyGUIEngine/src/MyGUI_SharedLayer.cpp	2026-08-18 11:42:15.432749561 -0600
-+++ b/MyGUIEngine/src/MyGUI_SharedLayer.cpp	2026-08-18 11:42:15.410749561 -0600
-@@ -167,7 +167,8 @@
+--- a/MyGUIEngine/src/MyGUI_SharedLayer.cpp
++++ b/MyGUIEngine/src/MyGUI_SharedLayer.cpp
+@@ -8,6 +8,7 @@
+ #include "MyGUI_LayerItem.h"
+ #include "MyGUI_SharedLayer.h"
+ #include "MyGUI_LayerNode.h"
++#include "MyGUI_ISubWidget.h"
+ #include "MyGUI_RenderManager.h"
+ 
+ namespace MyGUI
+@@ -60,7 +61,7 @@
+ 
+ 		mChildItem->addUsing();
+ 
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 		return mChildItem;
+ 	}
+@@ -77,7 +78,7 @@
+ 				mChildItem = nullptr;
+ 			}
+ 
+-			mOutOfDate = true;
++			mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 			return;
+ 		}
+@@ -91,7 +92,7 @@
+ 		if (parent != nullptr)
+ 			parent->upChildItemNode(_item);
+ 
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 	}
+ 
+ 	ILayerItem* SharedLayer::getLayerItemByPoint(int _left, int _top) const
+@@ -167,7 +168,8 @@
  
  	bool SharedLayer::isOutOfDate() const
  	{
@@ -503,3 +595,123 @@
  	}
  
  } // namespace MyGUI
+--- a/MyGUIEngine/src/MyGUI_LayerNode.cpp
++++ b/MyGUIEngine/src/MyGUI_LayerNode.cpp
+@@ -40,7 +40,7 @@
+ 		LayerNode* layer = new LayerNode(mLayer, this);
+ 		mChildItems.push_back(layer);
+ 
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 		return layer;
+ 	}
+@@ -54,7 +54,7 @@
+ 				delete _node;
+ 				mChildItems.erase(iter);
+ 
+-				mOutOfDate = true;
++				mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 				return;
+ 			}
+@@ -71,7 +71,7 @@
+ 				mChildItems.erase(iter);
+ 				mChildItems.push_back(_item);
+ 
+-				mOutOfDate = true;
++				mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 				return;
+ 			}
+@@ -157,7 +157,7 @@
+ 		}
+ 
+ 		mOutOfDateCompression = true;
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 		// first queue keep order
+ 
+@@ -221,7 +221,7 @@
+ 		mLayerItems.push_back(_item);
+ 		_item->attachItemToNode(mLayer, this);
+ 
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 	}
+ 
+ 	void LayerNode::detachLayerItem(ILayerItem* _item)
+@@ -232,7 +232,7 @@
+ 			{
+ 				mLayerItems.erase(iter);
+ 
+-				mOutOfDate = true;
++				mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 				return;
+ 			}
+@@ -242,7 +242,7 @@
+ 
+ 	void LayerNode::outOfDate(RenderItem* _item)
+ 	{
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 		if (_item)
+ 			_item->outOfDate();
+ 	}
+--- a/MyGUIEngine/src/MyGUI_OverlappedLayer.cpp
++++ b/MyGUIEngine/src/MyGUI_OverlappedLayer.cpp
+@@ -8,6 +8,7 @@
+ #include "MyGUI_LayerItem.h"
+ #include "MyGUI_OverlappedLayer.h"
+ #include "MyGUI_LayerNode.h"
++#include "MyGUI_ISubWidget.h"
+ #include "MyGUI_RenderManager.h"
+ 
+ namespace MyGUI
+@@ -59,7 +60,7 @@
+ 		ILayerNode* node = new LayerNode(this);
+ 		mChildItems.push_back(node);
+ 
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 		return node;
+ 	}
+@@ -72,7 +73,7 @@
+ 		{
+ 			parent->destroyChildItemNode(_item);
+ 
+-			mOutOfDate = true;
++			mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 			return;
+ 		}
+@@ -85,7 +86,7 @@
+ 				delete _item;
+ 				mChildItems.erase(iter);
+ 
+-				mOutOfDate = true;
++				mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 				return;
+ 			}
+@@ -102,7 +103,7 @@
+ 		{
+ 			parent->upChildItemNode(_item);
+ 
+-			mOutOfDate = true;
++			mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 			return;
+ 		}
+@@ -117,7 +118,7 @@
+ 				mChildItems.erase(iter);
+ 				mChildItems.push_back(_item);
+ 
+-				mOutOfDate = true;
++				mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 				return;
+ 			}

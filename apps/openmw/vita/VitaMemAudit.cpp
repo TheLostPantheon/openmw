@@ -26,6 +26,8 @@ extern "C"
         cullprof_dcull, cullprof_leaves, cullprof_sg, cullprof_xf_bone;
     extern unsigned int cullprof_drw_us, cullprof_cb_us, cullprof_xf_us, cullprof_grp_us;
     extern unsigned int cullprof_stage_setup_us, cullprof_stage_trav_us, cullprof_stage_sort_us;
+    extern unsigned int osg_vita_bound_calls, osg_vita_bound_children;
+    extern unsigned int cullprof_isculled_us, cullprof_pushss_us;
     // Weak defaults: these counters came from an OSG patch and a vitaGL
     // fork lost in the Aug 2026 machine restore. A strong definition (a
     // future patch) overrides them; until then they report zero.
@@ -74,7 +76,7 @@ namespace MyGUIPlatform
 {
     extern uint32_t g_vitaGuiWalks;
     extern uint32_t g_vitaGuiSkips;
-    extern uint32_t g_vitaGuiWalkUs;
+    extern uint32_t g_vitaGuiWalkUs, g_vitaGuiCheckUs, g_vitaGuiRepeatUs;
     extern char g_vitaGuiDirtyLayers[8][24];
     extern uint32_t g_vitaGuiDirtyCounts[8];
     struct VitaDirtyRow
@@ -598,7 +600,7 @@ namespace Vita
         }
         snprintf(buf, sizeof(buf),
             "[Scene] drawables=%.0f fast=%.0f lights=%.0f bins=%.0f tris=%.0f strips=%.0f lightCb=%u/%.2fms "
-            "glmemo=%u/%u vprog=%u/%u bin2=%u/%u gui=%u/%u guiwalk=%.2fms",
+            "glmemo=%u/%u vprog=%u/%u bin2=%u/%u gui=%u/%u guiwalk=%.2fms guicheck=%.2fms guirepeat=%.2fms",
             countOf(camStats, "Visible number of drawables"), countOf(camStats, "Visible number of fast drawables"),
             countOf(camStats, "Visible number of lights"), countOf(camStats, "Visible number of render bins"),
             countOf(camStats, "Visible number of GL_TRIANGLES"),
@@ -609,7 +611,9 @@ namespace Vita
             vgl_vprog_hits / kReportEveryFrames, vgl_vprog_miss / kReportEveryFrames,
             vita_bin2_graphs / kReportEveryFrames, vita_bin2_leaves / kReportEveryFrames,
             MyGUIPlatform::g_vitaGuiSkips, MyGUIPlatform::g_vitaGuiWalks,
-            MyGUIPlatform::g_vitaGuiWalkUs / 1000.0 / kReportEveryFrames);
+            MyGUIPlatform::g_vitaGuiWalkUs / 1000.0 / kReportEveryFrames,
+            MyGUIPlatform::g_vitaGuiCheckUs / 1000.0 / kReportEveryFrames,
+            MyGUIPlatform::g_vitaGuiRepeatUs / 1000.0 / kReportEveryFrames);
         SceneUtil::gLightCbCalls = 0;
         SceneUtil::gLightCbUs = 0;
         vgl_memo_hits = vgl_memo_miss = 0;
@@ -652,7 +656,7 @@ namespace Vita
             }
         }
         MyGUIPlatform::g_vitaGuiSkips = MyGUIPlatform::g_vitaGuiWalks = 0;
-        MyGUIPlatform::g_vitaGuiWalkUs = 0;
+        MyGUIPlatform::g_vitaGuiWalkUs = MyGUIPlatform::g_vitaGuiCheckUs = MyGUIPlatform::g_vitaGuiRepeatUs = 0;
         auditLog(buf);
 
         // Per-leaf OSG draw-dispatch cost (probes in RenderLeaf.cpp).
@@ -686,12 +690,20 @@ namespace Vita
                 8.0 * cullprof_grp_us / 1000.0 / kReportEveryFrames,
                 8.0 * cullprof_xfbound_us / 1000.0 / kReportEveryFrames, cullprof_crep_drop / kReportEveryFrames);
             auditLog(buf);
-            snprintf(buf, sizeof(buf), "[CullStage] setup=%.2f trav=%.2f sort=%.2f ms/frame (sampled 1/8)",
+            snprintf(buf, sizeof(buf),
+                "[CullStage] setup=%.2f trav=%.2f sort=%.2f | grp+xf: isculled=%.2f pushss=%.2f ms/frame (sampled 1/8)",
                 8.0 * cullprof_stage_setup_us / 1000.0 / kReportEveryFrames,
                 8.0 * cullprof_stage_trav_us / 1000.0 / kReportEveryFrames,
-                8.0 * cullprof_stage_sort_us / 1000.0 / kReportEveryFrames);
+                8.0 * cullprof_stage_sort_us / 1000.0 / kReportEveryFrames,
+                8.0 * cullprof_isculled_us / 1000.0 / kReportEveryFrames,
+                8.0 * cullprof_pushss_us / 1000.0 / kReportEveryFrames);
             auditLog(buf);
             cullprof_stage_setup_us = cullprof_stage_trav_us = cullprof_stage_sort_us = 0;
+            cullprof_isculled_us = cullprof_pushss_us = 0;
+            snprintf(buf, sizeof(buf), "[Bounds] recompute=%u children=%u /frame",
+                osg_vita_bound_calls / kReportEveryFrames, osg_vita_bound_children / kReportEveryFrames);
+            auditLog(buf);
+            osg_vita_bound_calls = osg_vita_bound_children = 0;
         }
         cullprof_node = cullprof_group = cullprof_transform = cullprof_geode = 0;
         cullprof_drawable = cullprof_dcull = cullprof_leaves = cullprof_sg = 0;

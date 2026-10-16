@@ -81,7 +81,7 @@ def summarize(path):
             # cull cost by subtree (VitaCullTimer)
             ("cull.total", "[CullTree]", "total"), ("cull.sky_other (old logs)", "[CullTree]", "sky/other"),
             ("cull.gui", "[CullTree]", "gui"), ("cull.other", "[CullTree]", "other"),
-            ("gui_walk_ms", "[Scene]", "guiwalk"),
+            ("gui_walk_ms", "[Scene]", "guiwalk"), ("gui_check_ms", "[Scene]", "guicheck"), ("gui_repeat_ms", "[Scene]", "guirepeat"),
             ("cull.terrain_water_fx", "[CullTree]", "terrain/water/fx"), ("cull.statics", "[CullTree]", "statics"),
             ("cull.actors", "[CullTree]", "actors"),
             # sampled cull timers (1 frame in 8, scaled): drawable applies,
@@ -89,7 +89,9 @@ def summarize(path):
             ("cullp.drawables", "[CullProf]", "dus"), ("cullp.drawable_cbs", "[CullProf]", "cbus"),
             ("cullp.transforms", "[CullProf]", "xfus"), ("cullp.groups", "[CullProf]", "gus"),
             ("cullstage.setup", "[CullStage]", "setup"), ("cullstage.traverse", "[CullStage]", "trav"),
-            ("cullstage.sort_prune", "[CullStage]", "sort")]:
+            ("cullstage.sort_prune", "[CullStage]", "sort"),
+            ("cullstage.isculled", "[CullStage]", "isculled"), ("cullstage.pushss", "[CullStage]", "pushss"),
+            ("bounds.recompute_per_frame", "[Bounds]", "recompute"), ("bounds.children_per_frame", "[Bounds]", "children")]:
         v = [x for x in series(L, tag, key) if x >= 0]
         s[name] = round(statistics.median(v), 1) if v else None
     adds = {"fit": 0, "urg": 0, "starve": 0}

@@ -947,8 +947,25 @@ namespace MWGui
             mMap->setPlayerDir(playerdirection.x(), playerdirection.y());
             mMap->setPlayerPos(x, y, u, v);
         }
-        if (mHud->isVisible())
+        // Experiment (ux0:data/openmw/minimaphz.txt holding N): move the HUD
+        // minimap and compass at most N times a second. Each move re-lays
+        // out every map tile and door marker and rebuilds the whole GUI
+        // (~2.2 ms in cull).
+        static const float sMinimapPeriod = [] {
+            float hz = 0.f;
+            if (FILE* f = fopen("ux0:data/openmw/minimaphz.txt", "r"))
+            {
+                if (fscanf(f, "%f", &hz) != 1)
+                    hz = 0.f;
+                fclose(f);
+            }
+            return hz > 0.f ? 1.f / hz : 0.f;
+        }();
+        static float sMinimapAccum = 0.f;
+        sMinimapAccum += MWBase::Environment::get().getFrameDuration();
+        if (mHud->isVisible() && sMinimapAccum >= sMinimapPeriod)
         {
+            sMinimapAccum = 0.f;
             mHud->setPlayerDir(playerdirection.x(), playerdirection.y());
             mHud->setPlayerPos(x, y, u, v);
         }

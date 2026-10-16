@@ -25,6 +25,7 @@
 #include <MyGUI_ISubWidget.h>
 #include <MyGUI_Widget.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/io/stat.h>
 namespace Vita { bool isSimThread(); }
 #endif
 
@@ -524,8 +525,9 @@ namespace MyGUIPlatform
 #ifdef __vita__
     uint32_t g_vitaGuiWalks = 0;
     uint32_t g_vitaGuiSkips = 0;
-    // Time spent in full walks (batch rebuilds), for [Scene] guiwalk.
-    uint32_t g_vitaGuiWalkUs = 0;
+    // Time spent in full walks (batch rebuilds), for [Scene] guiwalk; in the
+    // per-frame dirty check across layers, and in clean-frame batch replays.
+    uint32_t g_vitaGuiWalkUs = 0, g_vitaGuiCheckUs = 0, g_vitaGuiRepeatUs = 0;
     // Dirty attribution: every sub-widget dirty site reports (via the
     // MyGUI probe macro). Keyed by owning widget name/type + parent chain
     // + thread; top rows printed per audit window.
@@ -621,30 +623,53 @@ namespace MyGUIPlatform
         // (main joins it: this is critical-path). MyGUI tracks widget
         // dirtiness per layer node; when nothing changed, re-emit last
         // frame's batches instead of rebuilding them. mUpdate (resize/theme)
-        // still forces a walk, as does any layer type without dirty tracking
-        // (ILayer::isOutOfDate defaults true).
+        // still forces a walk. Every OpenMW layer (files/data/mygui/
+        // openmw_layers.xml) is a shared or overlapped layer, both tracked.
+        // What changed is known from MyGUI's own out-of-date marks: a dirty
+        // generation (MyGUI patch, vita_gui_dirty_gen) moves whenever a
+        // layer, layer node or render item is marked. Comparing it replaces
+        // walking every layer each frame to ask (1.3 ms/frame in the city,
+        // as much as the rebuilds). noguigen.txt restores the walk for A/B;
+        // guidirty.txt attribution needs the walk to name the layer.
+        static const bool sUseGen = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/noguigen.txt", &st) < 0;
+        }();
+        static unsigned int sWalkedGen = ~0u;
+        const unsigned int gen = vita_gui_dirty_gen;
         if (!mUpdate)
         {
+            const uint64_t checkT0 = sceKernelGetProcessTimeWide();
             bool anyDirty = false;
-            MyGUI::LayerManager::EnumeratorLayer layers
-                = MyGUI::LayerManager::getInstance().getEnumerator();
-            while (layers.next())
+            if (sUseGen && !g_vitaGuiDirtyEnabled)
+                anyDirty = gen != sWalkedGen;
+            else
             {
-                if (layers.current()->isOutOfDate())
+                MyGUI::LayerManager::EnumeratorLayer layers = MyGUI::LayerManager::getInstance().getEnumerator();
+                while (layers.next())
                 {
-                    if (!anyDirty)
-                        vitaNoteDirtyLayer(layers.current()->getName());
-                    anyDirty = true;
-                    break;
+                    if (layers.current()->isOutOfDate())
+                    {
+                        if (!anyDirty)
+                            vitaNoteDirtyLayer(layers.current()->getName());
+                        anyDirty = true;
+                        break;
+                    }
                 }
             }
+            const uint64_t checkT1 = sceKernelGetProcessTimeWide();
+            g_vitaGuiCheckUs += (uint32_t)(checkT1 - checkT0);
             if (!anyDirty)
             {
                 mDrawable->repeatLastBatches();
+                g_vitaGuiRepeatUs += (uint32_t)(sceKernelGetProcessTimeWide() - checkT1);
                 ++g_vitaGuiSkips;
                 return;
             }
         }
+        // Marks made during the walk show up as a newer generation: one
+        // extra walk next frame, never a missed change.
+        sWalkedGen = gen;
         ++g_vitaGuiWalks;
         const uint64_t walkT0 = sceKernelGetProcessTimeWide();
 #endif

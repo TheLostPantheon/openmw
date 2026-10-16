@@ -958,11 +958,10 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgShadow/MinimalCullBoundsShadowMap
 diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUtil/CullVisitor.cpp
 --- a/src/osgUtil/CullVisitor.cpp
 +++ b/src/osgUtil/CullVisitor.cpp
-@@ -37,6 +37,80 @@
- 
+@@ -38,6 +38,83 @@
  using namespace osg;
  using namespace osgUtil;
-+
+ 
 +#ifdef __vita__
 +#include <psp2/kernel/processmgr.h>
 +extern "C" {
@@ -977,6 +976,9 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
 +    // SceneView::cullStage split (sampled): setup before the traversal
 +    // (render graph clean, stage reset), the traversal, sort + prune after.
 +    unsigned int cullprof_stage_setup_us = 0, cullprof_stage_trav_us = 0, cullprof_stage_sort_us = 0;
++    // Parts of the Group/Transform exclusive times (sampled): visibility test
++    // (bound fetch + frustum/small-feature), and state set pushes.
++    unsigned int cullprof_isculled_us = 0, cullprof_pushss_us = 0;
 +}
 +#include <cstdio>
 +namespace
@@ -1036,10 +1038,11 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
 +#define CULLPROF_ADD(var, t0)
 +#define CULLPROF_CB_NOTE(name, owner, us)
 +#endif
- 
++
  inline float MAX_F(float a, float b)
      { return a>b?a:b; }
-@@ -861,6 +935,7 @@
+ inline int EQUAL_F(float a, float b)
+@@ -861,6 +938,7 @@
  
  void CullVisitor::apply(Node& node)
  {
@@ -1047,7 +1050,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
      if (isCulled(node)) return;
  
      // push the culling mode.
-@@ -882,6 +957,7 @@
+@@ -882,6 +960,7 @@
  
  void CullVisitor::apply(Geode& node)
  {
@@ -1055,7 +1058,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
      if (isCulled(node)) return;
  
      // push the culling mode.
-@@ -902,24 +978,52 @@
+@@ -902,24 +981,52 @@
  
  void CullVisitor::apply(osg::Drawable& drawable)
  {
@@ -1110,7 +1113,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  
  
      if (_computeNearFar && bb.valid())
-@@ -969,6 +1073,7 @@
+@@ -969,6 +1076,7 @@
      }
      else
      {
@@ -1118,14 +1121,16 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
          addDrawableAndDepth(&drawable,&matrix,depth);
      }
  
-@@ -1136,7 +1241,13 @@
+@@ -1136,41 +1244,76 @@
  
  void CullVisitor::apply(Group& node)
  {
 -    if (isCulled(node)) return;
 +    CULLPROF_INC(cullprof_group);
 +    const unsigned int grp0 = CULLPROF_T();
-+    if (isCulled(node))
++    const bool grpCulled = isCulled(node);
++    CULLPROF_ADD(cullprof_isculled_us, grp0)
++    if (grpCulled)
 +    {
 +        CULLPROF_ADD(cullprof_grp_us, grp0)
 +        return;
@@ -1133,9 +1138,16 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  
      // push the culling mode.
      pushCurrentMask();
-@@ -1145,18 +1256,31 @@
+ 
+     // push the node's state.
      StateSet* node_state = node.getStateSet();
-     if (node_state) pushStateSet(node_state);
+-    if (node_state) pushStateSet(node_state);
++    if (node_state)
++    {
++        const unsigned int ss0 = CULLPROF_T();
++        pushStateSet(node_state);
++        CULLPROF_ADD(cullprof_pushss_us, ss0)
++    }
  
 +    CULLPROF_ADD(cullprof_grp_us, grp0)
      handle_cull_callbacks_and_traverse(node);
@@ -1158,7 +1170,9 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
 +        ++cullprof_xf_bone;
 +#endif
 +    const unsigned int xf0 = CULLPROF_T();
-+    if (isCulled(node))
++    const bool xfCulled = isCulled(node);
++    CULLPROF_ADD(cullprof_isculled_us, xf0)
++    if (xfCulled)
 +    {
 +        CULLPROF_ADD(cullprof_xf_us, xf0)
 +        return;
@@ -1166,7 +1180,18 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  
      // push the culling mode.
      pushCurrentMask();
-@@ -1169,8 +1293,10 @@
+ 
+     // push the node's state.
+     StateSet* node_state = node.getStateSet();
+-    if (node_state) pushStateSet(node_state);
++    if (node_state)
++    {
++        const unsigned int ss0 = CULLPROF_T();
++        pushStateSet(node_state);
++        CULLPROF_ADD(cullprof_pushss_us, ss0)
++    }
+ 
+     RefMatrix* matrix = createOrReuseMatrix(*getModelViewMatrix());
      node.computeLocalToWorldMatrix(*matrix,this);
      pushModelViewMatrix(matrix, node.getReferenceFrame());
  
@@ -1177,7 +1202,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
      popModelViewMatrix();
  
      // pop the node's state off the render graph stack.
-@@ -1178,6 +1304,7 @@
+@@ -1178,6 +1321,7 @@
  
      // pop the culling mode.
      popCurrentMask();
@@ -1185,7 +1210,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  }
  
  void CullVisitor::apply(Projection& node)
-@@ -1747,3 +1874,4 @@
+@@ -1747,3 +1891,4 @@
      popCurrentMask();
  }
  
@@ -1625,7 +1650,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/RenderLeaf.cpp b/src/osgUtil
 diff -ruN '--exclude=.git' pristine-osg/src/osg/Group.cpp b/src/osg/Group.cpp
 --- a/src/osg/Group.cpp
 +++ b/src/osg/Group.cpp
-@@ -23,6 +23,131 @@
+@@ -23,6 +23,135 @@
  
  #include <algorithm>
  
@@ -1662,6 +1687,10 @@ diff -ruN '--exclude=.git' pristine-osg/src/osg/Group.cpp b/src/osg/Group.cpp
 +    // Cull traversals on another thread while snapshotting is on; they
 +    // iterate unprotected, so this should stay 0.
 +    unsigned int osg_vita_cow_foreign = 0;
++    // Bound recomputes ([Bounds] audit line): Group::computeBound calls and
++    // the children they visited. A dirty bound (a moved child, an animated
++    // bone) is recomputed on its next getBound(), usually inside cull.
++    unsigned int osg_vita_bound_calls = 0, osg_vita_bound_children = 0;
 +}
 +
 +namespace
@@ -1757,7 +1786,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osg/Group.cpp b/src/osg/Group.cpp
  using namespace osg;
  
  Group::Group()
-@@ -56,6 +181,33 @@
+@@ -56,6 +185,33 @@
  
  void Group::traverse(NodeVisitor& nv)
  {
@@ -1791,7 +1820,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osg/Group.cpp b/src/osg/Group.cpp
      for(NodeList::iterator itr=_children.begin();
          itr!=_children.end();
          ++itr)
-@@ -88,6 +240,10 @@
+@@ -88,6 +244,10 @@
  
  
      // note ref_ptr<> automatically handles incrementing child's reference count.
@@ -1802,15 +1831,15 @@ diff -ruN '--exclude=.git' pristine-osg/src/osg/Group.cpp b/src/osg/Group.cpp
      if (index >= _children.size())
      {
          index = _children.size();      // set correct index value to be passed to the "childInserted" method
-@@ -96,6 +252,7 @@
-     else
+@@ -97,6 +257,7 @@
      {
          _children.insert(_children.begin()+index, child);
-+    }
      }
++    }
  
      // register as parent of child.
-@@ -195,6 +352,20 @@
+     child->addParent(this);
+@@ -195,6 +356,20 @@
  
          childRemoved(pos,endOfRemoveRange-pos);
  
@@ -1831,7 +1860,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osg/Group.cpp b/src/osg/Group.cpp
          _children.erase(_children.begin()+pos,_children.begin()+endOfRemoveRange);
  
          if (updateCallbackRemoved)
-@@ -250,7 +421,13 @@
+@@ -250,7 +425,13 @@
  
          // note ref_ptr<> automatically handles decrementing origNode's reference count,
          // and inccrementing newNode's reference count.
@@ -1846,6 +1875,17 @@ diff -ruN '--exclude=.git' pristine-osg/src/osg/Group.cpp b/src/osg/Group.cpp
  
          // register as parent of child.
          newNode->addParent(this);
+@@ -350,6 +531,10 @@
+ 
+ BoundingSphere Group::computeBound() const
+ {
++#ifdef __vita__
++    ++osg_vita_bound_calls;
++    osg_vita_bound_children += (unsigned int)_children.size();
++#endif
+     BoundingSphere bsphere;
+     if (_children.empty())
+     {
 diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/SceneView.cpp b/src/osgUtil/SceneView.cpp
 --- a/src/osgUtil/SceneView.cpp
 +++ b/src/osgUtil/SceneView.cpp
