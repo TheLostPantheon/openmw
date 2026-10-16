@@ -52,14 +52,14 @@ namespace Vita
         {
             static const Mode sMode = [] {
                 SceIoStat st;
-                Mode m = Mode::Off;
+                Mode m = Mode::Fast;
                 if (sceIoGetstat("ux0:data/openmw/staticverify.txt", &st) >= 0)
                     m = Mode::Verify;
-                else if (sceIoGetstat("ux0:data/openmw/faststatic.txt", &st) >= 0)
-                    m = Mode::Fast;
+                else if (sceIoGetstat("ux0:data/openmw/nofaststatic.txt", &st) >= 0)
+                    m = Mode::Off;
                 breadcrumb(m == Mode::Verify ? "[Statics] verify mode (staticverify.txt): OSG renders, fast path compared"
-                        : m == Mode::Fast    ? "[Statics] fast path on (faststatic.txt)"
-                                             : "[Statics] fast path off");
+                        : m == Mode::Fast    ? "[Statics] fast path on (nofaststatic.txt turns it off)"
+                                             : "[Statics] fast path off (nofaststatic.txt)");
                 return m;
             }();
             return sMode;

@@ -17,9 +17,9 @@ namespace Vita
     /// plain static objects from a flat registry instead of OSG's per-node
     /// traversal; everything else in the tile still goes through OSG.
     ///
-    /// ux0:data/openmw/faststatic.txt turns it on; staticverify.txt instead
-    /// keeps OSG rendering and compares what the fast path would submit
-    /// against OSG's render leaves ([StaticVerify]).
+    /// On by default; ux0:data/openmw/nofaststatic.txt turns it off, and
+    /// staticverify.txt instead keeps OSG rendering and compares what the
+    /// fast path would submit against OSG's render leaves ([StaticVerify]).
     void attachStaticTileCull(osg::Group* tile);
 
     /// After the frame's cull, on the thread that culled: verify mode
