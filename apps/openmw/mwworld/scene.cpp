@@ -2950,7 +2950,7 @@ namespace MWWorld
     // bound lookup, demand touch -- each takes the preloader's mutex.
     struct VitaWarmSplit
     {
-        unsigned mCalls = 0, mColdSkips = 0;
+        unsigned mCalls = 0, mColdSkips = 0, mWarmSkips = 0;
         uint32_t mCommonUs = 0, mBoundUs = 0, mDemandUs = 0, mMaxUs = 0;
     };
     static VitaWarmSplit sWarmSplit;
@@ -3142,6 +3142,10 @@ namespace MWWorld
     {
         int vitaOps = 0;
         std::set<std::string> vitaTickCold; // per-tick memo: one consult per model
+        // Same for warm answers: approaching actors share most parts (race
+        // skins, common armour), and each consult is ~37 us of locked lookups.
+        // Value: alwaysWarm (common-warm) vs delivered (demand Ready).
+        std::unordered_map<std::string, bool> vitaTickWarm;
         // THE HYDRATOR: the whole scene is radial. Lane A (always):
         // structural render (in 6500/out 7000, inner 3000 first),
         // structural collision (3700/6000), items+lights (3000/3500),
@@ -3360,6 +3364,13 @@ namespace MWWorld
                 ++sWarmSplit.mColdSkips;
                 return false;
             }
+            if (const auto tw = vitaTickWarm.find(path); tw != vitaTickWarm.end())
+            {
+                ++sWarmSplit.mWarmSkips;
+                if (alwaysWarm && tw->second)
+                    *alwaysWarm = true;
+                return true;
+            }
             const auto w0 = Clock::now();
             const bool commonWarm = mPreloader->vitaIsCommonWarm(path);
             const uint32_t commonUs = vitaUsSince(w0);
@@ -3369,6 +3380,7 @@ namespace MWWorld
             {
                 if (alwaysWarm)
                     *alwaysWarm = true;
+                vitaTickWarm.emplace(path, true);
                 return true;
             }
             const auto w1 = Clock::now();
@@ -3394,7 +3406,10 @@ namespace MWWorld
             sWarmSplit.mDemandUs += demandUs;
             sWarmSplit.mMaxUs = std::max({ sWarmSplit.mMaxUs, boundUs, demandUs });
             if (ready)
+            {
+                vitaTickWarm.emplace(path, false);
                 return true;
+            }
             vitaTickCold.insert(std::move(path));
             return false;
         };
@@ -3510,6 +3525,7 @@ namespace MWWorld
                 // Warm-actor memo; pool relief can re-cool assets, so it is
                 // dropped whenever the ready epoch moves (new deliveries).
                 static std::set<const LiveCellRefBase*> sRing3Warm;
+                static std::unordered_map<const LiveCellRefBase*, Clock::time_point> sRing3Checked;
                 static unsigned sRing3Epoch = 0;
                 static Clock::time_point sRing3Cleared{};
                 if (guardFix)
@@ -3521,6 +3537,7 @@ namespace MWWorld
                     {
                         sRing3Cleared = tick0;
                         sRing3Warm.clear();
+                        sRing3Checked.clear();
                     }
                 }
                 else if (readyEpoch != sRing3Epoch)
@@ -3556,9 +3573,21 @@ namespace MWWorld
                             }
                             // Ring 3: actors pre-warm out to rActorWarm. Memo
                             // skips the VFS path walk once an actor is warm.
-                            if (actor && d2 < rActorWarm * rActorWarm && actorWarmFiled < 12
+                            // Not-yet-warm actors re-file their parts once a
+                            // second, not every pass: Wanted entries live 4 s
+                            // untouched, and each check is ~25+ locked consults.
+                            bool ring3Due = true;
+                            if (guardFix && actor && sRing3Warm.count(ptr.mRef) == 0)
+                            {
+                                auto& last = sRing3Checked[ptr.mRef];
+                                ring3Due = last.time_since_epoch().count() == 0
+                                    || tick0 - last >= std::chrono::seconds(1);
+                            }
+                            if (actor && ring3Due && d2 < rActorWarm * rActorWarm && actorWarmFiled < 12
                                 && sRing3Warm.count(ptr.mRef) == 0)
                             {
+                                if (guardFix)
+                                    sRing3Checked[ptr.mRef] = tick0;
                                 // An NPC's first inventory read runs its whole
                                 // ensureCustomData (spells, autocalc, AI fill,
                                 // leveled rolls, autoEquip). Unbounded here, a
@@ -4542,8 +4571,9 @@ namespace MWWorld
                 Vita::breadcrumb(pb);
                 sGuardSplit = VitaGuardSplit();
                 snprintf(pb, sizeof(pb),
-                    "[WarmSplit] calls=%u coldskip=%u common=%ums bound=%ums demand=%ums worst=%uus",
-                    sWarmSplit.mCalls, sWarmSplit.mColdSkips, sWarmSplit.mCommonUs / 1000, sWarmSplit.mBoundUs / 1000,
+                    "[WarmSplit] calls=%u coldskip=%u warmskip=%u common=%ums bound=%ums demand=%ums worst=%uus",
+                    sWarmSplit.mCalls, sWarmSplit.mColdSkips, sWarmSplit.mWarmSkips, sWarmSplit.mCommonUs / 1000,
+                    sWarmSplit.mBoundUs / 1000,
                     sWarmSplit.mDemandUs / 1000, sWarmSplit.mMaxUs);
                 Vita::breadcrumb(pb);
                 sWarmSplit = VitaWarmSplit();
