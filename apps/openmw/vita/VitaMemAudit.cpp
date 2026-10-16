@@ -25,6 +25,7 @@ extern "C"
     extern unsigned int cullprof_node, cullprof_group, cullprof_transform, cullprof_geode, cullprof_drawable,
         cullprof_dcull, cullprof_leaves, cullprof_sg, cullprof_xf_bone;
     extern unsigned int cullprof_drw_us, cullprof_cb_us, cullprof_xf_us, cullprof_grp_us;
+    extern unsigned int cullprof_stage_setup_us, cullprof_stage_trav_us, cullprof_stage_sort_us;
     // Weak defaults: these counters came from an OSG patch and a vitaGL
     // fork lost in the Aug 2026 machine restore. A strong definition (a
     // future patch) overrides them; until then they report zero.
@@ -671,19 +672,26 @@ namespace Vita
         {
             snprintf(buf, sizeof(buf),
                 "[CullProf] node=%u grp=%u xf=%u bone=%u geode=%u drw=%u dcull=%u leaves=%u crep=%u sg=%u terr=%.2fms "
-                "dus=%.2f cbus=%.2f xfus=%.2f gus=%.2f xfbnd=%.2f cdrop=%u /frame",
+                "dus=%.2f cbus=%.2f xfus=%.2f gus=%.2f xfbnd=%.2f cdrop=%u /frame (times sampled 1/8)",
                 cullprof_node / kReportEveryFrames, cullprof_group / kReportEveryFrames,
                 cullprof_transform / kReportEveryFrames, cullprof_xf_bone / kReportEveryFrames,
                 cullprof_geode / kReportEveryFrames, cullprof_drawable / kReportEveryFrames,
                 cullprof_dcull / kReportEveryFrames, cullprof_leaves / kReportEveryFrames,
                 cullprof_creplay / kReportEveryFrames, cullprof_sg / kReportEveryFrames,
                 (double)cullprof_terr_us / 1000.0 / kReportEveryFrames,
-                (double)cullprof_drw_us / 1000.0 / kReportEveryFrames,
-                (double)cullprof_cb_us / 1000.0 / kReportEveryFrames,
-                (double)cullprof_xf_us / 1000.0 / kReportEveryFrames,
-                (double)cullprof_grp_us / 1000.0 / kReportEveryFrames,
-                (double)cullprof_xfbound_us / 1000.0 / kReportEveryFrames, cullprof_crep_drop / kReportEveryFrames);
+                // Timers run on one frame in eight (engine.cpp): scale back.
+                8.0 * cullprof_drw_us / 1000.0 / kReportEveryFrames,
+                8.0 * cullprof_cb_us / 1000.0 / kReportEveryFrames,
+                8.0 * cullprof_xf_us / 1000.0 / kReportEveryFrames,
+                8.0 * cullprof_grp_us / 1000.0 / kReportEveryFrames,
+                8.0 * cullprof_xfbound_us / 1000.0 / kReportEveryFrames, cullprof_crep_drop / kReportEveryFrames);
             auditLog(buf);
+            snprintf(buf, sizeof(buf), "[CullStage] setup=%.2f trav=%.2f sort=%.2f ms/frame (sampled 1/8)",
+                8.0 * cullprof_stage_setup_us / 1000.0 / kReportEveryFrames,
+                8.0 * cullprof_stage_trav_us / 1000.0 / kReportEveryFrames,
+                8.0 * cullprof_stage_sort_us / 1000.0 / kReportEveryFrames);
+            auditLog(buf);
+            cullprof_stage_setup_us = cullprof_stage_trav_us = cullprof_stage_sort_us = 0;
         }
         cullprof_node = cullprof_group = cullprof_transform = cullprof_geode = 0;
         cullprof_drawable = cullprof_dcull = cullprof_leaves = cullprof_sg = 0;

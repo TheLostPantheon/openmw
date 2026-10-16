@@ -956,12 +956,13 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgShadow/MinimalCullBoundsShadowMap
          osg::Polytope polytope;
  #if 1
 diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUtil/CullVisitor.cpp
---- a/src/osgUtil/CullVisitor.cpp	2022-01-11 08:08:55.000000000 -0700
-+++ b/src/osgUtil/CullVisitor.cpp	2026-08-05 17:31:37.419330115 -0600
-@@ -38,6 +38,74 @@
+--- a/src/osgUtil/CullVisitor.cpp
++++ b/src/osgUtil/CullVisitor.cpp
+@@ -37,6 +37,80 @@
+ 
  using namespace osg;
  using namespace osgUtil;
- 
++
 +#ifdef __vita__
 +#include <psp2/kernel/processmgr.h>
 +extern "C" {
@@ -973,6 +974,9 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
 +    // Time buckets: drawable-apply total, cull-callback share, pre-traverse
 +    // exclusive cost of Transform/Group applies.
 +    unsigned int cullprof_drw_us = 0, cullprof_cb_us = 0, cullprof_xf_us = 0, cullprof_grp_us = 0;
++    // SceneView::cullStage split (sampled): setup before the traversal
++    // (render graph clean, stage reset), the traversal, sort + prune after.
++    unsigned int cullprof_stage_setup_us = 0, cullprof_stage_trav_us = 0, cullprof_stage_sort_us = 0;
 +}
 +#include <cstdio>
 +namespace
@@ -1018,22 +1022,24 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
 +}
 +#define CULLPROF_INC(x) (++x)
 +// Timing probes cost ~4 kernel clock reads per node visit — about 4900 per
-+// frame — so they inflated the very number they were measuring. Counts are
-+// nearly free and stay; the timers are compiled out.
-+#define CULLPROF_T() 0
-+#define CULLPROF_ADD(var, t0)
-+#define CULLPROF_CB_NOTE(name, owner, us)
++// frame — so always-on they inflated the very number they were measuring.
++// Counts are nearly free and stay; timers run only on frames the engine
++// samples (osg_vita_cullprof_sample, one frame in eight), and cost a load
++// and a branch otherwise. The audit scales the sums back to per frame.
++extern "C" { int osg_vita_cullprof_sample = 0; }
++#define CULLPROF_T() (osg_vita_cullprof_sample ? (unsigned int)sceKernelGetProcessTimeWide() : 0u)
++#define CULLPROF_ADD(var, t0) if (osg_vita_cullprof_sample) { var += (unsigned int)sceKernelGetProcessTimeWide() - (t0); }
++#define CULLPROF_CB_NOTE(name, owner, us) if (osg_vita_cullprof_sample) { cullprofCbNote(name, owner, us); }
 +#else
 +#define CULLPROF_INC(x) ((void)0)
 +#define CULLPROF_T() 0
 +#define CULLPROF_ADD(var, t0)
 +#define CULLPROF_CB_NOTE(name, owner, us)
 +#endif
-+
+ 
  inline float MAX_F(float a, float b)
      { return a>b?a:b; }
- inline int EQUAL_F(float a, float b)
-@@ -861,6 +929,7 @@
+@@ -861,6 +935,7 @@
  
  void CullVisitor::apply(Node& node)
  {
@@ -1041,7 +1047,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
      if (isCulled(node)) return;
  
      // push the culling mode.
-@@ -882,6 +951,7 @@
+@@ -882,6 +957,7 @@
  
  void CullVisitor::apply(Geode& node)
  {
@@ -1049,7 +1055,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
      if (isCulled(node)) return;
  
      // push the culling mode.
-@@ -902,24 +972,52 @@
+@@ -902,24 +978,52 @@
  
  void CullVisitor::apply(osg::Drawable& drawable)
  {
@@ -1104,7 +1110,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  
  
      if (_computeNearFar && bb.valid())
-@@ -969,6 +1067,7 @@
+@@ -969,6 +1073,7 @@
      }
      else
      {
@@ -1112,7 +1118,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
          addDrawableAndDepth(&drawable,&matrix,depth);
      }
  
-@@ -1136,7 +1235,13 @@
+@@ -1136,7 +1241,13 @@
  
  void CullVisitor::apply(Group& node)
  {
@@ -1127,7 +1133,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  
      // push the culling mode.
      pushCurrentMask();
-@@ -1145,18 +1250,31 @@
+@@ -1145,18 +1256,31 @@
      StateSet* node_state = node.getStateSet();
      if (node_state) pushStateSet(node_state);
  
@@ -1160,7 +1166,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  
      // push the culling mode.
      pushCurrentMask();
-@@ -1169,8 +1287,10 @@
+@@ -1169,8 +1293,10 @@
      node.computeLocalToWorldMatrix(*matrix,this);
      pushModelViewMatrix(matrix, node.getReferenceFrame());
  
@@ -1171,7 +1177,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
      popModelViewMatrix();
  
      // pop the node's state off the render graph stack.
-@@ -1178,6 +1298,7 @@
+@@ -1178,6 +1304,7 @@
  
      // pop the culling mode.
      popCurrentMask();
@@ -1179,7 +1185,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  }
  
  void CullVisitor::apply(Projection& node)
-@@ -1747,3 +1868,4 @@
+@@ -1747,3 +1874,4 @@
      popCurrentMask();
  }
  
@@ -1840,3 +1846,55 @@ diff -ruN '--exclude=.git' pristine-osg/src/osg/Group.cpp b/src/osg/Group.cpp
  
          // register as parent of child.
          newNode->addParent(this);
+diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/SceneView.cpp b/src/osgUtil/SceneView.cpp
+--- a/src/osgUtil/SceneView.cpp
++++ b/src/osgUtil/SceneView.cpp
+@@ -768,9 +768,19 @@
+ 
+ 
+ }
++
++#ifdef __vita__
++#include <psp2/kernel/processmgr.h>
++extern "C" int osg_vita_cullprof_sample;
++extern "C" unsigned int cullprof_stage_setup_us, cullprof_stage_trav_us, cullprof_stage_sort_us;
++#define VITA_STAGE_T() (osg_vita_cullprof_sample ? (unsigned int)sceKernelGetProcessTimeWide() : 0u)
++#else
++#define VITA_STAGE_T() 0u
++#endif
+ 
+ bool SceneView::cullStage(const osg::Matrixd& projection,const osg::Matrixd& modelview,osgUtil::CullVisitor* cullVisitor, osgUtil::StateGraph* rendergraph, osgUtil::RenderStage* renderStage, osg::Viewport *viewport)
+ {
++    const unsigned int vitaStage0 = VITA_STAGE_T();
+ 
+     if (!_camera || !viewport) return false;
+ 
+@@ -887,11 +897,13 @@
+     // traverse the scene graph to generate the rendergraph.
+     // If the camera has a cullCallback execute the callback which has the
+     // requirement that it must traverse the camera's children.
++    const unsigned int vitaStage1 = VITA_STAGE_T();
+     {
+        osg::Callback* callback = _camera->getCullCallback();
+        if (callback) callback->run(_camera.get(), cullVisitor);
+        else cullVisitor->traverse(*_camera);
+     }
++    const unsigned int vitaStage2 = VITA_STAGE_T();
+ 
+ 
+     cullVisitor->popModelViewMatrix();
+@@ -914,6 +926,14 @@
+ 
+     // set the number of dynamic objects in the scene.
+     _dynamicObjectCount += renderStage->computeNumberOfDynamicRenderLeaves();
++#ifdef __vita__
++    if (osg_vita_cullprof_sample)
++    {
++        cullprof_stage_setup_us += vitaStage1 - vitaStage0;
++        cullprof_stage_trav_us += vitaStage2 - vitaStage1;
++        cullprof_stage_sort_us += (unsigned int)sceKernelGetProcessTimeWide() - vitaStage2;
++    }
++#endif
+ 
+ 
+     bool computeNearFar = (cullVisitor->getComputeNearFarMode()!=osgUtil::CullVisitor::DO_NOT_COMPUTE_NEAR_FAR) && getSceneData()!=0;

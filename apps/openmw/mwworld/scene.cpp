@@ -262,12 +262,17 @@ namespace
     // ring, which only acts on rendered objects that lack a collider.
     unsigned sVitaRenderGen = 0;
 
-    // Scan windows (ms) for the contact ring and radial scan. Experiment
-    // toggle ux0:data/openmw/scanms.txt holding "<contact> <radial>"
-    // (default 3 2): sizes what the scans cost the frame in the city.
-    void vitaScanWindowsMs(int& contactMs, int& radialMs)
+    // Scan windows (ms) for the contact ring and radial scan. Both used to
+    // spend 3 + 2 ms every frame; in the city (over the frame target) that
+    // came straight off the frame. 1 + 1 measured 41.5 -> 40.1 ms average,
+    // 17% -> 12% of frames over 50 ms on the inner-Balmora route with the
+    // same objects and colliders loaded by its end (2026-10-16). Catch-up
+    // (fast travel, the seconds after a crossing, a deep backlog) keeps the
+    // old 3 + 2. ux0:data/openmw/scanms.txt holding "<contact> <radial>"
+    // overrides both for experiments.
+    void vitaScanWindowsMs(bool catchUp, int& contactMs, int& radialMs)
     {
-        static int sContact = 3, sRadial = 2;
+        static int sContact = -1, sRadial = -1;
         static const bool sRead = [] {
             if (FILE* f = fopen("ux0:data/openmw/scanms.txt", "r"))
             {
@@ -285,8 +290,8 @@ namespace
             return true;
         }();
         (void)sRead;
-        contactMs = sContact;
-        radialMs = sRadial;
+        contactMs = sContact >= 0 ? sContact : (catchUp ? 3 : 1);
+        radialMs = sRadial >= 0 ? sRadial : (catchUp ? 2 : 1);
     }
 
     // Idle gates on the contact ring and radial scan (vitaBubbleTick):
@@ -3579,7 +3584,7 @@ namespace MWWorld
             int contactPending = 0;
             bool contactComplete = true;
             int vitaContactMs = 3, vitaRadialMs = 2;
-            vitaScanWindowsMs(vitaContactMs, vitaRadialMs);
+            vitaScanWindowsMs(vitaCatchUp, vitaContactMs, vitaRadialMs);
             const auto contactDeadline = Clock::now() + std::chrono::milliseconds(vitaContactMs);
             for (std::size_t ci = 0; !sContactIdle && ci < n; ++ci)
             {
@@ -3743,7 +3748,7 @@ namespace MWWorld
             // telemetry: scan=prog cands=0 forever; the whole queue was a
             // silent no-op while other lanes masked it).
             int vitaContactMs = 3, vitaRadialMs = 2;
-            vitaScanWindowsMs(vitaContactMs, vitaRadialMs);
+            vitaScanWindowsMs(vitaCatchUp, vitaContactMs, vitaRadialMs);
             const auto scanDeadline = Clock::now() + std::chrono::milliseconds(vitaRadialMs);
             for (; sRadScanInProgress && sRadScanCursor < n && Clock::now() < scanDeadline;)
             {

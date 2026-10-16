@@ -48,6 +48,8 @@ extern "C" uint32_t vita_cullfence_us, vita_gl_cull_us, vita_cullongl_frames;
 // OSG patch (Group.cpp): cull-thread child-list snapshots.
 extern "C" void osg_vita_cow_enable(int on);
 extern "C" void osg_vita_cow_set_writer(void);
+// OSG patch (CullVisitor.cpp): cull timers run on frames with this set.
+extern "C" int osg_vita_cullprof_sample;
 extern "C" void osg_vita_cow_drain(void);
 
 namespace
@@ -857,6 +859,9 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 #ifdef __vita__
     vitaMainPhase("render");
     const uint64_t renderStartUs = sceKernelGetProcessTimeWide();
+    // Sampled cull profiling ([CullProf] times, [CullStage]): one frame in
+    // eight pays the per-node clock reads; set before cull is kicked.
+    osg_vita_cullprof_sample = (frameNumber & 7u) == 0;
     if (mSimWorker && mSimOverlap && mCullOverlap && mCullOnGL)
     {
         // Cull on GL (docs/vita/frame-pipeline-redesign.md): the worker runs
