@@ -154,11 +154,14 @@ def main():
     ap.add_argument("--timeout", type=float, default=900)
     ap.add_argument("--route", help="route file in ux0:data/openmw/bench/ (default route.txt)")
     ap.add_argument("--settle", type=float, help="seconds at the route start before timing (default 2)")
+    ap.add_argument("--fps", type=float, help="session frame cap and streaming target (0 = uncapped, target 60)")
     args = ap.parse_args()
     if args.route:
         BENCH_OPTIONS.append(f"route={args.route}")
     if args.settle is not None:
         BENCH_OPTIONS.append(f"settle={args.settle:g}")
+    if args.fps is not None:
+        BENCH_OPTIONS.append(f"fps={args.fps:g}")
 
     if args.deploy:
         say(dev.tool_deploy({}))

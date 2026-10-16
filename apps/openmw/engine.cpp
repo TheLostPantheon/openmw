@@ -26,6 +26,7 @@
 #ifdef __vita__
 #include "vita/VitaBench.h"
 #include "vita/VitaCullTimer.h"
+#include "vita/VitaStaticRenderer.h"
 #include "vita/VitaInit.h"
 #include "vita/VitaMemAudit.h"
 #include "vita/VitaSimWorker.h"
@@ -626,6 +627,10 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         vitaJoinFrame();
         // Benchmark record/replay (VitaBench.h): no-op unless toggled.
         Vita::benchTick(frametime);
+        // [Subtrees] timers go on new scene-root children here, where no
+        // cull or update traversal is running (the audit runs mid-job).
+        if ((frameNumber & 127u) == 0 && mViewer->getSceneData())
+            Vita::attachSubtreeTimers(mViewer->getSceneData()->asGroup());
         phase_fin_us = (uint32_t)(sceKernelGetProcessTimeWide() - vitaFrameT0);
         vitaMainPhase("input");
 #endif
@@ -924,6 +929,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             const uint64_t cullT0 = sceKernelGetProcessTimeWide();
             vita_simjob_upd_us += (uint32_t)(cullT0 - jobT0);
             renderer->cull();
+            Vita::staticVerifyAfterCull(); // no-op unless staticverify.txt
             const uint64_t simT0 = sceKernelGetProcessTimeWide();
             vita_simjob_cull_us += (uint32_t)(simT0 - cullT0);
             runSimPhases(frameStart, nextFrame, nextDt, nextPaused);
@@ -1823,6 +1829,16 @@ void OMW::Engine::go()
     mViewer->setUseConfigureAffinity(false);
 
     mEnvironment.setFrameRateLimit(Settings::video().mFramerateLimit);
+#ifdef __vita__
+    if (Vita::benchFrameCap() >= 0.f)
+    {
+        mEnvironment.setFrameRateLimit(Vita::benchFrameCap());
+        char b[96];
+        snprintf(b, sizeof(b), "[Bench] fps option: frame cap %.0f, streaming target %.0f", Vita::benchFrameCap(),
+            Vita::benchStreamingTarget());
+        Vita::breadcrumb(b);
+    }
+#endif
 
     prepareEngine();
 

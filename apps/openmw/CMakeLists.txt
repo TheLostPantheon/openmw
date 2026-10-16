@@ -15,6 +15,7 @@ if(VITA)
         vita/VitaCullTimer.cpp
         vita/VitaLogServer.cpp
         vita/VitaBench.cpp
+        vita/VitaStaticRenderer.cpp
     )
 endif()
 

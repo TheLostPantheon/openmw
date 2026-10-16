@@ -12,6 +12,7 @@
 #include <malloc.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/io/stat.h>
+#include "../vita/VitaBench.h"
 #include <osg/Billboard>
 #include <osg/Geometry>
 #include <osg/LOD>
@@ -3052,7 +3053,8 @@ namespace MWWorld
             {
                 // Same [Cells] target framerate the GL precompile budget
                 // uses — one notion of "target" for the whole engine.
-                const float fps = Settings::cells().mTargetFramerate;
+                const float fps = Vita::benchStreamingTarget() > 0.f ? Vita::benchStreamingTarget()
+                                                                     : (float)Settings::cells().mTargetFramerate;
                 const int targetFrameMs = fps > 1.f ? (int)(1000.f / fps) : 33;
                 constexpr int kFloorMs = 2; // never stall streaming outright
                 constexpr int kCeilMs = 16; // one tick must not become a hitch

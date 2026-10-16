@@ -2,6 +2,7 @@
 
 #include "VitaMemAudit.h"
 #include "VitaCullTimer.h"
+#include "VitaStaticRenderer.h"
 #include "VitaInit.h"
 #include "VitaSimWorker.h"
 
@@ -759,6 +760,22 @@ namespace Vita
                 gCullTreeUs[i] = 0;
                 gCullTreeVisits[i] = 0;
             }
+            // Static fast path (docs/vita/static-renderer.md).
+            {
+                char st[512];
+                if (staticReport(st, sizeof(st), kReportEveryFrames) > 0)
+                    auditLog(st);
+                if (staticVerifyReport(st, sizeof(st)) > 0)
+                    auditLog(st);
+            }
+            // Cull/update ms per frame by named subtree (cull/update pairs).
+            char sb[256];
+            if (subtreeReport(sb, sizeof(sb), kReportEveryFrames) > 0)
+            {
+                snprintf(buf, sizeof(buf), "[Subtrees] cull/update %s", sb);
+                auditLog(buf);
+            }
+
         }
         vita_sim_script_us = vita_sim_mech_us = vita_sim_phys_us = vita_sim_gscript_us = 0;
 

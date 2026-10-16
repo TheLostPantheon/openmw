@@ -28,6 +28,7 @@ extern uint32_t vita_anim_inst_us, vita_anim_tribip_us, vita_anim_kf_us, vita_an
 #ifdef __vita__
 #include "../vita/VitaCullTimer.h"
 #include "../vita/VitaInit.h"
+#include "../vita/VitaStaticRenderer.h"
 #endif
 
 namespace MWRender
@@ -79,6 +80,9 @@ namespace MWRender
         {
             osg::ref_ptr<osg::Group> bucket = new osg::Group;
             bucket->setName("Cell Tile");
+            // Plain statics in the tile cull from a flat registry
+            // (docs/vita/static-renderer.md); no-op unless enabled.
+            Vita::attachStaticTileCull(bucket.get());
             cellnode->addChild(bucket);
             it = buckets.emplace(key, std::move(bucket)).first;
         }

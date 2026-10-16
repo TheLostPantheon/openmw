@@ -60,6 +60,7 @@ namespace Vita
             std::string mSave;
             std::string mRoute = kRoute; // replay: "route=<file in bench/>"
             float mSettleSeconds = 2.f; // replay: "settle=<seconds>" before timing
+            float mFps = -1.f; // replay: "fps=<n>" frame cap and streaming target (0: no cap, target 60)
             bool mExit = false;
         };
 
@@ -86,6 +87,8 @@ namespace Vita
                             c.mRoute = std::string(kDir) + "/" + (line + 6);
                         else if (strncmp(line, "settle=", 7) == 0)
                             c.mSettleSeconds = (float)atof(line + 7);
+                        else if (strncmp(line, "fps=", 4) == 0)
+                            c.mFps = (float)atof(line + 4);
                         else if (strcmp(line, "exit") == 0)
                             c.mExit = true;
                     }
@@ -425,6 +428,20 @@ namespace Vita
     bool benchReplayActive()
     {
         return config().mMode == Mode::Replay;
+    }
+
+    float benchFrameCap()
+    {
+        const Config& c = config();
+        return c.mMode == Mode::Replay ? c.mFps : -1.f;
+    }
+
+    float benchStreamingTarget()
+    {
+        const Config& c = config();
+        if (c.mMode != Mode::Replay || c.mFps < 0.f)
+            return -1.f;
+        return c.mFps > 0.f ? c.mFps : 60.f;
     }
 
     void benchApplyMove()

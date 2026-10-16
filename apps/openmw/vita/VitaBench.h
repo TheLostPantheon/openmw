@@ -37,6 +37,13 @@ namespace Vita
     /// Replay mode is on (bench.txt).
     bool benchReplayActive();
 
+    /// Replay "fps=<n>" option, or -1: the frame cap (0 = none) and the
+    /// streaming budget's target frame rate for this session only, so a
+    /// benchmark can measure headroom above the 30 fps cap. Settings on
+    /// disk are untouched.
+    float benchFrameCap();
+    float benchStreamingTarget();
+
     /// Replay: apply the player move benchTick computed for this frame. Start
     /// of the sim job, the thread where scripts move objects too.
     void benchApplyMove();

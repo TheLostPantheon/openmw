@@ -225,6 +225,8 @@ namespace
                         "[Deadman] main silent %us phase=%s gl=%d(%us,%s) sim=%d draw=%d\n",
                         (unsigned)((now - hb) / 1000000ULL), ph ? ph : "?", vita_gl_busy, glAgeS,
                         glp ? glp : "?", vita_sim_busy, vita_draw_inflight);
+                    if (n >= (int)sizeof(db))
+                        n = (int)sizeof(db) - 1;
                     if (n > 0)
                         logAppend(db, (size_t)n);
                 }
@@ -368,8 +370,15 @@ void vitaMemBreadcrumb(const char* msg)
         s_freeKB = (unsigned int)(mi.fordblks / 1024);
         s_miAt = now;
     }
-    char buf[300];
+    char buf[640];
     int len = snprintf(buf, sizeof(buf), "[VitaMem] %s | used: %uKB | free: %uKB\n", msg, s_usedKB, s_freeKB);
+    // snprintf returns the untruncated length: appending that much read past
+    // the buffer and put stack bytes into boot.log on long audit lines.
+    if (len >= (int)sizeof(buf))
+    {
+        len = (int)sizeof(buf) - 1;
+        buf[len - 1] = '\n';
+    }
     if (len > 0)
         logAppend(buf, (size_t)len);
 }
