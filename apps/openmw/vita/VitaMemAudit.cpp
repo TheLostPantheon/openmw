@@ -86,8 +86,8 @@ extern "C"
 namespace MyGUIPlatform
 {
     extern uint32_t g_vitaGuiWalks;
-    extern char g_vitaGuiLayerNames[12][24];
-    extern uint32_t g_vitaGuiLayerUs[12], g_vitaGuiLayerBatches[12];
+    extern char g_vitaGuiLayerNames[32][24];
+    extern uint32_t g_vitaGuiLayerUs[32], g_vitaGuiLayerBatches[32];
     extern uint32_t g_vitaGuiSkips;
     extern uint32_t g_vitaGuiWalkUs, g_vitaGuiCheckUs, g_vitaGuiRepeatUs;
     extern char g_vitaGuiDirtyLayers[8][24];
@@ -635,14 +635,19 @@ namespace Vita
         if (MyGUIPlatform::g_vitaGuiWalks > 0 && MyGUIPlatform::g_vitaGuiLayerNames[0][0])
         {
             // Per-walk averages (guiprof.txt): which layer the rebuild spends in.
-            char gl[400];
+            // Layers under 5 us a walk with no batches are left out.
+            char gl[800];
             const unsigned walks = MyGUIPlatform::g_vitaGuiWalks;
             int n = snprintf(gl, sizeof(gl), "[GuiLayers] per walk (%u walks):", walks);
-            for (int i = 0; i < 12 && MyGUIPlatform::g_vitaGuiLayerNames[i][0] && n > 0 && n < (int)sizeof(gl); ++i)
+            for (int i = 0; i < 32 && MyGUIPlatform::g_vitaGuiLayerNames[i][0] && n > 0 && n < (int)sizeof(gl); ++i)
             {
-                n += snprintf(gl + n, sizeof(gl) - n, " %s=%.2fms/%ub", MyGUIPlatform::g_vitaGuiLayerNames[i],
-                    MyGUIPlatform::g_vitaGuiLayerUs[i] / 1000.0 / walks, MyGUIPlatform::g_vitaGuiLayerBatches[i] / walks);
+                const unsigned us = MyGUIPlatform::g_vitaGuiLayerUs[i];
+                const unsigned batches = MyGUIPlatform::g_vitaGuiLayerBatches[i];
                 MyGUIPlatform::g_vitaGuiLayerUs[i] = MyGUIPlatform::g_vitaGuiLayerBatches[i] = 0;
+                if (us < 5 * walks && batches == 0)
+                    continue;
+                n += snprintf(gl + n, sizeof(gl) - n, " %s=%.2fms/%ub", MyGUIPlatform::g_vitaGuiLayerNames[i],
+                    us / 1000.0 / walks, batches / walks);
             }
             auditLog(gl);
         }

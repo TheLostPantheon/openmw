@@ -16,11 +16,13 @@
 #include <components/esm3/loadcell.hpp>
 
 #include "../mwbase/environment.hpp"
+#include "../mwbase/inputmanager.hpp"
 #include "../mwbase/rotationflags.hpp"
 #include "../mwbase/statemanager.hpp"
 #include "../mwbase/world.hpp"
 #include "../mwworld/cellstore.hpp"
 #include "../mwworld/ptr.hpp"
+#include "../mwinput/actions.hpp"
 
 #include "VitaBuildInfo.h"
 #include "VitaInit.h"
@@ -61,6 +63,9 @@ namespace Vita
             std::string mRoute = kRoute; // replay: "route=<file in bench/>"
             float mSettleSeconds = 2.f; // replay: "settle=<seconds>" before timing
             float mFps = -1.f; // replay: "fps=<n>" frame cap and streaming target (0: no cap, target 60)
+            // replay: "shot=<s>[,<s>...]" screenshots that many seconds after
+            // the start is placed, with the touch-zone overlay shown first
+            std::vector<float> mShots;
             bool mExit = false;
         };
 
@@ -89,6 +94,16 @@ namespace Vita
                             c.mSettleSeconds = (float)atof(line + 7);
                         else if (strncmp(line, "fps=", 4) == 0)
                             c.mFps = (float)atof(line + 4);
+                        else if (strncmp(line, "shot=", 5) == 0)
+                        {
+                            for (const char* p = line + 5; *p;)
+                            {
+                                c.mShots.push_back((float)atof(p));
+                                p += strcspn(p, ",");
+                                if (*p == ',')
+                                    ++p;
+                            }
+                        }
                         else if (strcmp(line, "exit") == 0)
                             c.mExit = true;
                     }
@@ -182,6 +197,8 @@ namespace Vita
             size_t mCursor = 0;
             bool mPlaced = false; // at the route's first sample, loaded
             double mSettleUntil = 0; // timing starts once streaming has settled here
+            double mPlacedAt = 0;
+            size_t mNextShot = 0;
             std::string mCurrentCell;
             std::vector<float> mFrameMs;
             std::vector<float> mWorkMs; // frame time minus the frame cap's pacing wait
@@ -320,7 +337,17 @@ namespace Vita
                     // Let streaming settle at the start point before timing: the
                     // post-load fill is not what a route measures.
                     mSettleUntil = nowSeconds() + config().mSettleSeconds;
+                    mPlacedAt = nowSeconds();
+                    if (!config().mShots.empty())
+                        MWBase::Environment::get().getInputManager()->vitaShowTouchIntro();
                     return;
+                }
+                while (mNextShot < config().mShots.size()
+                    && nowSeconds() - mPlacedAt >= config().mShots[mNextShot])
+                {
+                    ++mNextShot;
+                    breadcrumb("[Bench] screenshot");
+                    MWBase::Environment::get().getInputManager()->executeAction(MWInput::A_Screenshot);
                 }
                 if (nowSeconds() < mSettleUntil)
                     return;

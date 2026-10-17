@@ -104,6 +104,32 @@ def results_lines(run_dir, name):
         return []
 
 
+SHOTS_DIR = "ux0:/data/openmw/screenshots"
+
+
+def screenshot_names():
+    ftp = dev.connect()
+    try:
+        return [ln.split(None, 8)[8] for ln in dev.listing(ftp, SHOTS_DIR) if len(ln.split(None, 8)) == 9
+                and not ln.startswith("d")]
+    finally:
+        ftp.quit()
+
+
+def fetch_screenshots(run_dir, before):
+    new = sorted(set(screenshot_names()) - before)
+    ftp = dev.connect()
+    try:
+        for name in new:
+            with open(os.path.join(run_dir, name), "wb") as f:
+                f.write(dev.fetch(ftp, f"{SHOTS_DIR}/{name}"))
+            say(f"screenshot: {os.path.join(run_dir, name)}")
+    finally:
+        ftp.quit()
+    if not new:
+        say("no new screenshots on the device")
+
+
 def ftp_up():
     import socket
 
@@ -155,6 +181,8 @@ def main():
     ap.add_argument("--route", help="route file in ux0:data/openmw/bench/ (default route.txt)")
     ap.add_argument("--settle", type=float, help="seconds at the route start before timing (default 2)")
     ap.add_argument("--fps", type=float, help="session frame cap and streaming target (0 = uncapped, target 60)")
+    ap.add_argument("--shot", help="screenshot times in seconds after the route start is placed, e.g. 2,3.5; "
+                    "shows the touch-zone overlay and fetches the images into the run dir")
     args = ap.parse_args()
     if args.route:
         BENCH_OPTIONS.append(f"route={args.route}")
@@ -162,6 +190,8 @@ def main():
         BENCH_OPTIONS.append(f"settle={args.settle:g}")
     if args.fps is not None:
         BENCH_OPTIONS.append(f"fps={args.fps:g}")
+    if args.shot:
+        BENCH_OPTIONS.append(f"shot={args.shot}")
 
     if args.deploy:
         say(dev.tool_deploy({}))
@@ -192,6 +222,7 @@ def main():
     log = os.path.join(run_dir, "boot.log")
 
     before = results_lines(run_dir, "results.before.txt")
+    shots_before = set(screenshot_names()) if args.shot else set()
     say(f"front app after launch: {launch(TITLE)}")
     rc = subprocess.call([sys.executable, os.path.join(HERE, "vita_logtail.py"), "--host", HOST, "--out", log,
                           "--until", r"\[Bench\] done", "--timeout", str(args.timeout)])
@@ -212,6 +243,8 @@ def main():
             result = after[-1]
             outcome = "done"
     say(f"result: {result or '(no result line)'}")
+    if args.shot:
+        fetch_screenshots(run_dir, shots_before)
     # Leave the device as it plays normally: bench.txt would make every
     # manual launch replay the route and quit, and a toggle this run turned
     # on (e.g. an A/B "off" switch) would silently persist into play and

@@ -34,6 +34,20 @@
 
 namespace MWGui
 {
+    namespace
+    {
+        // The quick keys menu shows a spell by its first effect's big icon.
+        VFS::Path::Normalized spellIconPath(const ESM::Spell& spell)
+        {
+            const ESM::MagicEffect* effect = MWBase::Environment::get().getESMStore()->get<ESM::MagicEffect>().find(
+                spell.mEffects.mList.front().mData.mEffectID);
+            std::string path = effect->mIcon;
+            std::replace(path.begin(), path.end(), '/', '\\');
+            path.insert(path.rfind('\\') + 1, "b_");
+            return Misc::ResourceHelpers::correctIconPath(
+                VFS::Path::toNormalized(path), *MWBase::Environment::get().getResourceSystem()->getVFS());
+        }
+    }
 
     QuickKeysMenu::QuickKeysMenu()
         : WindowBase("openmw_quickkeys_menu.layout")
@@ -320,14 +334,7 @@ namespace MWGui
         mSelected->button->setUserString("Spell", spellId.serialize());
 
         // use the icon of the first effect
-        const ESM::MagicEffect* effect
-            = esmStore.get<ESM::MagicEffect>().find(spell->mEffects.mList.front().mData.mEffectID);
-
-        std::string path = effect->mIcon;
-        std::replace(path.begin(), path.end(), '/', '\\');
-        path.insert(path.rfind('\\') + 1, "b_");
-        const VFS::Path::Normalized iconPath = Misc::ResourceHelpers::correctIconPath(
-            VFS::Path::toNormalized(path), *MWBase::Environment::get().getResourceSystem()->getVFS());
+        const VFS::Path::Normalized iconPath = spellIconPath(*spell);
 
         float scale = 1.f;
         MyGUI::ITexture* texture
@@ -342,6 +349,56 @@ namespace MWGui
         if (mMagicSelectionDialog)
             mMagicSelectionDialog->setVisible(false);
     }
+
+#ifdef __vita__
+    std::string QuickKeysMenu::vitaKeySignature(int index) const
+    {
+        if (index < 1 || index > static_cast<int>(mKey.size()))
+            return {};
+        const keyData& key = mKey[index - 1];
+        return std::to_string(static_cast<int>(key.type)) + key.id.serializeText();
+    }
+
+    void QuickKeysMenu::vitaMirrorKey(int index, ItemWidget* target) const
+    {
+        target->setItem(MWWorld::Ptr());
+        if (index < 1 || index > static_cast<int>(mKey.size()))
+            return;
+        const keyData& key = mKey[index - 1];
+        if (key.type == ESM::QuickKeys::Type::Item || key.type == ESM::QuickKeys::Type::MagicItem)
+        {
+            const MWWorld::Ptr* item = key.button->getUserData<MWWorld::Ptr>(false);
+            if (item == nullptr || item->isEmpty())
+                return;
+            if (key.type == ESM::QuickKeys::Type::Item)
+            {
+                target->setItem(*item, ItemWidget::Barter);
+                return;
+            }
+            float scale = 1.f;
+            if (MyGUI::ITexture* texture
+                = MyGUI::RenderManager::getInstance().getTexture("textures\\menu_icon_select_magic_magic.dds"))
+                scale = texture->getHeight() / 64.f;
+            const int diameter = static_cast<int>(44 * scale);
+            target->setFrame("textures\\menu_icon_select_magic_magic.dds", MyGUI::IntCoord(0, 0, diameter, diameter));
+            target->setIcon(*item);
+        }
+        else if (key.type == ESM::QuickKeys::Type::Magic)
+        {
+            const ESM::Spell* spell
+                = MWBase::Environment::get().getESMStore()->get<ESM::Spell>().search(key.id);
+            if (spell == nullptr || spell->mEffects.mList.empty())
+                return;
+            float scale = 1.f;
+            if (MyGUI::ITexture* texture
+                = MyGUI::RenderManager::getInstance().getTexture("textures\\menu_icon_select_magic.dds"))
+                scale = texture->getHeight() / 64.f;
+            const int diameter = static_cast<int>(44 * scale);
+            target->setFrame("textures\\menu_icon_select_magic.dds", MyGUI::IntCoord(0, 0, diameter, diameter));
+            target->setIcon(spellIconPath(*spell));
+        }
+    }
+#endif
 
     void QuickKeysMenu::onAssignMagicCancel()
     {

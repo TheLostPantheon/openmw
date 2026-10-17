@@ -536,8 +536,8 @@ namespace MyGUIPlatform
     // per-frame dirty check across layers, and in clean-frame batch replays.
     uint32_t g_vitaGuiWalkUs = 0, g_vitaGuiCheckUs = 0, g_vitaGuiRepeatUs = 0;
     // [GuiLayers] (guiprof.txt): walk time and batches per layer.
-    char g_vitaGuiLayerNames[12][24] = {};
-    uint32_t g_vitaGuiLayerUs[12] = {}, g_vitaGuiLayerBatches[12] = {};
+    char g_vitaGuiLayerNames[32][24] = {};
+    uint32_t g_vitaGuiLayerUs[32] = {}, g_vitaGuiLayerBatches[32] = {};
     static bool vitaGuiProf()
     {
         static const bool sOn = [] {
@@ -702,7 +702,7 @@ namespace MyGUIPlatform
                 const uint64_t l0 = sceKernelGetProcessTimeWide();
                 const uint32_t b0 = sVitaBatchCount;
                 layers.current()->renderToTarget(this, mUpdate);
-                if (i < 12)
+                if (i < 32)
                 {
                     if (g_vitaGuiLayerNames[i][0] == 0)
                         snprintf(g_vitaGuiLayerNames[i], sizeof(g_vitaGuiLayerNames[i]), "%s",

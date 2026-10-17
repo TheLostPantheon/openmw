@@ -13,8 +13,9 @@ namespace MWInput
     class ActionManager;
     class BindingsManager;
 
-    /// Front-panel touch zones: tap reveals the layout, hold keeps it,
-    /// release inside a zone fires its action.
+    /// Front-panel touch zones: a touch anywhere in play (or on a zone in
+    /// menus) reveals the layout, hold keeps it, release inside a zone fires
+    /// its action.
     class VitaTouchZones
     {
     public:

@@ -56,6 +56,10 @@ namespace MWGui
                 return {};
             return mKey[index - 1].name;
         }
+        /// Changes whenever key `index`'s assignment does (touch overlay refresh).
+        std::string vitaKeySignature(int index) const;
+        /// Show key `index`'s icon on `target` as this menu does.
+        void vitaMirrorKey(int index, ItemWidget* target) const;
 #endif
 
     private:
