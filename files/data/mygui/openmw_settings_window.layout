@@ -885,8 +885,30 @@
                         <Property key="AddItem" value="Off (Full)"/>
                     </Widget>
                 </Widget>
+                <!-- Small Object Culling: hides objects smaller than a few pixels -->
+                <Widget type="Widget" position="4 252 352 46" align="Left Top HStretch" name="VitaCullingRow">
+                    <Widget type="TextBox" skin="NormalText" position="0 0 352 20" align="Left Top">
+                        <Property key="Caption" value="Small Object Culling"/>
+                    </Widget>
+                    <Widget type="ComboBox" skin="MW_ComboBox" position="0 20 200 26" align="Left Top" name="VitaCullingList">
+                        <Property key="AddItem" value="Off"/>
+                        <Property key="AddItem" value="Light"/>
+                        <Property key="AddItem" value="Balanced"/>
+                        <Property key="AddItem" value="Strong"/>
+                    </Widget>
+                </Widget>
+                <!-- Frame Rate: 30 fps lock or uncapped -->
+                <Widget type="Widget" position="4 302 352 46" align="Left Top HStretch" name="VitaFrameRateRow">
+                    <Widget type="TextBox" skin="NormalText" position="0 0 352 20" align="Left Top">
+                        <Property key="Caption" value="Frame Rate"/>
+                    </Widget>
+                    <Widget type="ComboBox" skin="MW_ComboBox" position="0 20 200 26" align="Left Top" name="VitaFrameRateList">
+                        <Property key="AddItem" value="Locked 30"/>
+                        <Property key="AddItem" value="Uncapped"/>
+                    </Widget>
+                </Widget>
                 <!-- Hint: texture filtering lives on the Video tab to avoid duplicate UI. -->
-                <Widget type="TextBox" skin="SandText" position="4 252 352 20" align="Left Top HStretch">
+                <Widget type="TextBox" skin="SandText" position="4 352 352 20" align="Left Top HStretch">
                     <Property key="Caption" value="Texture filtering: see the Video tab."/>
                 </Widget>
             </Widget>

@@ -112,6 +112,14 @@ namespace MWGui
         // Backed by General.vita texture detail. Restart required.
         MyGUI::ComboBox* mVitaTextureDetailList = nullptr;
         void onVitaTextureDetailChanged(MyGUI::ComboBox* sender, size_t pos);
+        // Small-feature culling preset (off/light/balanced/strong). Backed by
+        // Camera.small feature culling and its pixel size. Applies at once.
+        MyGUI::ComboBox* mVitaCullingList = nullptr;
+        void onVitaCullingChanged(MyGUI::ComboBox* sender, size_t pos);
+        // Frame cap: locked 30 or uncapped (Video.framerate limit 30 / 0).
+        // Applies at once.
+        MyGUI::ComboBox* mVitaFrameRateList = nullptr;
+        void onVitaFrameRateChanged(MyGUI::ComboBox* sender, size_t pos);
 #endif
 
         void onRebindAction(MyGUI::Widget* sender);

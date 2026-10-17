@@ -3375,8 +3375,13 @@ namespace MWWorld
             {
                 // Same [Cells] target framerate the GL precompile budget
                 // uses — one notion of "target" for the whole engine.
-                const float fps = Vita::benchStreamingTarget() > 0.f ? Vita::benchStreamingTarget()
-                                                                     : (float)Settings::cells().mTargetFramerate;
+                // Uncapped (no frame wait to fill) aims at 60 like the
+                // bench's --fps 0.
+                float fps = Vita::benchStreamingTarget();
+                if (fps <= 0.f)
+                    fps = MWBase::Environment::get().getFrameRateLimit() > 0.f
+                        ? (float)Settings::cells().mTargetFramerate
+                        : 60.f;
                 const int targetFrameMs = fps > 1.f ? (int)(1000.f / fps) : 33;
                 constexpr int kFloorMs = 2; // never stall streaming outright
                 constexpr int kCeilMs = 16; // one tick must not become a hitch

@@ -1703,10 +1703,31 @@ namespace Vita
         // supplies 640x368 as the default (matches the vglInit backbuffer
         // 1:1), and the Vita Settings tab exposes 480x272 / 512x288 /
         // 640x368. See vglInitWithCustomSizes in initialize() for why
-        // higher widths aren't offered. Antialiasing and framerate cap
-        // stay forced.
+        // higher widths aren't offered. Antialiasing stays forced.
         Settings::video().mAntialiasing.set(0);
-        Settings::video().mFramerateLimit.set(30.0f);
+        // Frame cap: locked 30 or uncapped (0), chosen in the Vita settings
+        // tab. Any other value (the desktop default is 300) means locked 30.
+        if (Settings::video().mFramerateLimit != 0.f)
+            Settings::video().mFramerateLimit.set(30.0f);
+
+        // Small-feature culling: the old default (8 px at 640x368) hid too
+        // much; move it once to Balanced (5). Strong (8) chosen in the Vita
+        // settings tab afterwards stays.
+        if (FILE* mark = fopen("ux0:data/openmw/config/cull-v2.txt", "rb"))
+            fclose(mark);
+        else
+        {
+            if (Settings::camera().mSmallFeatureCullingPixelSize == 8.f)
+            {
+                Settings::camera().mSmallFeatureCullingPixelSize.set(5.f);
+                breadcrumb("[Display] small feature culling 8 (old default) moved to 5");
+            }
+            if (FILE* f = fopen("ux0:data/openmw/config/cull-v2.txt", "w"))
+            {
+                fputs("small feature culling default moved to 5\n", f);
+                fclose(f);
+            }
+        }
 
         // --- Shaders: FFP only (vitaGL cannot compile OpenMW GLSL shaders) ---
         Settings::shaders().mLightingMethod.set(SceneUtil::LightingMethod::FFP);

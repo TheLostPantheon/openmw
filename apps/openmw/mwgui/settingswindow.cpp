@@ -298,6 +298,29 @@ namespace MWGui
                 mVitaTextureDetailList->eventComboChangePosition
                     += MyGUI::newDelegate(this, &SettingsWindow::onVitaTextureDetailChanged);
             }
+
+            // Small object culling: nearest preset to the current pixel size
+            getWidget(mVitaCullingList, "VitaCullingList");
+            if (mVitaCullingList)
+            {
+                const float px = Settings::camera().mSmallFeatureCullingPixelSize;
+                size_t idx = 3; // strong
+                if (!Settings::camera().mSmallFeatureCulling) idx = 0;
+                else if (px < 4.f) idx = 1;
+                else if (px < 6.5f) idx = 2;
+                mVitaCullingList->setIndexSelected(idx);
+                mVitaCullingList->eventComboChangePosition
+                    += MyGUI::newDelegate(this, &SettingsWindow::onVitaCullingChanged);
+            }
+
+            // Frame rate: locked 30 / uncapped
+            getWidget(mVitaFrameRateList, "VitaFrameRateList");
+            if (mVitaFrameRateList)
+            {
+                mVitaFrameRateList->setIndexSelected(Settings::video().mFramerateLimit > 0.f ? 0 : 1);
+                mVitaFrameRateList->eventComboChangePosition
+                    += MyGUI::newDelegate(this, &SettingsWindow::onVitaFrameRateChanged);
+            }
         }
         catch (...)
         {
@@ -780,6 +803,25 @@ namespace MWGui
         // No apply() — texture downsample happens at image-load time
         // inside ImageManager::getImage. Already-cached textures retain
         // their old caps. The new preset takes effect on next boot.
+    }
+
+    void SettingsWindow::onVitaCullingChanged(MyGUI::ComboBox* /*sender*/, size_t pos)
+    {
+        // Indices aligned with layout AddItem order. Sizes are at 640x368;
+        // the renderer scales them to the render width.
+        static constexpr float kPixels[] = { 0.f, 3.f, 5.f, 8.f };
+        if (pos >= std::size(kPixels))
+            return;
+        Settings::camera().mSmallFeatureCulling.set(pos != 0);
+        if (pos != 0)
+            Settings::camera().mSmallFeatureCullingPixelSize.set(kPixels[pos]);
+        apply();
+    }
+
+    void SettingsWindow::onVitaFrameRateChanged(MyGUI::ComboBox* /*sender*/, size_t pos)
+    {
+        // The engine loop picks the new cap up on its next frame.
+        Settings::video().mFramerateLimit.set(pos == 0 ? 30.f : 0.f);
     }
 #endif
 

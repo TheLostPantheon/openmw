@@ -1988,8 +1988,23 @@ void OMW::Engine::go()
     MWWorld::DateTimeManager& timeManager = *mWorld->getTimeManager();
     Misc::FrameRateLimiter frameRateLimiter = Misc::makeFrameRateLimiter(mEnvironment.getFrameRateLimit());
     const std::chrono::steady_clock::duration maxSimulationInterval(std::chrono::milliseconds(200));
+#ifdef __vita__
+    const bool benchCap = Vita::benchFrameCap() >= 0.f;
+#endif
     while (!mViewer->done() && !mStateManager->hasQuitRequest())
     {
+#ifdef __vita__
+        // Frame cap chosen in the Vita settings tab (locked 30 / uncapped)
+        // takes effect on the next frame. A bench replay keeps its own.
+        if (!benchCap && Settings::video().mFramerateLimit != mEnvironment.getFrameRateLimit())
+        {
+            mEnvironment.setFrameRateLimit(Settings::video().mFramerateLimit);
+            frameRateLimiter = Misc::makeFrameRateLimiter(mEnvironment.getFrameRateLimit());
+            char b[64];
+            snprintf(b, sizeof(b), "[FrameCap] %.0f fps", mEnvironment.getFrameRateLimit());
+            Vita::breadcrumb(b);
+        }
+#endif
         const double dt = std::chrono::duration_cast<std::chrono::duration<double>>(
                               std::min(frameRateLimiter.getLastFrameDuration(), maxSimulationInterval))
                               .count()
