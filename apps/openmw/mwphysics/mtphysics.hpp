@@ -63,6 +63,12 @@ namespace MWPhysics
             btCollisionWorld::RayResultCallback& resultCallback) const;
         void convexSweepTest(const btConvexShape* castShape, const btTransform& from, const btTransform& to,
             btCollisionWorld::ConvexResultCallback& resultCallback) const;
+#ifdef __vita__
+        /// As convexSweepTest, but returns false instead of waiting when the
+        /// collision world is locked (the physics thread moving actors).
+        bool tryConvexSweepTest(const btConvexShape* castShape, const btTransform& from, const btTransform& to,
+            btCollisionWorld::ConvexResultCallback& resultCallback) const;
+#endif
         void contactTest(btCollisionObject* colObj, btCollisionWorld::ContactResultCallback& resultCallback);
         std::optional<btVector3> getHitPoint(const btTransform& from, btCollisionObject* target);
         void aabbTest(const btVector3& aabbMin, const btVector3& aabbMax, btBroadphaseAabbCallback& callback);

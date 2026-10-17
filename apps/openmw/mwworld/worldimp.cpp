@@ -9,6 +9,7 @@
 #include "../vita/VitaMemAudit.h"
 #include <components/vita/VitaEsmPrefetch.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/io/stat.h>
 #define VITA_CRUMB(msg) Vita::breadcrumb(msg)
 #else
 #define VITA_CRUMB(msg)
@@ -2266,7 +2267,21 @@ namespace MWWorld
         try
         {
             // inform the GUI about focused object
+#ifdef __vita__
+            // [Focus]: faced-object lookup vs GUI update, per call (it runs
+            // ten times a second and averaged 1.4 ms a frame in a town).
+            static uint64_t sFoUs[3] = {};
+            static unsigned sFoCalls = 0;
+            uint64_t foT = sceKernelGetProcessTimeWide();
+#endif
             MWWorld::Ptr object = getFocusObject();
+#ifdef __vita__
+            {
+                const uint64_t now = sceKernelGetProcessTimeWide();
+                sFoUs[0] += now - foT;
+                foT = now;
+            }
+#endif
 
             // retrieve the object's top point's screen position so we know where to place the floating label
             if (!object.isEmpty())
@@ -2283,7 +2298,26 @@ namespace MWWorld
                 MWBase::Environment::get().getWindowManager()->setFocusObjectScreenCoords(pos.x(), pos.y());
             }
 
+#ifdef __vita__
+            {
+                const uint64_t now = sceKernelGetProcessTimeWide();
+                sFoUs[1] += now - foT;
+                foT = now;
+            }
+#endif
             MWBase::Environment::get().getWindowManager()->setFocusObject(object);
+#ifdef __vita__
+            sFoUs[2] += sceKernelGetProcessTimeWide() - foT;
+            if (++sFoCalls >= 50)
+            {
+                char fb[128];
+                snprintf(fb, sizeof(fb), "[Focus] per call: faced=%.2f screen=%.2f gui=%.2f ms", sFoUs[0] / 1000.0 / sFoCalls,
+                    sFoUs[1] / 1000.0 / sFoCalls, sFoUs[2] / 1000.0 / sFoCalls);
+                Vita::breadcrumb(fb);
+                sFoUs[0] = sFoUs[1] = sFoUs[2] = 0;
+                sFoCalls = 0;
+            }
+#endif
         }
         catch (std::exception& e)
         {
@@ -2325,15 +2359,49 @@ namespace MWWorld
             std::vector<MWWorld::ConstPtr> ignore;
             if (ignorePlayer)
                 ignore.push_back(mPlayer->getPlayer());
+            const uint64_t vitaRayT0 = sceKernelGetProcessTimeWide();
             const MWPhysics::RayCastingResult phys = mPhysics->castRay(rayStart, rayEnd, ignore, {},
                 MWPhysics::CollisionType_Default | MWPhysics::CollisionType_VisualOnly);
+            const uint64_t vitaRayT1 = sceKernelGetProcessTimeWide();
             const float physDist
                 = (phys.mHit && !phys.mHitObject.isEmpty()) ? (phys.mHitPos - rayStart).length() : -1.f;
 
+            // The scene ray tests the triangles of everything along it (~4 ms
+            // in a dense town): end it a little past the physics hit. Only a
+            // recessed door leaf just behind its frame's collision can win
+            // from there (below); farther objects are behind the hit.
+            const float sceneMax = physDist >= 0.f ? std::min(maxDistance, physDist + 64.f) : maxDistance;
+            // focusab.txt (diagnostic): alternate 10 s windows with and
+            // without statics in the scene ray; [FocusRay] reports each.
+            static const bool sFocusAb = [] {
+                SceIoStat st;
+                return sceIoGetstat("ux0:data/openmw/focusab.txt", &st) >= 0;
+            }();
+            const bool noStatics = sFocusAb && ((vitaRayT0 / 10000000ULL) & 1ULL) != 0;
             const MWRender::RenderingManager::RayResult scene = mRendering->castCameraToViewportRay(
-                0.5f, 0.5f, maxDistance, ignorePlayer,
+                0.5f, 0.5f, sceneMax, ignorePlayer,
                 MWRender::Mask_Scene | MWRender::Mask_Object | MWRender::Mask_VitaPick
-                    | MWRender::Mask_Static); // doors are remasked Static (door.cpp)
+                    | (noStatics ? 0u : (unsigned)MWRender::Mask_Static)); // doors are remasked Static (door.cpp)
+            {
+                // [FocusRay]: physics ray vs scene ray, per call, per mode.
+                static uint64_t sPhysUs[2] = {}, sSceneUs[2] = {};
+                static unsigned sCalls[2] = {}, sPhysHits[2] = {};
+                const int mode = noStatics ? 1 : 0;
+                sPhysUs[mode] += vitaRayT1 - vitaRayT0;
+                sSceneUs[mode] += sceKernelGetProcessTimeWide() - vitaRayT1;
+                sPhysHits[mode] += physDist >= 0.f ? 1 : 0;
+                if (++sCalls[mode] >= 50)
+                {
+                    char fb[160];
+                    snprintf(fb, sizeof(fb),
+                        "[FocusRay] %s: phys=%.2f scene=%.2f ms per call, phys hit %u/%u", mode ? "no statics" : "all",
+                        sPhysUs[mode] / 1000.0 / sCalls[mode], sSceneUs[mode] / 1000.0 / sCalls[mode],
+                        sPhysHits[mode], sCalls[mode]);
+                    Vita::breadcrumb(fb);
+                    sPhysUs[mode] = sSceneUs[mode] = 0;
+                    sCalls[mode] = sPhysHits[mode] = 0;
+                }
+            }
             float sceneDist = -1.f;
             MWWorld::Ptr sceneObject = scene.mHitObject;
             if (scene.mHit)
@@ -2341,7 +2409,7 @@ namespace MWWorld
                 if (sceneObject.isEmpty() && scene.mHitRefnum.isSet())
                     sceneObject = MWBase::Environment::get().getWorldModel()->getPtr(scene.mHitRefnum);
                 if (!sceneObject.isEmpty())
-                    sceneDist = scene.mRatio * maxDistance;
+                    sceneDist = scene.mRatio * sceneMax;
             }
 
             // Nameless scenery must not eat the prompt of a named object

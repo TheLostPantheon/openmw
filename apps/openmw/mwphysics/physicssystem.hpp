@@ -225,6 +225,12 @@ namespace MWPhysics
             int mask = CollisionType_Default, int group = 0xff) const override;
         using RayCastingInterface::castRay;
 
+#ifdef __vita__
+        /// castSphere without waiting for the collision world lock: nullopt
+        /// when the physics thread holds it.
+        std::optional<RayCastingResult> vitaTryCastSphere(const osg::Vec3f& from, const osg::Vec3f& to,
+            float radius, int mask, int group = 0xff) const;
+#endif
         RayCastingResult castSphere(const osg::Vec3f& from, const osg::Vec3f& to, float radius,
             int mask = CollisionType_Default, int group = 0xff) const override;
 

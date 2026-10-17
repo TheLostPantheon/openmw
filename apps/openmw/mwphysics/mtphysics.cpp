@@ -38,12 +38,45 @@
 #include "actor.hpp"
 #include "contacttestwrapper.h"
 #include "movementsolver.hpp"
+#ifdef __vita__
+#include "../vita/VitaInit.h"
+#include "../vita/VitaSimWorker.h"
+#include <psp2/kernel/processmgr.h>
+#endif
 #include "object.hpp"
 #include "physicssystem.hpp"
 #include "projectile.hpp"
 
 namespace MWPhysics
 {
+#ifdef __vita__
+    // [PhysQuery] (logged with [RendUpd]): main-thread ray and sweep queries,
+    // time waiting for the collision world lock vs the query itself.
+    uint64_t gVitaQueryLockUs = 0, gVitaQueryUs = 0;
+    unsigned gVitaQueryCalls = 0;
+    namespace
+    {
+        struct VitaQueryTimer
+        {
+            const bool mMain = !Vita::isSimThread();
+            const uint64_t mT0 = mMain ? sceKernelGetProcessTimeWide() : 0;
+            uint64_t mT1 = 0;
+            void locked()
+            {
+                if (mMain)
+                    mT1 = sceKernelGetProcessTimeWide();
+            }
+            ~VitaQueryTimer()
+            {
+                if (!mMain)
+                    return;
+                gVitaQueryLockUs += mT1 - mT0;
+                gVitaQueryUs += sceKernelGetProcessTimeWide() - mT1;
+                ++gVitaQueryCalls;
+            }
+        };
+    }
+#endif
     namespace
     {
         template <class Mutex>
@@ -489,6 +522,11 @@ namespace MWPhysics
         {
             Log(Debug::Info) << "Using " << mNumThreads << " async physics threads";
 #ifdef __vita__
+            Vita::breadcrumb(mLockingPolicy == LockingPolicy::AllowSharedLocks
+                    ? "[Physics] async, shared locks for queries"
+                    : "[Physics] async, exclusive locks only");
+#endif
+#ifdef __vita__
             // Bullet's GJK/EPA solver uses ~30KB+ stack per call frame.
             // Default pthread stack on Vita overflows. Use 512KB.
             for (unsigned i = 0; i < mNumThreads; ++i)
@@ -678,16 +716,45 @@ namespace MWPhysics
     void PhysicsTaskScheduler::rayTest(const btVector3& rayFromWorld, const btVector3& rayToWorld,
         btCollisionWorld::RayResultCallback& resultCallback) const
     {
+#ifdef __vita__
+        VitaQueryTimer timer;
         MaybeLock lock(mCollisionWorldMutex, mLockingPolicy);
+        timer.locked();
+#else
+        MaybeLock lock(mCollisionWorldMutex, mLockingPolicy);
+#endif
         mCollisionWorld->rayTest(rayFromWorld, rayToWorld, resultCallback);
     }
 
     void PhysicsTaskScheduler::convexSweepTest(const btConvexShape* castShape, const btTransform& from,
         const btTransform& to, btCollisionWorld::ConvexResultCallback& resultCallback) const
     {
+#ifdef __vita__
+        VitaQueryTimer timer;
         MaybeLock lock(mCollisionWorldMutex, mLockingPolicy);
+        timer.locked();
+#else
+        MaybeLock lock(mCollisionWorldMutex, mLockingPolicy);
+#endif
         mCollisionWorld->convexSweepTest(castShape, from, to, resultCallback);
     }
+
+#ifdef __vita__
+    bool PhysicsTaskScheduler::tryConvexSweepTest(const btConvexShape* castShape, const btTransform& from,
+        const btTransform& to, btCollisionWorld::ConvexResultCallback& resultCallback) const
+    {
+        if (mLockingPolicy == LockingPolicy::NoLocks)
+        {
+            mCollisionWorld->convexSweepTest(castShape, from, to, resultCallback);
+            return true;
+        }
+        std::unique_lock<Misc::SharedMutex> lock(mCollisionWorldMutex, std::try_to_lock);
+        if (!lock.owns_lock())
+            return false;
+        mCollisionWorld->convexSweepTest(castShape, from, to, resultCallback);
+        return true;
+    }
+#endif
 
     void PhysicsTaskScheduler::contactTest(
         btCollisionObject* colObj, btCollisionWorld::ContactResultCallback& resultCallback)

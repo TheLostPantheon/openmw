@@ -289,6 +289,35 @@ namespace MWPhysics
         return result;
     }
 
+#ifdef __vita__
+    std::optional<RayCastingResult> PhysicsSystem::vitaTryCastSphere(
+        const osg::Vec3f& from, const osg::Vec3f& to, float radius, int mask, int group) const
+    {
+        btCollisionWorld::ClosestConvexResultCallback callback(
+            Misc::Convert::toBullet(from), Misc::Convert::toBullet(to));
+        callback.m_collisionFilterGroup = group;
+        callback.m_collisionFilterMask = mask;
+
+        btSphereShape shape(radius);
+        const btQuaternion btrot = btQuaternion::getIdentity();
+
+        if (!mTaskScheduler->tryConvexSweepTest(&shape, btTransform(btrot, Misc::Convert::toBullet(from)),
+                btTransform(btrot, Misc::Convert::toBullet(to)), callback))
+            return std::nullopt;
+
+        RayCastingResult result;
+        result.mHit = callback.hasHit();
+        if (result.mHit)
+        {
+            result.mHitPos = Misc::Convert::toOsg(callback.m_hitPointWorld);
+            result.mHitNormal = Misc::Convert::toOsg(callback.m_hitNormalWorld);
+            if (auto* ptrHolder = static_cast<PtrHolder*>(callback.m_hitCollisionObject->getUserPointer()))
+                result.mHitObject = ptrHolder->getPtr();
+        }
+        return result;
+    }
+#endif
+
     bool PhysicsSystem::getLineOfSight(const MWWorld::ConstPtr& actor1, const MWWorld::ConstPtr& actor2) const
     {
         if (actor1 == actor2)

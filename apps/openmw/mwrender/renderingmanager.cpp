@@ -93,6 +93,14 @@
 #include <components/vita/VitaShader.h>
 #include "../vita/VitaCullTimer.h"
 #include "../vita/VitaInit.h"
+#ifdef __vita__
+#include <psp2/kernel/processmgr.h>
+namespace MWPhysics
+{
+    extern uint64_t gVitaQueryLockUs, gVitaQueryUs;
+    extern unsigned gVitaQueryCalls;
+}
+#endif
 #include "../vita/VitaSimWorker.h"
 #include <osg/GL>
 #endif
@@ -988,17 +996,38 @@ namespace MWRender
 
     void RenderingManager::update(float dt, bool paused)
     {
+#ifdef __vita__
+        // [RendUpd]: where the main thread's rendering update goes (4.4 ms a
+        // frame in a dense town). Steps: stats, shaders, water, effects,
+        // sky, nav, camera, fog + scene uniforms.
+        static uint64_t sRuUs[8] = {};
+        static unsigned sRuFrames = 0;
+        uint64_t ruT = sceKernelGetProcessTimeWide();
+        const auto ruLap = [&ruT](int step) {
+            const uint64_t now = sceKernelGetProcessTimeWide();
+            sRuUs[step] += now - ruT;
+            ruT = now;
+        };
+#define VITA_RU_LAP(step) ruLap(step)
+#else
+#define VITA_RU_LAP(step)
+#endif
         reportStats();
+        VITA_RU_LAP(0);
 
         mResourceSystem->getSceneManager()->getShaderManager().update(*mViewer);
+        VITA_RU_LAP(1);
 
         mWater->setRainIntensity(mSky->getRainRipplesEnabled() ? mSky->getPrecipitationAlpha() : 0.f);
 
         mWater->update(dt, paused);
+        VITA_RU_LAP(2);
         if (!paused)
         {
             mEffectManager->update(dt);
+            VITA_RU_LAP(3);
             mSky->update(dt);
+            VITA_RU_LAP(4);
 
             const MWWorld::Ptr& player = mPlayerAnimation->getPtr();
             osg::Vec3f playerPos(player.getRefData().getPosition().asVec3());
@@ -1010,6 +1039,7 @@ namespace MWRender
 
         updateNavMesh();
         updateRecastMesh();
+        VITA_RU_LAP(5);
 
         if (mUpdateProjectionMatrix)
         {
@@ -1017,6 +1047,7 @@ namespace MWRender
             updateProjectionMatrix();
         }
         mCamera->update(dt, paused);
+        VITA_RU_LAP(6);
 
         bool isUnderwater = mWater->isUnderwater(mCamera->getPosition());
 
@@ -1065,6 +1096,30 @@ namespace MWRender
 
         Vita::updateSceneUniforms(mSceneRoot->getOrCreateStateSet(), sunDirView, sunColor, ambient,
             fogStart, fogEnd, fogColor);
+        VITA_RU_LAP(7);
+        if (++sRuFrames >= 150)
+        {
+            char rb[200];
+            snprintf(rb, sizeof(rb),
+                "[RendUpd] stats=%.2f shaders=%.2f water=%.2f fx=%.2f sky=%.2f nav=%.2f camera=%.2f fog+unif=%.2f "
+                "ms/frame",
+                sRuUs[0] / 1000.0 / sRuFrames, sRuUs[1] / 1000.0 / sRuFrames, sRuUs[2] / 1000.0 / sRuFrames,
+                sRuUs[3] / 1000.0 / sRuFrames, sRuUs[4] / 1000.0 / sRuFrames, sRuUs[5] / 1000.0 / sRuFrames,
+                sRuUs[6] / 1000.0 / sRuFrames, sRuUs[7] / 1000.0 / sRuFrames);
+            Vita::breadcrumb(rb);
+            if (MWPhysics::gVitaQueryCalls > 0)
+            {
+                snprintf(rb, sizeof(rb), "[PhysQuery] main thread: %.1f calls, lock wait %.2f ms, query %.2f ms /frame",
+                    (double)MWPhysics::gVitaQueryCalls / sRuFrames, MWPhysics::gVitaQueryLockUs / 1000.0 / sRuFrames,
+                    MWPhysics::gVitaQueryUs / 1000.0 / sRuFrames);
+                Vita::breadcrumb(rb);
+                MWPhysics::gVitaQueryLockUs = MWPhysics::gVitaQueryUs = 0;
+                MWPhysics::gVitaQueryCalls = 0;
+            }
+            std::fill(std::begin(sRuUs), std::end(sRuUs), 0);
+            sRuFrames = 0;
+        }
+#undef VITA_RU_LAP
 
         // Periodic lighting diagnostics (every ~5 seconds at 30fps)
         {
