@@ -542,7 +542,15 @@ namespace
         const uint64_t t0 = sceKernelGetProcessTimeWide();
         // Spike anatomy: is a long draw compiling new GL objects
         // (ICO), or is it dispatch/vitaGL itself?
-        const unsigned int icoSets = icoProbe ? (unsigned int)icoProbe->getToCompile().size() : 0u;
+        // The to-compile list is changed under its mutex by main (the
+        // per-frame play-queue drop) and loaders; reading it here without
+        // the lock crashed the GL thread on a freed compile set.
+        unsigned int icoSets = 0;
+        if (icoProbe)
+        {
+            std::lock_guard<OpenThreads::Mutex> lock(*icoProbe->getToCompiledMutex());
+            icoSets = (unsigned int)icoProbe->getToCompile().size();
+        }
         vita_gl_phase = "draw";
         renderer->draw();
         vitaRunCompileOperation(icoProbe, gc);
@@ -557,6 +565,9 @@ namespace
             unsigned tex = 0, drw = 0, prog = 0;
             unsigned biggestKB = 0;
             char biggest[48] = "";
+            std::unique_lock<OpenThreads::Mutex> icoLock;
+            if (icoProbe)
+                icoLock = std::unique_lock<OpenThreads::Mutex>(*icoProbe->getToCompiledMutex());
             if (icoProbe)
                 for (const auto& cs : icoProbe->getToCompile())
                     for (const auto& cm : cs->_compileMap)
@@ -582,6 +593,8 @@ namespace
                             else
                                 ++drw;
                         }
+            if (icoLock.owns_lock())
+                icoLock.unlock();
             char db[224];
             snprintf(db, sizeof(db), "[DrawSpike] draw=%ums sets=%u tex=%u drw=%u prog=%u big=%uKB %s",
                 (unsigned)((t1 - t0) / 1000), icoSets, tex, drw, prog, biggestKB, biggest);

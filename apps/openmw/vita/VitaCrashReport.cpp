@@ -11,6 +11,7 @@
 #include <kubridge.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/modulemgr.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 
 #include "VitaBuildInfo.h"
@@ -152,9 +153,25 @@ namespace
             putAddr("LR  ", c->lr);
             put("\nbacktrace (stack scan, call sites checked):\n");
             const uint32_t* sp = reinterpret_cast<const uint32_t*>(c->sp);
+            // Scan only the faulting thread's stack block: a fixed 8 KB ran
+            // past the top of a shallow GL-thread stack and the handler
+            // itself faulted, losing the report. No block: no scan.
+            int words = 0;
+            {
+                SceKernelMemBlockInfo info{};
+                info.size = sizeof(info);
+                if (sceKernelGetMemBlockInfoByAddr(reinterpret_cast<void*>(c->sp), &info) >= 0)
+                {
+                    const uintptr_t top = reinterpret_cast<uintptr_t>(info.mappedBase) + info.mappedSize;
+                    if (top > c->sp)
+                        words = static_cast<int>(std::min<uintptr_t>((top - c->sp) / 4, 2048));
+                }
+                else
+                    put("  (stack pointer not in a mapped block: no scan)\n");
+            }
             int frames = 0;
             uint32_t last = 0;
-            for (int i = 0; i < 2048 && frames < 20; ++i)
+            for (int i = 0; i < words && frames < 20; ++i)
             {
                 const uint32_t v = sp[i];
                 if (v == last || !isCallSite(v))
