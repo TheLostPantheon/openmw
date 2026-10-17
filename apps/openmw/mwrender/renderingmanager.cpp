@@ -99,6 +99,21 @@
 
 namespace MWRender
 {
+    namespace
+    {
+        // The cutoff is in screen pixels. On Vita it is tuned at 640x368;
+        // scale it to the render width so native 960x544 culls the same
+        // small objects (each still costs cull and a draw call there).
+        float smallFeatureCullingPixelSize()
+        {
+            float px = Settings::camera().mSmallFeatureCullingPixelSize;
+#ifdef __vita__
+            px *= std::max(1.f, static_cast<float>(Settings::video().mResolutionX.get()) / 640.f);
+#endif
+            return px;
+        }
+    }
+
     class PerViewUniformStateUpdater final : public SceneUtil::StateSetUpdater
     {
     public:
@@ -631,7 +646,7 @@ namespace MWRender
             cullingMode &= ~(osg::CullStack::SMALL_FEATURE_CULLING);
         else
         {
-            mViewer->getCamera()->setSmallFeatureCullingPixelSize(Settings::camera().mSmallFeatureCullingPixelSize);
+            mViewer->getCamera()->setSmallFeatureCullingPixelSize(smallFeatureCullingPixelSize());
             cullingMode |= osg::CullStack::SMALL_FEATURE_CULLING;
         }
 
@@ -1762,8 +1777,7 @@ namespace MWRender
                     cullingMode &= ~(osg::CullStack::SMALL_FEATURE_CULLING);
                 else
                 {
-                    mViewer->getCamera()->setSmallFeatureCullingPixelSize(
-                        Settings::camera().mSmallFeatureCullingPixelSize);
+                    mViewer->getCamera()->setSmallFeatureCullingPixelSize(smallFeatureCullingPixelSize());
                     cullingMode |= osg::CullStack::SMALL_FEATURE_CULLING;
                 }
                 mViewer->getCamera()->setCullingMode(cullingMode);
