@@ -171,26 +171,51 @@ namespace
 
     // [Land] a cell whose heights did not load gets the flat default
     // heightfield (far below sea level: the player falls under the terrain
-    // and swims) and no terrain. Logged with the reason.
-    void vitaLogLandMiss(const ESM::ExteriorCellLocation& at, const ESMTerrain::LandObject* land)
+    // and swims) and no terrain. Logged with the reason; returns whether the
+    // cell has heights that should have loaded (then it is queued for retry).
+    bool vitaLandExpectsHeights(const ESM::ExteriorCellLocation& at)
     {
-        const MWWorld::ESMStore& store = *MWBase::Environment::get().getESMStore();
-        const ESM::Land* record = ESM::isEsm4Ext(at.mWorldspace)
-            ? nullptr
-            : store.get<ESM::Land>().search(at.mX, at.mY);
-        if (record == nullptr || !(record->mDataTypes & ESM::Land::DATA_VHGT))
-            return; // no land here: the flat default is correct
-        char b[160];
-        snprintf(b, sizeof(b), "[Land] (%d,%d) no height data: land=%s loaded=0x%x heap=%dMB", at.mX, at.mY,
-            land ? "yes" : "null", land ? land->getData(0)->getLoadFlags() : 0, Vita::getHeapUsedMBFresh());
-        Vita::breadcrumb(b);
+        if (ESM::isEsm4Ext(at.mWorldspace))
+            return false;
+        const ESM::Land* record
+            = MWBase::Environment::get().getESMStore()->get<ESM::Land>().search(at.mX, at.mY);
+        return record != nullptr && (record->mDataTypes & ESM::Land::DATA_VHGT);
     }
 
-    osg::ref_ptr<const ESMTerrain::LandObject> vitaGetLand(
+    bool vitaLogLandMiss(const ESM::ExteriorCellLocation& at, const ESMTerrain::LandObject* land)
+    {
+        if (!vitaLandExpectsHeights(at))
+            return false; // no land here: the flat default is correct
+        char b[160];
+        snprintf(b, sizeof(b), "[Land] (%d,%d) no height data: land=%s loaded=0x%x heap=%dMB; retrying", at.mX,
+            at.mY, land ? "yes" : "null", land ? land->getData(0)->getLoadFlags() : 0, Vita::getHeapUsedMBFresh());
+        Vita::breadcrumb(b);
+        return true;
+    }
+
+    osg::ref_ptr<const ESMTerrain::LandObject> vitaGetLandOnce(
         MWRender::LandManager& landManager, const ESM::ExteriorCellLocation& at)
     {
+        // ux0:data/openmw/landfail.txt "x y n": the first n loads of that
+        // cell throw (tests the retry path).
+        static int sFailX = 0, sFailY = 0, sFailLeft = 0;
+        static const bool sFailInit = [] {
+            if (FILE* f = fopen("ux0:data/openmw/landfail.txt", "r"))
+            {
+                if (fscanf(f, "%d %d %d", &sFailX, &sFailY, &sFailLeft) != 3)
+                    sFailLeft = 0;
+                fclose(f);
+            }
+            return true;
+        }();
+        (void)sFailInit;
         try
         {
+            if (sFailLeft > 0 && at.mX == sFailX && at.mY == sFailY)
+            {
+                --sFailLeft;
+                throw std::runtime_error("injected failure (landfail.txt)");
+            }
             return landManager.getLand(at);
         }
         catch (const std::exception& e)
@@ -201,6 +226,24 @@ namespace
             Vita::breadcrumb(b);
             return nullptr;
         }
+    }
+
+    // A load that failed partway leaves a land object without heights in the
+    // cache, and every later lookup gets the same broken entry until it
+    // expires: drop it and load once more.
+    osg::ref_ptr<const ESMTerrain::LandObject> vitaGetLand(
+        MWRender::LandManager& landManager, const ESM::ExteriorCellLocation& at)
+    {
+        osg::ref_ptr<const ESMTerrain::LandObject> land = vitaGetLandOnce(landManager, at);
+        if ((land && land->getData(ESM::Land::DATA_VHGT)) || !vitaLandExpectsHeights(at))
+            return land;
+        landManager.getObjectCache()->removeFromObjectCache(at);
+        land = vitaGetLandOnce(landManager, at);
+        char b[96];
+        snprintf(b, sizeof(b), "[Land] (%d,%d) heights missing; reload %s", at.mX, at.mY,
+            land && land->getData(ESM::Land::DATA_VHGT) ? "succeeded" : "failed");
+        Vita::breadcrumb(b);
+        return land;
     }
     // Store-eviction distance floors (world units to cell edge, player-based).
     constexpr float kVitaEvictKeepNear = 12288.f;
@@ -1108,6 +1151,15 @@ namespace MWWorld
     {
 #ifdef __vita__
         VitaSceneSplit vitaSplit;
+        {
+            static auto sLandRetryAt = std::chrono::steady_clock::time_point{};
+            const auto landNow = std::chrono::steady_clock::now();
+            if (landNow >= sLandRetryAt)
+            {
+                sLandRetryAt = landNow + std::chrono::seconds(1);
+                vitaRetryLand();
+            }
+        }
         // Streaming mode is an architecture switch, so it can't flip under a
         // live world. Rebuild through the save path instead — in RAM, so the
         // player's saves and quicksave rotation are untouched.
@@ -2633,6 +2685,57 @@ namespace MWWorld
     }
 
 #ifdef __vita__
+    void Scene::vitaQueueLandRetry(const ESM::ExteriorCellLocation& at)
+    {
+        for (const auto& entry : mVitaLandRetry)
+            if (entry.first == at)
+                return;
+        mVitaLandRetry.emplace_back(at, 0);
+    }
+
+    // Once a second: reload the heights of cells that got the flat fallback
+    // and swap in the real heightfield, so a failed load is a short hole,
+    // not a cell the player falls through until it unloads.
+    void Scene::vitaRetryLand()
+    {
+        if (mVitaLandRetry.empty())
+            return;
+        MWRender::LandManager& landManager = *mRendering.getLandManager();
+        for (auto it = mVitaLandRetry.begin(); it != mVitaLandRetry.end();)
+        {
+            const ESM::ExteriorCellLocation at = it->first;
+            if (mPhysics->getHeightField(at.mX, at.mY) == nullptr)
+            {
+                it = mVitaLandRetry.erase(it); // unloaded meanwhile
+                continue;
+            }
+            landManager.getObjectCache()->removeFromObjectCache(at);
+            const osg::ref_ptr<const ESMTerrain::LandObject> land = vitaGetLandOnce(landManager, at);
+            const ESM::LandData* data = land ? land->getData(ESM::Land::DATA_VHGT) : nullptr;
+            const int tries = ++it->second;
+            char b[96];
+            if (data != nullptr)
+            {
+                mPhysics->removeHeightField(at.mX, at.mY);
+                mPhysics->addHeightField(data->getHeights().data(), at.mX, at.mY, ESM::getCellSize(at.mWorldspace),
+                    ESM::getLandSize(at.mWorldspace), data->getMinHeight(), data->getMaxHeight(), land.get());
+                snprintf(b, sizeof(b), "[Land] (%d,%d) heights recovered after %d retries", at.mX, at.mY, tries);
+                Vita::breadcrumb(b);
+                it = mVitaLandRetry.erase(it);
+            }
+            else if (tries >= 30)
+            {
+                snprintf(b, sizeof(b), "[Land] (%d,%d) heights still missing after %d retries", at.mX, at.mY, tries);
+                Vita::breadcrumb(b);
+                it = mVitaLandRetry.erase(it);
+            }
+            else
+                ++it;
+        }
+    }
+#endif
+
+#ifdef __vita__
     // Reveal-imminent roots jump the FIFO or upload first-bind.
     void Scene::vitaPrioritizeLastCompileSet(osgUtil::IncrementalCompileOperation* ico)
     {
@@ -2905,8 +3008,8 @@ namespace MWWorld
         {
             osg::ref_ptr<const ESMTerrain::LandObject> land = vitaGetLand(*mRendering.getLandManager(), cellIndex);
             const ESM::LandData* data = land ? land->getData(ESM::Land::DATA_VHGT) : nullptr;
-            if (data == nullptr)
-                vitaLogLandMiss(cellIndex, land.get());
+            if (data == nullptr && vitaLogLandMiss(cellIndex, land.get()))
+                vitaQueueLandRetry(cellIndex);
             const int verts = ESM::getLandSize(worldspace);
             const int worldsize = ESM::getCellSize(worldspace);
 
@@ -3031,8 +3134,8 @@ namespace MWWorld
         {
             osg::ref_ptr<const ESMTerrain::LandObject> land = vitaGetLand(*mRendering.getLandManager(), cellIndex);
             const ESM::LandData* data = land ? land->getData(ESM::Land::DATA_VHGT) : nullptr;
-            if (data == nullptr)
-                vitaLogLandMiss(cellIndex, land.get());
+            if (data == nullptr && vitaLogLandMiss(cellIndex, land.get()))
+                vitaQueueLandRetry(cellIndex);
             const int verts = ESM::getLandSize(worldspace);
             const int worldsize = ESM::getCellSize(worldspace);
 
@@ -6533,8 +6636,8 @@ namespace MWWorld
         {
             osg::ref_ptr<const ESMTerrain::LandObject> land = vitaGetLand(*mRendering.getLandManager(), cellIndex);
             const ESM::LandData* data = land ? land->getData(ESM::Land::DATA_VHGT) : nullptr;
-            if (data == nullptr)
-                vitaLogLandMiss(cellIndex, land.get());
+            if (data == nullptr && vitaLogLandMiss(cellIndex, land.get()))
+                vitaQueueLandRetry(cellIndex);
             const int verts = ESM::getLandSize(worldspace);
             const int worldsize = ESM::getCellSize(worldspace);
 
@@ -6884,7 +6987,19 @@ namespace MWWorld
         {
             // Cold terrain used to demote the crossing mid-flight — an
             // 11s live stall. Terrain preloads in the background instead.
+#ifdef __vita__
+            // A seamless crossing does not wait for it either: the
+            // synchronous load froze crossings 0.3-2.6 s, 3-6 times on a
+            // 2-minute flight. ux0:data/openmw/syncterrain.txt restores the
+            // wait (A/B).
+            static const bool sSyncTerrain = [] {
+                SceIoStat st;
+                return sceIoGetstat("ux0:data/openmw/syncterrain.txt", &st) >= 0;
+            }();
+            preloadTerrain(pos, playerCellIndex.mWorldspace, !vitaSeamless || sSyncTerrain);
+#else
             preloadTerrain(pos, playerCellIndex.mWorldspace, true);
+#endif
         }
 #ifdef __vita__
         vitaMterr = std::chrono::steady_clock::now();

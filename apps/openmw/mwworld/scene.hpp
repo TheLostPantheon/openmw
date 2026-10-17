@@ -185,6 +185,11 @@ namespace MWWorld
         // Player moving at fast-travel speed (>1200 u/s) until then; the
         // memory governor shortens cache expiry meanwhile.
         std::chrono::steady_clock::time_point mVitaFastTravelUntil{};
+        // [Land] cells that got the flat fallback heightfield because their
+        // heights failed to load; retried once a second (vitaRetryLand).
+        std::vector<std::pair<ESM::ExteriorCellLocation, int>> mVitaLandRetry;
+        void vitaQueueLandRetry(const ESM::ExteriorCellLocation& at);
+        void vitaRetryLand();
         void vitaScreenHousekeeping();
         void vitaStoreEvictPass(bool pressure);
         void finishPendingCellLoad(PendingCellLoad& pending);

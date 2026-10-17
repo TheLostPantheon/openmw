@@ -10,6 +10,7 @@
 #include "components/esm3/cellref.hpp"
 
 #include <unordered_map>
+#include <unordered_set>
 
 namespace MWWorld
 {
@@ -71,6 +72,34 @@ namespace MWWorld
                 ++mRevision;
             }
         }
+
+#ifdef __vita__
+        /// After cell stores were freed: drops entries still pointing at one
+        /// of them (their refs live on in another store, so the refs' own
+        /// destructors did not remove them) and reports each first. A Lua
+        /// object resolving through such an entry read the freed cell (the
+        /// teleport crash). Callers must not dereference the cell.
+        template <class Report>
+        std::size_t vitaDropEntriesInCells(const std::unordered_set<const CellStore*>& gone, Report&& report)
+        {
+            const std::unique_lock<Misc::SharedMutex> lock(mVitaMutex);
+            std::size_t n = 0;
+            for (auto it = mIndex.begin(); it != mIndex.end();)
+            {
+                if (it->second.mCell != nullptr && gone.count(it->second.mCell) > 0)
+                {
+                    report(it->first, it->second);
+                    it = mIndex.erase(it);
+                    ++n;
+                }
+                else
+                    ++it;
+            }
+            if (n > 0)
+                ++mRevision;
+            return n;
+        }
+#endif
 
         // For fixing old saves
         void assign(ESM::CellRef& ref)

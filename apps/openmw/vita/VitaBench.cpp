@@ -392,7 +392,10 @@ namespace Vita
                 const Sample& a = mRoute[mCursor];
                 const Sample& b = mRoute[std::min(mCursor + 1, mRoute.size() - 1)];
                 const float span = b.mT - a.mT;
-                const float f = span > 0.f ? std::clamp((t - a.mT) / span, 0.f, 1.f) : 0.f;
+                // Samples far apart are a teleport, not travel: hold at a
+                // rather than slide, so the jump replays as one (below).
+                const float gap = osg::Vec2f(b.mPos[0] - a.mPos[0], b.mPos[1] - a.mPos[1]).length();
+                const float f = span > 0.f && gap <= 4096.f ? std::clamp((t - a.mT) / span, 0.f, 1.f) : 0.f;
 
                 MWWorld::Ptr player = world->getPlayerPtr();
                 const osg::Vec3f pos(a.mPos[0] + (b.mPos[0] - a.mPos[0]) * f, a.mPos[1] + (b.mPos[1] - a.mPos[1]) * f,
@@ -404,8 +407,13 @@ namespace Vita
                     = a.mCell.empty() ? ESM::RefId() : ESM::RefId::deserializeText(a.mCell);
                 const bool toExterior = cellId.is<ESM::ESM3ExteriorCellRefId>();
                 const bool inExterior = player.isInCell() && player.getCell()->isExterior();
+                // An exterior jump of more than a few cells between samples
+                // was a teleport (a scroll, an intervention): replay it as
+                // one, loading screen included, not as a slide.
+                const bool teleportJump = toExterior && inExterior
+                    && (pos - player.getRefData().getPosition().asVec3()).length() > 4096.f;
                 if (!a.mCell.empty() && a.mCell != mCurrentCell && a.mCell != cellIdOf(player)
-                    && !(toExterior && inExterior))
+                    && (!(toExterior && inExterior) || teleportJump))
                 {
                     ESM::Position p;
                     p.pos[0] = pos.x();
@@ -414,6 +422,8 @@ namespace Vita
                     p.rot[0] = a.mPitch;
                     p.rot[1] = 0.f;
                     p.rot[2] = a.mYaw;
+                    if (teleportJump)
+                        breadcrumb("[Bench] replaying a teleport");
                     world->changeToCell(cellId, p, false);
                     mCurrentCell = a.mCell;
                     return;

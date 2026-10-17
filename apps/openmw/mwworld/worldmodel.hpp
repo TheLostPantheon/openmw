@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <components/esm/exteriorcelllocation.hpp>
 #include <components/misc/algorithm.hpp>
@@ -205,6 +206,9 @@ namespace MWWorld
         bool vitaLedgerReadSpan(const VitaLedgerSpan& span, std::string& out) const;
         /// Serialize store state into the ledger; false = store untouched.
         bool vitaSerializeToLedger(CellStore& store);
+        /// [Dangling]: after `gone` were freed, drop and log lookup entries
+        /// still pointing at them. `path` names the eviction.
+        void vitaCheckDanglingCells(const std::unordered_set<const CellStore*>& gone, const char* path);
         void vitaApplyBuffer(const std::string& data);
 #endif
         std::size_t mIdCacheIndex = 0;
