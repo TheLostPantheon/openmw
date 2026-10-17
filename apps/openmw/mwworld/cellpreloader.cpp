@@ -1802,7 +1802,16 @@ namespace MWWorld
 
     bool CellPreloader::isTerrainLoaded(const PositionCellGrid& position, double referenceTime) const
     {
-        return mLoadedTerrainTimestamp + mResourceSystem->getSceneManager()->getExpiryDelay() > referenceTime
+#ifdef __vita__
+        // Terrain stays cached for the land/terrain expiry, not the model
+        // template one: fast travel shortens the latter to 0.5 s, which made
+        // every crossing think its terrain had expired and build it
+        // synchronously.
+        const double expiry = mLandManager->getExpiryDelay();
+#else
+        const double expiry = mResourceSystem->getSceneManager()->getExpiryDelay();
+#endif
+        return mLoadedTerrainTimestamp + expiry > referenceTime
             && contains(mLoadedTerrainPositions, position, Constants::CellSizeInUnits);
     }
 

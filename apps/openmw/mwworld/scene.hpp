@@ -182,6 +182,9 @@ namespace MWWorld
         };
         std::vector<PendingCellLoad> mPendingCellLoads;
         std::chrono::steady_clock::time_point mVitaLastCrossing{};
+        // Player moving at fast-travel speed (>1200 u/s) until then; the
+        // memory governor shortens cache expiry meanwhile.
+        std::chrono::steady_clock::time_point mVitaFastTravelUntil{};
         void vitaScreenHousekeeping();
         void vitaStoreEvictPass(bool pressure);
         void finishPendingCellLoad(PendingCellLoad& pending);

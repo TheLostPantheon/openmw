@@ -1,5 +1,7 @@
 #include "resourcesystem.hpp"
 
+#include "bulletshapemanager.hpp"
+
 #ifdef __vita__
 #include <algorithm>
 #include <cstdlib>
@@ -144,6 +146,21 @@ namespace Resource
 
 
 #ifdef __vita__
+    void ResourceSystem::vitaSetFastTravelExpiry(double objectExpiry, double keyframeExpiry, double otherExpiry)
+    {
+        for (BaseResourceManager* manager : mResourceManagers)
+        {
+            if (manager == static_cast<BaseResourceManager*>(mSceneManager.get())
+                || dynamic_cast<BulletShapeManager*>(manager) != nullptr)
+                manager->setExpiryDelay(objectExpiry);
+            else if (manager == static_cast<BaseResourceManager*>(mKeyframeManager.get()))
+                manager->setExpiryDelay(keyframeExpiry);
+            else
+                manager->setExpiryDelay(otherExpiry);
+        }
+        mNifFileManager->setExpiryDelay(0.0);
+    }
+
     std::string ResourceSystem::vitaClearCachesMeasured(const std::function<std::size_t()>& heapBytes)
     {
         std::vector<BaseResourceManager*> order = mResourceManagers;

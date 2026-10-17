@@ -1390,12 +1390,43 @@ namespace MWWorld
             // flush trigger (budget-20), eased at kGovRate seconds per
             // second so no single pass expires a large backlog. The flush
             // below stays the fallback.
+            //
+            // Fast travel (Icarian Flight): the caches refilled with 5-24 MB
+            // of passed-by models within ~5 s, faster than a 2 s expiry
+            // frees them, so the flush cleared them in 100-650 ms main-thread
+            // stalls (6 on a 2-minute flight). While the player moves above
+            // 1200 u/s (and 3 s after), unreferenced templates and collision
+            // shapes expire after 0.5 s (keyframes 2 s), so the worker's pass
+            // frees them as they fall behind. Images (terrain layers load
+            // through them), terrain chunks and land keep the normal delay:
+            // expiring them made terrain preloads miss and crossings build
+            // terrain synchronously (terr= 0.3-3 s, 11-13 crossings on the
+            // route instead of 4-6).
+            // ux0:data/openmw/nofastexpiry.txt turns that part off (A/B).
             if (vitaMemGovEnabled())
             {
                 constexpr double kGovMinExpiry = 2.0;
                 constexpr double kGovRate = 2.0;
+                // ux0:data/openmw/fastexpiry.txt holding seconds overrides (tuning).
+                static const double kFastExpiry = [] {
+                    double v = 0.5;
+                    if (FILE* f = fopen("ux0:data/openmw/fastexpiry.txt", "r"))
+                    {
+                        if (fscanf(f, "%lf", &v) != 1 || v < 0.1 || v > 10.0)
+                            v = 0.5;
+                        fclose(f);
+                    }
+                    return v;
+                }();
+                constexpr double kFastKeyframeExpiry = 2.0;
+                static const bool sFastOff = [] {
+                    SceIoStat st;
+                    return sceIoGetstat("ux0:data/openmw/nofastexpiry.txt", &st) >= 0;
+                }();
+                const bool fastTravel = !sFastOff && std::chrono::steady_clock::now() < mVitaFastTravelUntil;
                 const double base = Settings::cells().mCacheExpiryDelay;
                 static double sGovExpiry = -1.0, sGovApplied = -1.0;
+                static bool sFastApplied = false;
                 static uint64_t sGovLastUs = 0, sGovLogUs = 0;
                 if (sGovExpiry < 0.0)
                     sGovExpiry = sGovApplied = base;
@@ -1412,21 +1443,32 @@ namespace MWWorld
                 const double step = kGovRate * dt;
                 sGovExpiry = target < sGovExpiry ? std::max(target, sGovExpiry - step)
                                                  : std::min(target, sGovExpiry + step);
-                if (std::abs(sGovExpiry - sGovApplied) >= 0.25 || (sGovExpiry == base && sGovApplied != base))
+                Resource::ResourceSystem* rs = mRendering.getResourceSystem();
+                if (fastTravel != sFastApplied || std::abs(sGovExpiry - sGovApplied) >= 0.25
+                    || (sGovExpiry == base && sGovApplied != base))
                 {
-                    Resource::ResourceSystem* rs = mRendering.getResourceSystem();
-                    rs->setExpiryDelay(sGovExpiry);
-                    // Keyframes keep the base delay: re-parsing them is what
-                    // made the flush skip them too.
-                    rs->getKeyframeManager()->setExpiryDelay(base);
+                    if (fastTravel)
+                        rs->vitaSetFastTravelExpiry(std::min(kFastExpiry, sGovExpiry),
+                            std::min(kFastKeyframeExpiry, sGovExpiry), sGovExpiry);
+                    else
+                    {
+                        rs->setExpiryDelay(sGovExpiry);
+                        // Keyframes keep the base delay: re-parsing them is
+                        // what made the flush skip them too.
+                        rs->getKeyframeManager()->setExpiryDelay(base);
+                    }
                     sGovApplied = sGovExpiry;
+                    sFastApplied = fastTravel;
                 }
-                if (sGovApplied < base && nowUs - sGovLogUs > 5000000)
+                if ((sGovApplied < base || fastTravel) && nowUs - sGovLogUs > 5000000)
                 {
                     sGovLogUs = nowUs;
-                    char gb[96];
-                    snprintf(gb, sizeof(gb), "[MemGov] heap=%dMB expiry=%.1fs (target %.1fs)", usedMB, sGovApplied,
-                        target);
+                    char gb[112];
+                    char fast[48] = "";
+                    if (fastTravel)
+                        snprintf(fast, sizeof(fast), ", objects %.1fs (fast travel)", std::min(kFastExpiry, sGovApplied));
+                    snprintf(gb, sizeof(gb), "[MemGov] heap=%dMB expiry=%.1fs (target %.1fs)%s", usedMB, sGovApplied,
+                        target, fast);
                     Vita::breadcrumb(gb);
                 }
             }
@@ -3797,6 +3839,8 @@ namespace MWWorld
         // Touchdown drain deleted: time-to-need prefetch + nearest-first
         // demand pump clear the small landing tail (~20 models) without a stall.
         sLastSpeed = vitaPlayerSpeed;
+        if (vitaPlayerSpeed > 1200.f)
+            mVitaFastTravelUntil = nowTtn + std::chrono::seconds(3);
         sLastPP = osg::Vec2f(pp.x(), pp.y());
         sLastPPT = nowTtn;
         const float vitaWindowUnits = vitaPlayerSpeed
