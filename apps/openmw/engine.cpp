@@ -916,6 +916,8 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             vitaPhaseT0 = sceKernelGetProcessTimeWide();
             vitaMainPhase("focus");
             mWorld->updateFocusObject();
+            if (mWorld->vitaFocusDeferred())
+                s_focusAccum = 0.1f; // physics lock was busy: retry next frame
             phase_focus_us = (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
         }
 #else

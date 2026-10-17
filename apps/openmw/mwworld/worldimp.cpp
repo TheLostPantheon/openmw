@@ -2271,16 +2271,30 @@ namespace MWWorld
             // [Focus]: faced-object lookup vs GUI update, per call (it runs
             // ten times a second and averaged 1.4 ms a frame in a town).
             static uint64_t sFoUs[3] = {};
-            static unsigned sFoCalls = 0;
+            static unsigned sFoCalls = 0, sFoBusy = 0;
             uint64_t foT = sceKernelGetProcessTimeWide();
+            static const bool sNoTry = [] {
+                SceIoStat st;
+                return sceIoGetstat("ux0:data/openmw/nofocustry.txt", &st) >= 0;
+            }();
+            mVitaFocusBusy = false;
+            mVitaFocusTry = !sNoTry && mVitaFocusBusyFrames < 3;
 #endif
             MWWorld::Ptr object = getFocusObject();
 #ifdef __vita__
+            mVitaFocusTry = false;
             {
                 const uint64_t now = sceKernelGetProcessTimeWide();
                 sFoUs[0] += now - foT;
                 foT = now;
             }
+            if (mVitaFocusBusy)
+            {
+                ++mVitaFocusBusyFrames;
+                ++sFoBusy;
+                return; // keep the last focus; the engine calls again next frame
+            }
+            mVitaFocusBusyFrames = 0;
 #endif
 
             // retrieve the object's top point's screen position so we know where to place the floating label
@@ -2310,12 +2324,13 @@ namespace MWWorld
             sFoUs[2] += sceKernelGetProcessTimeWide() - foT;
             if (++sFoCalls >= 50)
             {
-                char fb[128];
-                snprintf(fb, sizeof(fb), "[Focus] per call: faced=%.2f screen=%.2f gui=%.2f ms", sFoUs[0] / 1000.0 / sFoCalls,
-                    sFoUs[1] / 1000.0 / sFoCalls, sFoUs[2] / 1000.0 / sFoCalls);
+                // faced includes the deferred calls' (busy) ray time.
+                char fb[160];
+                snprintf(fb, sizeof(fb), "[Focus] per call: faced=%.2f screen=%.2f gui=%.2f ms, %u deferred (lock busy)",
+                    sFoUs[0] / 1000.0 / sFoCalls, sFoUs[1] / 1000.0 / sFoCalls, sFoUs[2] / 1000.0 / sFoCalls, sFoBusy);
                 Vita::breadcrumb(fb);
                 sFoUs[0] = sFoUs[1] = sFoUs[2] = 0;
-                sFoCalls = 0;
+                sFoCalls = sFoBusy = 0;
             }
 #endif
         }
@@ -2323,6 +2338,8 @@ namespace MWWorld
         {
             Log(Debug::Error) << "Error updating focus object: " << e.what();
 #ifdef __vita__
+            mVitaFocusTry = false;
+            mVitaFocusBusy = false;
             static std::chrono::steady_clock::time_point sLastFocusErr{};
             const auto nowFe = std::chrono::steady_clock::now();
             if (nowFe - sLastFocusErr > std::chrono::seconds(5))
@@ -2360,8 +2377,21 @@ namespace MWWorld
             if (ignorePlayer)
                 ignore.push_back(mPlayer->getPlayer());
             const uint64_t vitaRayT0 = sceKernelGetProcessTimeWide();
-            const MWPhysics::RayCastingResult phys = mPhysics->castRay(rayStart, rayEnd, ignore, {},
-                MWPhysics::CollisionType_Default | MWPhysics::CollisionType_VisualOnly);
+            constexpr int kFocusMask = MWPhysics::CollisionType_Default | MWPhysics::CollisionType_VisualOnly;
+            MWPhysics::RayCastingResult phys;
+            if (mVitaFocusTry)
+            {
+                const std::optional<MWPhysics::RayCastingResult> tried
+                    = mPhysics->vitaTryCastRay(rayStart, rayEnd, ignore, kFocusMask);
+                if (!tried)
+                {
+                    mVitaFocusBusy = true;
+                    return MWWorld::Ptr();
+                }
+                phys = *tried;
+            }
+            else
+                phys = mPhysics->castRay(rayStart, rayEnd, ignore, {}, kFocusMask);
             const uint64_t vitaRayT1 = sceKernelGetProcessTimeWide();
             const float physDist
                 = (phys.mHit && !phys.mHitObject.isEmpty()) ? (phys.mHitPos - rayStart).length() : -1.f;

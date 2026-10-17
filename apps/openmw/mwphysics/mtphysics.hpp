@@ -64,6 +64,10 @@ namespace MWPhysics
         void convexSweepTest(const btConvexShape* castShape, const btTransform& from, const btTransform& to,
             btCollisionWorld::ConvexResultCallback& resultCallback) const;
 #ifdef __vita__
+        /// As rayTest, but returns false instead of waiting when the
+        /// collision world is locked (the physics thread moving actors).
+        bool tryRayTest(const btVector3& rayFromWorld, const btVector3& rayToWorld,
+            btCollisionWorld::RayResultCallback& resultCallback) const;
         /// As convexSweepTest, but returns false instead of waiting when the
         /// collision world is locked (the physics thread moving actors).
         bool tryConvexSweepTest(const btConvexShape* castShape, const btTransform& from, const btTransform& to,

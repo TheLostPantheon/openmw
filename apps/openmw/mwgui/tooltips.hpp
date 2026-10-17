@@ -133,6 +133,20 @@ namespace MWGui
         bool mFullHelp;
 
         float mFrameDuration;
+
+#ifdef __vita__
+        // update() runs on every gameplay focus refresh (10 Hz) and rebuilt
+        // the focus tooltip's widgets each time: 2.7-3.8 ms a call with NPCs
+        // under the crosshair. The built tooltip is kept while the object
+        // and everything it shows are unchanged; only its position follows.
+        // ux0:data/openmw/notipreuse.txt rebuilds every time (A/B).
+        bool vitaReuseFocusToolTip();
+        std::string vitaFocusToolTipKey(bool isOwned) const;
+        MWWorld::Ptr mVitaTipObject;
+        std::string mVitaTipKey;
+        MyGUI::IntSize mVitaTipSize;
+        bool mVitaTipValid = false;
+#endif
     };
 }
 #endif

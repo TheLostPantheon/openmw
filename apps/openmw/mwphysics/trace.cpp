@@ -1,5 +1,9 @@
 #include "trace.h"
 
+#ifdef __vita__
+#include <psp2/kernel/processmgr.h>
+#endif
+
 #include <components/misc/convert.hpp>
 
 #include <BulletCollision/CollisionDispatch/btCollisionWorld.h>
@@ -11,6 +15,11 @@
 
 namespace MWPhysics
 {
+#ifdef __vita__
+    // Actor sweeps (movement solver, stepping, ground traces) for
+    // [PhysThread]; nearly all run on the physics thread.
+    uint32_t gVitaSweeps = 0, gVitaSweepUs = 0;
+#endif
 
     ActorConvexCallback sweepHelper(const btCollisionObject* actor, const btVector3& from, const btVector3& to,
         const btCollisionWorld* world, bool actorFilter)
@@ -33,7 +42,14 @@ namespace MWPhysics
         if (actorFilter)
             traceCallback.m_collisionFilterMask &= ~CollisionType_Actor;
 
+#ifdef __vita__
+        const uint64_t t0 = sceKernelGetProcessTimeWide();
         world->convexSweepTest(static_cast<const btConvexShape*>(shape), transFrom, transTo, traceCallback);
+        gVitaSweeps += 1;
+        gVitaSweepUs += (uint32_t)(sceKernelGetProcessTimeWide() - t0);
+#else
+        world->convexSweepTest(static_cast<const btConvexShape*>(shape), transFrom, transTo, traceCallback);
+#endif
         return traceCallback;
     }
 

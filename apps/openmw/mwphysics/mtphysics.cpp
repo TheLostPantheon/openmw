@@ -42,6 +42,8 @@
 #include "../vita/VitaInit.h"
 #include "../vita/VitaSimWorker.h"
 #include <psp2/kernel/processmgr.h>
+#include <psp2/io/stat.h>
+#include <cstdio>
 #endif
 #include "object.hpp"
 #include "physicssystem.hpp"
@@ -54,24 +56,42 @@ namespace MWPhysics
     // time waiting for the collision world lock vs the query itself.
     uint64_t gVitaQueryLockUs = 0, gVitaQueryUs = 0;
     unsigned gVitaQueryCalls = 0;
+    // The same for the sim thread (AI, combat, movement queries), and the
+    // async physics thread's step: wall time and its thread id, which
+    // [PhysThread] reads the scheduler's view of (core, preemptions).
+    uint32_t gVitaSimQueryLockUs = 0, gVitaSimQueryUs = 0, gVitaSimQueryCalls = 0;
+    uint32_t gVitaPhysStepUs = 0, gVitaPhysSteps = 0, gVitaPhysLosUs = 0;
+    int gVitaPhysThreadUid = 0;
+    // Idle-actor solve skipping (Visitors::Move): step count and per-actor
+    // solves vs skips, for [PhysThread].
+    unsigned gVitaPhysStep = 0;
+    uint32_t gVitaPhysActorSolves = 0, gVitaPhysIdleSkips = 0;
+    // Default placement (worker()): core 0 below main's priority (160), so
+    // it runs while main waits on the sim job and never delays main.
+    constexpr int kVitaPhysCore = 0;
+    constexpr int kVitaPhysPriority = 161;
     namespace
     {
         struct VitaQueryTimer
         {
-            const bool mMain = !Vita::isSimThread();
-            const uint64_t mT0 = mMain ? sceKernelGetProcessTimeWide() : 0;
+            const bool mSim = Vita::isSimThread();
+            const uint64_t mT0 = sceKernelGetProcessTimeWide();
             uint64_t mT1 = 0;
-            void locked()
-            {
-                if (mMain)
-                    mT1 = sceKernelGetProcessTimeWide();
-            }
+            void locked() { mT1 = sceKernelGetProcessTimeWide(); }
             ~VitaQueryTimer()
             {
-                if (!mMain)
+                const uint64_t t2 = sceKernelGetProcessTimeWide();
+                if (mT1 == 0)
+                    mT1 = t2;
+                if (mSim)
+                {
+                    gVitaSimQueryLockUs += (uint32_t)(mT1 - mT0);
+                    gVitaSimQueryUs += (uint32_t)(t2 - mT1);
+                    ++gVitaSimQueryCalls;
                     return;
+                }
                 gVitaQueryLockUs += mT1 - mT0;
-                gVitaQueryUs += sceKernelGetProcessTimeWide() - mT1;
+                gVitaQueryUs += t2 - mT1;
                 ++gVitaQueryCalls;
             }
         };
@@ -268,6 +288,27 @@ namespace
             }
         };
 
+#ifdef __vita__
+        // Idle actors (no movement, inertia, flight or swimming, standing on
+        // flat ground) get a full solve on one step in four, staggered per
+        // actor: the solve is 1-2 convex sweeps that find the same ground
+        // again, ~0.1-0.3 ms each in a town. Gravity resumes within 3 steps
+        // if the ground goes away. ux0:data/openmw/nophysidle.txt: every step.
+        bool vitaSkipIdleSolve(const MWPhysics::Actor* actor, const MWPhysics::ActorFrameData& d)
+        {
+            static const bool sOff = [] {
+                SceIoStat st;
+                return sceIoGetstat("ux0:data/openmw/nophysidle.txt", &st) >= 0;
+            }();
+            if (sOff || d.mIsPlayer || d.mSkipCollisionDetection || d.mFlying || !d.mIsOnGround || d.mIsOnSlope
+                || d.mStuckFrames != 0 || d.mMovement.length2() != 0.f || d.mInertia.length2() != 0.f
+                || d.mPosition.z() < d.mSwimLevel)
+                return false;
+            const unsigned stagger = static_cast<unsigned>(reinterpret_cast<uintptr_t>(actor) >> 4);
+            return ((MWPhysics::gVitaPhysStep + stagger) & 3u) != 0;
+        }
+#endif
+
         struct Move
         {
             const float mPhysicsDt;
@@ -275,6 +316,15 @@ namespace
             const MWPhysics::WorldFrameData& mWorldFrameData;
             void operator()(const LockedActorSimulation& sim) const
             {
+#ifdef __vita__
+                if (vitaSkipIdleSolve(sim.first.get(), sim.second))
+                {
+                    ++MWPhysics::gVitaPhysIdleSkips;
+                    return;
+                }
+                ++MWPhysics::gVitaPhysActorSolves;
+                sim.second.get().mVitaSolved = true;
+#endif
                 MWPhysics::MovementSolver::move(sim.second, mPhysicsDt, mCollisionWorld, mWorldFrameData);
             }
             void operator()(const LockedProjectileSimulation& sim) const
@@ -311,7 +361,12 @@ namespace
                 actor->setSimulationPosition(::interpolateMovements(*actor, mTimeAccum, mPhysicsDt));
                 actor->setLastStuckPosition(frameData.mLastStuckPosition);
                 actor->setStuckFrames(frameData.mStuckFrames);
+#ifdef __vita__
+                // No step solved it (idle skip): its ground state is as it was.
+                if (mAdvanceSimulation && frameData.mVitaSolved)
+#else
                 if (mAdvanceSimulation)
+#endif
                 {
                     MWWorld::Ptr standingOn;
                     if (frameData.mStandingOn != nullptr)
@@ -740,6 +795,21 @@ namespace MWPhysics
     }
 
 #ifdef __vita__
+    bool PhysicsTaskScheduler::tryRayTest(const btVector3& rayFromWorld, const btVector3& rayToWorld,
+        btCollisionWorld::RayResultCallback& resultCallback) const
+    {
+        if (mLockingPolicy == LockingPolicy::NoLocks)
+        {
+            mCollisionWorld->rayTest(rayFromWorld, rayToWorld, resultCallback);
+            return true;
+        }
+        std::unique_lock<Misc::SharedMutex> lock(mCollisionWorldMutex, std::try_to_lock);
+        if (!lock.owns_lock())
+            return false;
+        mCollisionWorld->rayTest(rayFromWorld, rayToWorld, resultCallback);
+        return true;
+    }
+
     bool PhysicsTaskScheduler::tryConvexSweepTest(const btConvexShape* castShape, const btTransform& from,
         const btTransform& to, btCollisionWorld::ConvexResultCallback& resultCallback) const
     {
@@ -759,7 +829,13 @@ namespace MWPhysics
     void PhysicsTaskScheduler::contactTest(
         btCollisionObject* colObj, btCollisionWorld::ContactResultCallback& resultCallback)
     {
+        #ifdef __vita__
+        VitaQueryTimer timer;
+#endif
         MaybeSharedLock lock(mCollisionWorldMutex, mLockingPolicy);
+#ifdef __vita__
+        timer.locked();
+#endif
         ContactTestWrapper::contactTest(mCollisionWorld, colObj, resultCallback);
     }
 
@@ -772,13 +848,25 @@ namespace MWPhysics
         // path was reached unlocked via PhysicsSystem and produced a
         // SceGxm-class data abort inside Bullet's rayTestSingleInternal
         // when an arrow happened to be in flight during a cell change.
+        #ifdef __vita__
+        VitaQueryTimer timer;
+#endif
         MaybeLock lock(mCollisionWorldMutex, mLockingPolicy);
+#ifdef __vita__
+        timer.locked();
+#endif
         return actor->canMoveToWaterSurface(waterlevel, mCollisionWorld);
     }
 
     std::optional<btVector3> PhysicsTaskScheduler::getHitPoint(const btTransform& from, btCollisionObject* target)
     {
+        #ifdef __vita__
+        VitaQueryTimer timer;
+#endif
         MaybeLock lock(mCollisionWorldMutex, mLockingPolicy);
+#ifdef __vita__
+        timer.locked();
+#endif
         // target the collision object's world origin, this should be the center of the collision object
         btTransform rayTo;
         rayTo.setIdentity();
@@ -797,33 +885,63 @@ namespace MWPhysics
     void PhysicsTaskScheduler::aabbTest(
         const btVector3& aabbMin, const btVector3& aabbMax, btBroadphaseAabbCallback& callback)
     {
+        #ifdef __vita__
+        VitaQueryTimer timer;
+#endif
         MaybeSharedLock lock(mCollisionWorldMutex, mLockingPolicy);
+#ifdef __vita__
+        timer.locked();
+#endif
         mCollisionWorld->getBroadphase()->aabbTest(aabbMin, aabbMax, callback);
     }
 
     void PhysicsTaskScheduler::getAabb(const btCollisionObject* obj, btVector3& min, btVector3& max)
     {
+        #ifdef __vita__
+        VitaQueryTimer timer;
+#endif
         MaybeSharedLock lock(mCollisionWorldMutex, mLockingPolicy);
+#ifdef __vita__
+        timer.locked();
+#endif
         obj->getCollisionShape()->getAabb(obj->getWorldTransform(), min, max);
     }
 
     void PhysicsTaskScheduler::setCollisionFilterMask(btCollisionObject* collisionObject, int collisionFilterMask)
     {
+        #ifdef __vita__
+        VitaQueryTimer timer;
+#endif
         MaybeExclusiveLock lock(mCollisionWorldMutex, mLockingPolicy);
+#ifdef __vita__
+        timer.locked();
+#endif
         collisionObject->getBroadphaseHandle()->m_collisionFilterMask = collisionFilterMask;
     }
 
     void PhysicsTaskScheduler::addCollisionObject(
         btCollisionObject* collisionObject, int collisionFilterGroup, int collisionFilterMask)
     {
+        #ifdef __vita__
+        VitaQueryTimer timer;
+#endif
         MaybeExclusiveLock lock(mCollisionWorldMutex, mLockingPolicy);
+#ifdef __vita__
+        timer.locked();
+#endif
         mCollisionObjects.insert(collisionObject);
         mCollisionWorld->addCollisionObject(collisionObject, collisionFilterGroup, collisionFilterMask);
     }
 
     void PhysicsTaskScheduler::removeCollisionObject(btCollisionObject* collisionObject)
     {
+        #ifdef __vita__
+        VitaQueryTimer timer;
+#endif
         MaybeExclusiveLock lock(mCollisionWorldMutex, mLockingPolicy);
+#ifdef __vita__
+        timer.locked();
+#endif
         mCollisionObjects.erase(collisionObject);
         mCollisionWorld->removeCollisionObject(collisionObject);
     }
@@ -844,7 +962,13 @@ namespace MWPhysics
     bool PhysicsTaskScheduler::getLineOfSight(
         const std::shared_ptr<Actor>& actor1, const std::shared_ptr<Actor>& actor2)
     {
+        #ifdef __vita__
+        VitaQueryTimer timer;
+#endif
         MaybeExclusiveLock lock(mLOSCacheMutex, mLockingPolicy);
+#ifdef __vita__
+        timer.locked();
+#endif
 
         auto req = LOSRequest(actor1, actor2);
         auto result = std::find(mLOSCache.begin(), mLOSCache.end(), req);
@@ -909,9 +1033,47 @@ namespace MWPhysics
 
     void PhysicsTaskScheduler::worker()
     {
+#ifdef __vita__
+        gVitaPhysThreadUid = sceKernelGetThreadId();
+        // Placement: unpinned at the default priority, the thread (~8 ms a
+        // step with NPCs about) ran wherever the kernel put it, often core 1
+        // beside the sim worker at the same priority, which cannot preempt
+        // it. ux0:data/openmw/physcore.txt "<core> <priority>" places it
+        // ("-1" leaves it unpinned); the default is below.
+        {
+            int core = kVitaPhysCore, prio = kVitaPhysPriority;
+            if (FILE* f = fopen("ux0:data/openmw/physcore.txt", "r"))
+            {
+                int c = 0, p = 0;
+                const int n = fscanf(f, "%d %d", &c, &p);
+                fclose(f);
+                if (n >= 1)
+                    core = c;
+                if (n >= 2)
+                    prio = p;
+            }
+            if (prio > 0)
+                sceKernelChangeThreadPriority(0, prio);
+            char buf[96];
+            if (core >= 0)
+                Vita::pinCurrentThread(core, "physics");
+            else
+            {
+                snprintf(buf, sizeof(buf), "[Thread] physics unpinned (prio %d)", sceKernelGetThreadCurrentPriority());
+                Vita::breadcrumb(buf);
+            }
+        }
+#endif
         mWorkersSync->runWorker([this] {
             std::shared_lock lock(mSimulationMutex);
+#ifdef __vita__
+            const uint64_t t0 = sceKernelGetProcessTimeWide();
             doSimulation();
+            gVitaPhysStepUs += (uint32_t)(sceKernelGetProcessTimeWide() - t0);
+            ++gVitaPhysSteps;
+#else
+            doSimulation();
+#endif
         });
     }
 
@@ -945,6 +1107,9 @@ namespace MWPhysics
     {
         while (mRemainingSteps)
         {
+#ifdef __vita__
+            ++gVitaPhysStep;
+#endif
             mPreStepBarrier->wait([this] { afterPreStep(); });
             int job = 0;
             const Visitors::Move impl{ mPhysicsDt, mCollisionWorld, *mWorldFrameData };
@@ -955,7 +1120,13 @@ namespace MWPhysics
             mPostStepBarrier->wait([this] { afterPostStep(); });
         }
 
+#ifdef __vita__
+        const uint64_t losT0 = sceKernelGetProcessTimeWide();
         refreshLOSCache();
+        gVitaPhysLosUs += (uint32_t)(sceKernelGetProcessTimeWide() - losT0);
+#else
+        refreshLOSCache();
+#endif
         mPostSimBarrier->wait([this] { afterPostSim(); });
     }
 

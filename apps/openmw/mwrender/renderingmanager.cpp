@@ -95,10 +95,16 @@
 #include "../vita/VitaInit.h"
 #ifdef __vita__
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
 namespace MWPhysics
 {
     extern uint64_t gVitaQueryLockUs, gVitaQueryUs;
     extern unsigned gVitaQueryCalls;
+    extern uint32_t gVitaSimQueryLockUs, gVitaSimQueryUs, gVitaSimQueryCalls;
+    extern uint32_t gVitaPhysStepUs, gVitaPhysSteps, gVitaPhysLosUs;
+    extern uint32_t gVitaPhysActorSolves, gVitaPhysIdleSkips;
+    extern uint32_t gVitaSweeps, gVitaSweepUs;
+    extern int gVitaPhysThreadUid;
 }
 #endif
 #include "../vita/VitaSimWorker.h"
@@ -1099,7 +1105,7 @@ namespace MWRender
         VITA_RU_LAP(7);
         if (++sRuFrames >= 150)
         {
-            char rb[200];
+            char rb[320];
             snprintf(rb, sizeof(rb),
                 "[RendUpd] stats=%.2f shaders=%.2f water=%.2f fx=%.2f sky=%.2f nav=%.2f camera=%.2f fog+unif=%.2f "
                 "ms/frame",
@@ -1115,6 +1121,51 @@ namespace MWRender
                 Vita::breadcrumb(rb);
                 MWPhysics::gVitaQueryLockUs = MWPhysics::gVitaQueryUs = 0;
                 MWPhysics::gVitaQueryCalls = 0;
+            }
+            if (MWPhysics::gVitaSimQueryCalls > 0)
+            {
+                snprintf(rb, sizeof(rb), "[PhysQuery] sim thread: %.1f calls, lock wait %.2f ms, query %.2f ms /frame",
+                    (double)MWPhysics::gVitaSimQueryCalls / sRuFrames,
+                    MWPhysics::gVitaSimQueryLockUs / 1000.0 / sRuFrames,
+                    MWPhysics::gVitaSimQueryUs / 1000.0 / sRuFrames);
+                Vita::breadcrumb(rb);
+                MWPhysics::gVitaSimQueryLockUs = MWPhysics::gVitaSimQueryUs = MWPhysics::gVitaSimQueryCalls = 0;
+            }
+            // [PhysThread]: the async physics thread's step (wall vs CPU
+            // time: the gap is time it was runnable but not running, or
+            // waiting) and how the scheduler treats it.
+            if (MWPhysics::gVitaPhysThreadUid > 0)
+            {
+                SceKernelThreadInfo ti;
+                ti.size = sizeof(ti);
+                if (sceKernelGetThreadInfo(MWPhysics::gVitaPhysThreadUid, &ti) >= 0)
+                {
+                    static uint64_t sRun = 0;
+                    static uint32_t sPre = 0, sMig = 0;
+                    const uint64_t run = ti.runClocks;
+                    if (sRun != 0)
+                    {
+                        snprintf(rb, sizeof(rb),
+                            "[PhysThread] %.2f steps, wall %.2f ms (los %.2f), cpu %.2f ms /frame; actor solves %.1f, "
+                            "idle skips %.1f, sweeps %.1f (%.0f us each) /frame; core %d mask 0x%x prio %d; %u preempts, %u migrations",
+                            (double)MWPhysics::gVitaPhysSteps / sRuFrames,
+                            MWPhysics::gVitaPhysStepUs / 1000.0 / sRuFrames,
+                            MWPhysics::gVitaPhysLosUs / 1000.0 / sRuFrames, (run - sRun) / 1000.0 / sRuFrames,
+                            (double)MWPhysics::gVitaPhysActorSolves / sRuFrames,
+                            (double)MWPhysics::gVitaPhysIdleSkips / sRuFrames,
+                            (double)MWPhysics::gVitaSweeps / sRuFrames,
+                            MWPhysics::gVitaSweeps ? (double)MWPhysics::gVitaSweepUs / MWPhysics::gVitaSweeps : 0.0,
+                            (int)ti.lastExecutedCpuId, (unsigned)ti.currentCpuAffinityMask, (int)ti.currentPriority,
+                            ti.threadPreemptCount - sPre, (unsigned)ti.changeCpuCount - sMig);
+                        Vita::breadcrumb(rb);
+                    }
+                    sRun = run;
+                    sPre = ti.threadPreemptCount;
+                    sMig = (uint32_t)ti.changeCpuCount;
+                }
+                MWPhysics::gVitaPhysStepUs = MWPhysics::gVitaPhysSteps = MWPhysics::gVitaPhysLosUs = 0;
+                MWPhysics::gVitaPhysActorSolves = MWPhysics::gVitaPhysIdleSkips = 0;
+                MWPhysics::gVitaSweeps = MWPhysics::gVitaSweepUs = 0;
             }
             std::fill(std::begin(sRuUs), std::end(sRuUs), 0);
             sRuFrames = 0;

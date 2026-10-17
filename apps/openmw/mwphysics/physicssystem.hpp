@@ -104,6 +104,12 @@ namespace MWPhysics
         const bool mWaterCollision;
         const bool mSkipCollisionDetection;
         const bool mIsPlayer;
+#ifdef __vita__
+        // Set when a step solved this actor (mtphysics.cpp skips some steps
+        // for actors standing still); Sync keeps the actor's ground state
+        // when no step did.
+        bool mVitaSolved = false;
+#endif
     };
 
     struct ProjectileFrameData
@@ -226,6 +232,10 @@ namespace MWPhysics
         using RayCastingInterface::castRay;
 
 #ifdef __vita__
+        /// castRay (no target filter) without waiting for the collision world
+        /// lock: nullopt when the physics thread holds it.
+        std::optional<RayCastingResult> vitaTryCastRay(const osg::Vec3f& from, const osg::Vec3f& to,
+            const std::vector<MWWorld::ConstPtr>& ignore, int mask, int group = 0xff) const;
         /// castSphere without waiting for the collision world lock: nullopt
         /// when the physics thread holds it.
         std::optional<RayCastingResult> vitaTryCastSphere(const osg::Vec3f& from, const osg::Vec3f& to,

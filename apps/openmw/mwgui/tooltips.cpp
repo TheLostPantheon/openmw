@@ -1,5 +1,9 @@
 #include "tooltips.hpp"
 
+#ifdef __vita__
+#include <psp2/io/stat.h>
+#endif
+
 #include <format>
 #include <iomanip>
 
@@ -76,6 +80,11 @@ namespace MWGui
 
     void ToolTips::update(float frameDuration)
     {
+#ifdef __vita__
+        if (vitaReuseFocusToolTip())
+            return;
+        mVitaTipValid = false;
+#endif
 
         while (mDynamicToolTipBox->getChildCount())
         {
@@ -312,13 +321,24 @@ namespace MWGui
         {
             if (!mFocusObject.isEmpty())
             {
+#ifdef __vita__
+                const bool isOwned = checkOwned();
+                MyGUI::IntSize tooltipSize = getToolTipViaPtr(mFocusObject.getCellRef().getCount(), true, isOwned);
+#else
                 MyGUI::IntSize tooltipSize = getToolTipViaPtr(mFocusObject.getCellRef().getCount(), true, checkOwned());
+#endif
 
                 const int left = viewSize.width / 2 - tooltipSize.width / 2;
                 const int top = std::max(0, int(mFocusToolTipY * viewSize.height - tooltipSize.height - 20));
                 setCoord(left, top, tooltipSize.width, tooltipSize.height);
 
                 mDynamicToolTipBox->setVisible(true);
+#ifdef __vita__
+                mVitaTipObject = mFocusObject;
+                mVitaTipKey = vitaFocusToolTipKey(isOwned);
+                mVitaTipSize = tooltipSize;
+                mVitaTipValid = true;
+#endif
             }
         }
     }
@@ -343,6 +363,9 @@ namespace MWGui
     void ToolTips::clear()
     {
         mFocusObject = MWWorld::Ptr();
+#ifdef __vita__
+        mVitaTipValid = false;
+#endif
 
         while (mDynamicToolTipBox->getChildCount())
         {
@@ -386,6 +409,62 @@ namespace MWGui
 
         return tooltipSize;
     }
+
+#ifdef __vita__
+    bool ToolTips::vitaReuseFocusToolTip()
+    {
+        static const bool sOff = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/notipreuse.txt", &st) >= 0;
+        }();
+        if (sOff || !mVitaTipValid || !mEnabled || mFocusObject.isEmpty() || mFocusObject != mVitaTipObject
+            || MWBase::Environment::get().getWindowManager()->isGuiMode())
+            return false;
+        if (vitaFocusToolTipKey(checkOwned()) != mVitaTipKey)
+            return false;
+        // As the gameplay branch of update() places a fresh one.
+        const MyGUI::IntSize& viewSize = MyGUI::RenderManager::getInstance().getViewSize();
+        const int left = viewSize.width / 2 - mVitaTipSize.width / 2;
+        const int top = std::max(0, int(mFocusToolTipY * viewSize.height - mVitaTipSize.height - 20));
+        setCoord(left, top, mVitaTipSize.width, mVitaTipSize.height);
+        return true;
+    }
+
+    std::string ToolTips::vitaFocusToolTipKey(bool isOwned) const
+    {
+        // Everything createToolTip() reads, as text.
+        const MWWorld::Class& cls = mFocusObject.getClass();
+        if (!cls.hasToolTip(mFocusObject))
+            return "-";
+        const ToolTipInfo info = cls.getToolTipInfo(mFocusObject, mFocusObject.getCellRef().getCount());
+        std::string key;
+        key.reserve(info.caption.size() + info.text.size() + info.extra.size() + info.icon.size() + 64);
+        const auto field = [&key](std::string_view s) {
+            key += s;
+            key += '\x1f';
+        };
+        field(info.caption);
+        field(info.text);
+        field(info.extra);
+        field(info.icon);
+        field(info.enchant.serializeText());
+        for (const std::string& note : info.notes)
+            field(note);
+        for (const Widgets::SpellEffectParams& e : info.effects)
+        {
+            field(e.mEffectID.serializeText());
+            field(e.mSkill.serializeText());
+            field(e.mAttribute.serializeText());
+            key += std::to_string(e.mMagnMin) + ',' + std::to_string(e.mMagnMax) + ',' + std::to_string(e.mRange) + ','
+                + std::to_string(e.mDuration) + ',' + std::to_string(e.mArea) + ','
+                + char('0' + e.mNoTarget + 2 * e.mIsConstant + 4 * e.mNoMagnitude + 8 * e.mKnown);
+        }
+        key += std::to_string(info.imageSize) + ',' + std::to_string(info.remainingEnchantCharge) + ','
+            + char('0' + info.isPotion + 2 * info.isIngredient + 4 * info.wordWrap + 8 * isOwned + 16 * mFullHelp)
+            + std::to_string(Settings::game().mShowOwned);
+        return key;
+    }
+#endif
 
     bool ToolTips::checkOwned()
     {

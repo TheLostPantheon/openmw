@@ -182,6 +182,8 @@ def main():
     ap.add_argument("--settle", type=float, help="seconds at the route start before timing (default 2)")
     ap.add_argument("--fps", type=float, help="session frame cap and streaming target (0 = uncapped, target 60)")
     ap.add_argument("--god", action="store_true", help="god mode on at the route start (routes recorded with tgm)")
+    ap.add_argument("--save", help="save file name to load (any character folder), e.g. bench-npcs.omwsave; "
+                    "default: the most recent save")
     ap.add_argument("--race", action="store_true",
                     help="move the player without waiting for the physics step (physics lock test)")
     ap.add_argument("--shot", help="screenshot times in seconds after the route start is placed, e.g. 2,3.5; "
@@ -195,6 +197,8 @@ def main():
         BENCH_OPTIONS.append(f"fps={args.fps:g}")
     if args.shot:
         BENCH_OPTIONS.append(f"shot={args.shot}")
+    if args.save:
+        BENCH_OPTIONS.append(f"save={args.save}")
     if args.race:
         BENCH_OPTIONS.append("race")
     if args.god:

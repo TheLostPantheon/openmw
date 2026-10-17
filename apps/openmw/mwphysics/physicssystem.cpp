@@ -290,6 +290,44 @@ namespace MWPhysics
     }
 
 #ifdef __vita__
+    std::optional<RayCastingResult> PhysicsSystem::vitaTryCastRay(const osg::Vec3f& from, const osg::Vec3f& to,
+        const std::vector<MWWorld::ConstPtr>& ignore, int mask, int group) const
+    {
+        if (from == to)
+            return RayCastingResult{};
+        const btVector3 btFrom = Misc::Convert::toBullet(from);
+        const btVector3 btTo = Misc::Convert::toBullet(to);
+
+        std::vector<const btCollisionObject*> ignoreList;
+        for (const auto& ptr : ignore)
+        {
+            if (ptr.isEmpty())
+                continue;
+            if (const Actor* actor = getActor(ptr))
+                ignoreList.push_back(actor->getCollisionObject());
+            else if (const Object* object = getObject(ptr))
+                ignoreList.push_back(object->getCollisionObject());
+        }
+
+        ClosestNotMeRayResultCallback resultCallback(ignoreList, {}, btFrom, btTo);
+        resultCallback.m_collisionFilterGroup = group;
+        resultCallback.m_collisionFilterMask = mask;
+
+        if (!mTaskScheduler->tryRayTest(btFrom, btTo, resultCallback))
+            return std::nullopt;
+
+        RayCastingResult result;
+        result.mHit = resultCallback.hasHit();
+        if (result.mHit)
+        {
+            result.mHitPos = Misc::Convert::toOsg(resultCallback.m_hitPointWorld);
+            result.mHitNormal = Misc::Convert::toOsg(resultCallback.m_hitNormalWorld);
+            if (PtrHolder* ptrHolder = static_cast<PtrHolder*>(resultCallback.m_collisionObject->getUserPointer()))
+                result.mHitObject = ptrHolder->getPtr();
+        }
+        return result;
+    }
+
     std::optional<RayCastingResult> PhysicsSystem::vitaTryCastSphere(
         const osg::Vec3f& from, const osg::Vec3f& to, float radius, int mask, int group) const
     {
