@@ -111,6 +111,8 @@ static void countDrawables(const osg::Node* node, unsigned int& drawableCount, u
 #include "../mwbase/statemanager.hpp"
 
 #include "../mwrender/landmanager.hpp"
+#include "../mwlua/luamanagerimp.hpp"
+#include "../mwsound/soundmanagerimp.hpp"
 #include "../mwrender/objects.hpp"
 #include "../mwrender/postprocessor.hpp"
 #include "../mwrender/actorutil.hpp"
@@ -1527,10 +1529,41 @@ namespace MWWorld
                 vitaMainPhase("flush");
                 mRendering.flushUnrefQueueImmediate();
                 wdLap(wdSplit[2]);
-                mRendering.getResourceSystem()->clearCache();
-                // Static caches that bypass OSG expiry; cleared explicitly.
-                MWMechanics::AiPackage::clearPathgridCache();
-                MWRender::clearAnimationModelCache();
+                if (vitaMemAuditEnabled())
+                {
+                    // [MemProbe]: the heap each cache alone was holding, then
+                    // the holders measured exactly. Same clears as below.
+                    const auto heapBytes = [] { return (std::size_t)mallinfo().uordblks; };
+                    std::string freed = mRendering.getResourceSystem()->vitaClearCachesMeasured(heapBytes);
+                    std::size_t h0 = heapBytes();
+                    MWMechanics::AiPackage::clearPathgridCache();
+                    std::size_t h1 = heapBytes();
+                    MWRender::clearAnimationModelCache();
+                    const std::size_t h2 = heapBytes();
+                    freed += " Pathgrid=" + std::to_string(((long long)h0 - (long long)h1) / 1024) + "K";
+                    freed += " AnimModels=" + std::to_string(((long long)h1 - (long long)h2) / 1024) + "K";
+                    Vita::breadcrumb(("[MemProbe] caches freed:" + freed).c_str());
+                    unsigned luaKB = 0, soundKB = 0;
+                    if (auto* lua = dynamic_cast<MWLua::LuaManager*>(static_cast<MWBase::LuaManager*>(MWBase::Environment::get().getLuaManager())))
+                        luaKB = (unsigned)(lua->vitaLuaMemory() / 1024);
+                    if (auto* snd
+                        = dynamic_cast<MWSound::SoundManager*>(static_cast<MWBase::SoundManager*>(MWBase::Environment::get().getSoundManager())))
+                        soundKB = (unsigned)(snd->vitaSoundBufferBytes() / 1024);
+                    char hb[192];
+                    snprintf(hb, sizeof(hb),
+                        "[MemProbe] held: lua=%uKB sound=%uKB objs=%d phys=%d stores=%d warmpool=%uKB heap=%dMB",
+                        luaKB, soundKB, (int)mRendering.getObjects().getObjectCount(),
+                        (int)mPhysics->getObjectCount(), (int)mWorld.getWorldModel().vitaCellStoreCount(),
+                        (unsigned)(mPreloader->vitaWarmPoolBytes() / 1024), Vita::getHeapUsedMBFresh());
+                    Vita::breadcrumb(hb);
+                }
+                else
+                {
+                    mRendering.getResourceSystem()->clearCache();
+                    // Static caches that bypass OSG expiry; cleared explicitly.
+                    MWMechanics::AiPackage::clearPathgridCache();
+                    MWRender::clearAnimationModelCache();
+                }
                 wdLap(wdSplit[3]);
                 // Coalesce free chunks after the bulk-free. Texture
                 // decompression on Vita allocates varied-size RGBA buffers

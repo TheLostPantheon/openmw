@@ -1,5 +1,12 @@
 #include "resourcesystem.hpp"
 
+#ifdef __vita__
+#include <algorithm>
+#include <cstdlib>
+#include <cxxabi.h>
+#include <typeinfo>
+#endif
+
 #include <algorithm>
 
 #include "animblendrulesmanager.hpp"
@@ -135,4 +142,29 @@ namespace Resource
             (*it)->releaseGLObjects(state);
     }
 
+
+#ifdef __vita__
+    std::string ResourceSystem::vitaClearCachesMeasured(const std::function<std::size_t()>& heapBytes)
+    {
+        std::vector<BaseResourceManager*> order = mResourceManagers;
+        std::stable_partition(order.begin(), order.end(),
+            [this](BaseResourceManager* m) { return m == static_cast<BaseResourceManager*>(mSceneManager.get()); });
+        std::string out;
+        for (BaseResourceManager* manager : order)
+        {
+            int status = 0;
+            char* demangled = abi::__cxa_demangle(typeid(*manager).name(), nullptr, nullptr, &status);
+            std::string name = status == 0 && demangled ? demangled : typeid(*manager).name();
+            std::free(demangled);
+            const std::size_t colon = name.rfind("::");
+            if (colon != std::string::npos)
+                name = name.substr(colon + 2);
+            const std::size_t before = heapBytes();
+            manager->clearCache();
+            const std::size_t after = heapBytes();
+            out += ' ' + name + '=' + std::to_string(((long long)before - (long long)after) / 1024) + 'K';
+        }
+        return out;
+    }
+#endif
 }

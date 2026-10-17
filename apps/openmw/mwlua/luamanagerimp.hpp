@@ -35,6 +35,10 @@ namespace MWLua
     class LuaManager : public MWBase::LuaManager
     {
     public:
+#ifdef __vita__
+        /// Lua heap in use (memory audit).
+        uint64_t vitaLuaMemory() const { return mLua.getTotalMemoryUsage(); }
+#endif
         LuaManager(const VFS::Manager* vfs, const std::filesystem::path& libsDir);
         LuaManager(const LuaManager&) = delete;
         LuaManager(LuaManager&&) = delete;
