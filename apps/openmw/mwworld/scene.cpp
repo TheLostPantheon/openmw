@@ -337,6 +337,157 @@ namespace
         return sOn;
     }
 
+    // ---- Ref index (docs/vita/streaming-costs.md, "Ref index") ----
+    // World-space tiles of the active cells' lite refs (statics, doors,
+    // activators, containers): each ref's position and scale, plus its
+    // model and learned bound radius, resolved once on first use. The
+    // contact and radial scans walk only tiles that can reach their distance
+    // bands, resume by index, and read the cached model and radius instead
+    // of rebuilding the model path and taking the preloader mutex per visit.
+    // Entries point into cell stores, so a cell is purged when it leaves the
+    // active set (Scene::unloadCell, Scene::clear, and each tick for any
+    // indexed cell no longer active). norefindex.txt turns the index off.
+    constexpr float kVitaIdxTile = 1024.f;
+    constexpr uint32_t kVitaIdxUnresolved = 0xffffffffu;
+    constexpr uint32_t kVitaIdxNoModel = 0xfffffffeu;
+    // Culling stand-in for a radius not yet known: above the largest learned
+    // bound (5846, Vivec cantons) so an unresolved ref is never culled.
+    constexpr float kVitaIdxBigRadius = 6000.f;
+
+    struct VitaIdxRef
+    {
+        MWWorld::LiveCellRefBase* mRef;
+        MWWorld::CellStore* mCell;
+        float mX, mY, mScale;
+        float mBound = 0.f; // learned model bound (unscaled); 0 = not learned yet
+        uint32_t mModel = kVitaIdxUnresolved;
+    };
+
+    struct VitaIdxTile
+    {
+        std::vector<VitaIdxRef> mRefs;
+        float mReach = kVitaIdxBigRadius; // max radius x scale over its refs (big while any is unknown)
+        unsigned mUnknown = 0; // refs whose bound is not known yet
+    };
+
+    struct VitaIdxCell
+    {
+        std::vector<int64_t> mTiles;
+        std::chrono::steady_clock::time_point mIndexedAt;
+    };
+
+    struct VitaRefIndex
+    {
+        std::unordered_map<int64_t, VitaIdxTile> mTiles;
+        std::unordered_map<const MWWorld::CellStore*, VitaIdxCell> mCells;
+        std::vector<std::string> mModels;
+        std::vector<float> mModelBound; // per model id; 0 = not learned yet
+        std::vector<unsigned> mModelAsked; // tick of the last bound lookup while unlearned
+        std::vector<unsigned> mModelTouched; // radial pass that last filed this model's warm demand
+        std::unordered_map<std::string, uint32_t> mModelIds;
+        unsigned mGen = 0; // bumped whenever tiles change (scan cursors re-check)
+    };
+    VitaRefIndex sVitaIdx;
+
+    bool vitaRefIndexEnabled()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            const bool on = sceIoGetstat("ux0:data/openmw/norefindex.txt", &st) < 0;
+            Vita::breadcrumb(on ? "[RefIndex] on" : "[RefIndex] off (norefindex.txt)");
+            return on;
+        }();
+        return sOn;
+    }
+
+    // [Coverage] / [Landing] probes (coverage.txt): residency checks that
+    // read the cells directly, so they judge either scan mode alike.
+    bool vitaCoverageProbeEnabled()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/coverage.txt", &st) >= 0;
+        }();
+        return sOn;
+    }
+
+    int64_t vitaIdxKey(int tx, int ty)
+    {
+        return (static_cast<int64_t>(tx) << 32) | static_cast<uint32_t>(ty);
+    }
+
+    int vitaIdxCoord(float v)
+    {
+        return static_cast<int>(std::floor(v / kVitaIdxTile));
+    }
+
+    void vitaIdxUpdateReach(VitaIdxTile& tile)
+    {
+        float reach = 0.f;
+        unsigned unknown = 0;
+        for (const VitaIdxRef& e : tile.mRefs)
+        {
+            // A ref without a model is never a scan candidate, so it adds no reach.
+            if (e.mModel == kVitaIdxNoModel)
+                continue;
+            if (e.mBound <= 0.f)
+                ++unknown;
+            reach = std::max(reach, (e.mBound > 0.f ? e.mBound : kVitaIdxBigRadius) * e.mScale);
+        }
+        tile.mReach = reach;
+        tile.mUnknown = unknown;
+    }
+
+    void vitaIdxPurgeCell(const MWWorld::CellStore* cell)
+    {
+        const auto it = sVitaIdx.mCells.find(cell);
+        if (it == sVitaIdx.mCells.end())
+            return;
+        for (const int64_t key : it->second.mTiles)
+        {
+            const auto t = sVitaIdx.mTiles.find(key);
+            if (t == sVitaIdx.mTiles.end())
+                continue;
+            std::vector<VitaIdxRef>& refs = t->second.mRefs;
+            refs.erase(std::remove_if(refs.begin(), refs.end(), [cell](const VitaIdxRef& e) { return e.mCell == cell; }),
+                refs.end());
+            if (refs.empty())
+                sVitaIdx.mTiles.erase(t);
+            else
+                vitaIdxUpdateReach(t->second);
+        }
+        sVitaIdx.mCells.erase(it);
+        ++sVitaIdx.mGen;
+    }
+
+    void vitaIdxClear()
+    {
+        sVitaIdx.mTiles.clear();
+        sVitaIdx.mCells.clear();
+        ++sVitaIdx.mGen;
+    }
+
+    // Distance from (px, py) to the nearest point of a tile.
+    float vitaIdxTileDist(int64_t key, float px, float py)
+    {
+        const float x0 = static_cast<float>(static_cast<int32_t>(key >> 32)) * kVitaIdxTile;
+        const float y0 = static_cast<float>(static_cast<int32_t>(key & 0xffffffff)) * kVitaIdxTile;
+        const float dx = std::max({ x0 - px, 0.f, px - (x0 + kVitaIdxTile) });
+        const float dy = std::max({ y0 - py, 0.f, py - (y0 + kVitaIdxTile) });
+        return std::sqrt(dx * dx + dy * dy);
+    }
+
+    // Tiles one of whose refs could lie within `reach` of (px, py), counting
+    // each tile's largest radius when `withRadius` (an object's bound can
+    // reach toward the player from beyond the band).
+    void vitaIdxTilesInRange(float px, float py, float reach, bool withRadius, std::vector<int64_t>& out)
+    {
+        out.clear();
+        for (const auto& [key, tile] : sVitaIdx.mTiles)
+            if (vitaIdxTileDist(key, px, py) - (withRadius ? tile.mReach : 0.f) < reach)
+                out.push_back(key);
+    }
+
     // Guard pass fixes (hydrate tick): actor-list scans outside the near ring,
     // memoized actor part lists, a warm memo that survives deliveries, and a
     // slower delivery re-arm. ux0:data/openmw/noguardfix.txt turns them off.
@@ -2223,6 +2374,7 @@ namespace MWWorld
         MWBase::Environment::get().getSoundManager()->stopSound(cell);
         mActiveCells.erase(cell);
 #ifdef __vita__
+        vitaIdxPurgeCell(cell); // ref index holds pointers into this store
         mVitaActorDomain.erase(cell);
         mVitaPhysDomain.erase(cell);
         mCellLoadTiers.erase(cell);
@@ -2959,6 +3111,25 @@ namespace MWWorld
         uint32_t mPassUs = 0, mRingUs = 0, mRing3Us = 0, mDiscUs = 0;
     };
     static VitaGuardSplit sGuardSplit;
+    // [StreamScan] (with [ActorPace]): per streaming scan, refs visited, how
+    // many were already live, and how many needed work (an add, removal,
+    // physics change, candidate or demand touch); per hydrate tick.
+    struct VitaScanCount
+    {
+        unsigned mVisits = 0, mLive = 0, mWork = 0;
+    };
+    enum VitaScanLane
+    {
+        ScanGuardRing,
+        ScanGuardDisc,
+        ScanContact,
+        ScanRadial,
+        ScanLaneA,
+        ScanLaneB,
+        ScanLaneCount
+    };
+    static VitaScanCount sScanCount[ScanLaneCount];
+    static unsigned sScanTicks = 0;
     // warmPath callee split (whole tick, all callers): common-warm check,
     // bound lookup, demand touch -- each takes the preloader's mutex.
     struct VitaWarmSplit
@@ -3489,6 +3660,133 @@ namespace MWWorld
             return 0;
         const std::size_t n = cells.size();
 
+        // ---- Ref index upkeep (see VitaRefIndex) ----
+        // Purge cells that left the active set, then index one new or stale
+        // (10 s) loaded exterior cell per tick, keeping resolved models and
+        // bounds. The scans use the index only once every loaded exterior
+        // cell is in it; until then they walk the cells as before.
+        bool idxReady = false;
+        if (vitaRefIndexEnabled())
+        {
+            for (auto it = sVitaIdx.mCells.begin(); it != sVitaIdx.mCells.end();)
+            {
+                const MWWorld::CellStore* c = it->first;
+                ++it; // the purge erases the current entry
+                if (std::find(cells.begin(), cells.end(), c) == cells.end())
+                    vitaIdxPurgeCell(c);
+            }
+            CellStore* toIndex = nullptr;
+            CellStore* oldest = nullptr;
+            bool missing = false;
+            Clock::time_point oldestAt = tick0;
+            for (CellStore* c : cells)
+            {
+                if (!c->getCell()->isExterior() || c->getState() != CellStore::State_Loaded)
+                    continue;
+                const auto rec = sVitaIdx.mCells.find(c);
+                if (rec == sVitaIdx.mCells.end())
+                {
+                    missing = true;
+                    if (toIndex == nullptr)
+                        toIndex = c;
+                }
+                else if (rec->second.mIndexedAt < oldestAt)
+                {
+                    oldestAt = rec->second.mIndexedAt;
+                    oldest = c;
+                }
+            }
+            // Scripts rarely move or place lite refs; a rolling re-index
+            // bounds how long such a change goes unseen.
+            if (toIndex == nullptr && oldest != nullptr && tick0 - oldestAt > std::chrono::seconds(10))
+                toIndex = oldest;
+            if (toIndex != nullptr)
+            {
+                std::unordered_map<const LiveCellRefBase*, std::pair<float, uint32_t>> keep;
+                if (const auto rec = sVitaIdx.mCells.find(toIndex); rec != sVitaIdx.mCells.end())
+                    for (const int64_t key : rec->second.mTiles)
+                        if (const auto t = sVitaIdx.mTiles.find(key); t != sVitaIdx.mTiles.end())
+                            for (const VitaIdxRef& e : t->second.mRefs)
+                                if (e.mCell == toIndex)
+                                    keep.emplace(e.mRef, std::make_pair(e.mBound, e.mModel));
+                vitaIdxPurgeCell(toIndex);
+                VitaIdxCell rec;
+                rec.mIndexedAt = tick0;
+                toIndex->forEach([&](const MWWorld::Ptr& ptr) {
+                    if (!isLiteType(ptr.getType()))
+                        return true;
+                    const ESM::Position& pos = ptr.getRefData().getPosition();
+                    VitaIdxRef e{ ptr.mRef, toIndex, pos.pos[0], pos.pos[1], ptr.getCellRef().getScale() };
+                    if (const auto k = keep.find(ptr.mRef); k != keep.end())
+                    {
+                        e.mBound = k->second.first;
+                        e.mModel = k->second.second;
+                    }
+                    const int64_t key = vitaIdxKey(vitaIdxCoord(e.mX), vitaIdxCoord(e.mY));
+                    VitaIdxTile& tile = sVitaIdx.mTiles[key];
+                    if (tile.mRefs.empty())
+                        rec.mTiles.push_back(key);
+                    else if (std::find(rec.mTiles.begin(), rec.mTiles.end(), key) == rec.mTiles.end())
+                        rec.mTiles.push_back(key);
+                    tile.mRefs.push_back(e);
+                    return true;
+                });
+                for (const int64_t key : rec.mTiles)
+                    vitaIdxUpdateReach(sVitaIdx.mTiles[key]);
+                sVitaIdx.mCells[toIndex] = std::move(rec);
+                ++sVitaIdx.mGen;
+                missing = false;
+                for (CellStore* c : cells)
+                    if (c->getCell()->isExterior() && c->getState() == CellStore::State_Loaded
+                        && sVitaIdx.mCells.count(c) == 0)
+                        missing = true;
+            }
+            idxReady = !missing;
+        }
+        // Resolve a ref's model and learned bound once (per-model cache); an
+        // unlearned bound is asked again at most every 60 ticks (~2 s), as
+        // the model's first load teaches it. Called on refs of `tile`.
+        static unsigned sIdxTick = 0;
+        ++sIdxTick;
+        const auto idxResolve = [&](VitaIdxTile& tile, VitaIdxRef& e) {
+            const bool wasUnknown = e.mModel != kVitaIdxNoModel && e.mBound <= 0.f;
+            if (e.mModel == kVitaIdxUnresolved)
+            {
+                const VFS::Path::Normalized m = getModel(MWWorld::Ptr(e.mRef, e.mCell));
+                if (m.empty())
+                {
+                    e.mModel = kVitaIdxNoModel;
+                    return;
+                }
+                const auto [it, inserted]
+                    = sVitaIdx.mModelIds.try_emplace(std::string(m.value()), (uint32_t)sVitaIdx.mModels.size());
+                if (inserted)
+                {
+                    sVitaIdx.mModels.push_back(it->first);
+                    sVitaIdx.mModelBound.push_back(0.f);
+                    sVitaIdx.mModelAsked.push_back(0);
+                    sVitaIdx.mModelTouched.push_back(0);
+                }
+                e.mModel = it->second;
+            }
+            if (e.mModel == kVitaIdxNoModel || e.mBound > 0.f)
+            {
+                if (wasUnknown && e.mModel == kVitaIdxNoModel)
+                    vitaIdxUpdateReach(tile); // dropped out of the tile's reach
+                return;
+            }
+            float& known = sVitaIdx.mModelBound[e.mModel];
+            unsigned& asked = sVitaIdx.mModelAsked[e.mModel];
+            if (known <= 0.f && (asked == 0 || sIdxTick - asked >= 60))
+            {
+                asked = sIdxTick;
+                known = mPreloader->vitaKnownBoundRadius(sVitaIdx.mModels[e.mModel]);
+            }
+            e.mBound = known;
+            if (wasUnknown && e.mBound > 0.f && tile.mUnknown > 0 && --tile.mUnknown == 0)
+                vitaIdxUpdateReach(tile); // every bound known: tighten the reach
+        };
+
         // Innermost guarantee: anything unloaded this close jumps every
         // budget. Actors are excluded: their composite is Lane B's job,
         // warm-gated, and too large a lump for a budget-exempt path.
@@ -3500,6 +3798,7 @@ namespace MWWorld
         // limiting -- it stops when deliveries stop -- and the interval
         // floor keeps a busy ledger from making this per-tick.
         {
+            ++sScanTicks;
             SegTimer segGuard(&sSegGuardUs);
             constexpr float rGuard = 1100.f;
             constexpr float rGuardReach = 1500.f; // big-static extension, to rStructIn
@@ -3569,8 +3868,12 @@ namespace MWWorld
                         if (!gc->getCell()->isExterior() || edge2 > rActorWarm * rActorWarm)
                             continue;
                         const auto ringVisit = [&](const MWWorld::Ptr& ptr) {
+                            ++sScanCount[ScanGuardRing].mVisits;
                             if (ptr.getRefData().getBaseNode() != nullptr)
+                            {
+                                ++sScanCount[ScanGuardRing].mLive;
                                 return true;
+                            }
                             if (isPagedRef(ptr) || ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
                                 return true;
                             const bool actor = isActorType(ptr.getType());
@@ -3611,6 +3914,7 @@ namespace MWWorld
                                     dataCands.emplace_back(d2, ptr);
                                     return true;
                                 }
+                                ++sScanCount[ScanGuardRing].mWork;
                                 const auto r30 = Clock::now();
                                 std::vector<std::string> ownPaths;
                                 if (!guardFix)
@@ -3746,10 +4050,14 @@ namespace MWWorld
                         || vitaCellEdge2(*gc, pp) > (rGuard + rGuardReach) * (rGuard + rGuardReach))
                         continue;
                     gc->forEach([&](const MWWorld::Ptr& ptr) {
+                        ++sScanCount[ScanGuardDisc].mVisits;
                         // Cheapest reject first: in the steady state almost
                         // everything here is already live.
                         if (ptr.getRefData().getBaseNode() != nullptr)
+                        {
+                            ++sScanCount[ScanGuardDisc].mLive;
                             return true;
+                        }
                         const unsigned int gty = ptr.getType();
                         if (gty == ESM::REC_NPC_ || gty == ESM::REC_CREA || gty == ESM::REC_LEVC)
                             return true;
@@ -3777,6 +4085,7 @@ namespace MWWorld
                             if (std::sqrt(gd2) - greach >= rGuard)
                                 return true;
                         }
+                        ++sScanCount[ScanGuardDisc].mWork;
                         bool alwaysWarm = false;
                         if (!warmOrRequest(ptr, gd2, &alwaysWarm))
                             return true; // requested; adds when the ledger re-arms us
@@ -3845,9 +4154,15 @@ namespace MWWorld
             static unsigned sContactGen = 0, sContactPassAdds0 = 0;
             static int sContactPassPending = 0;
             static bool sContactPassActive = false;
+            // Index mode: the pass walks the ref-index tiles within rWarm.
+            static std::vector<int64_t> sContactTiles;
+            static std::size_t sContactTileIdx = 0, sContactTileRef = 0;
+            static bool sContactByIdx = false;
             const bool scanFix = vitaScanFixEnabled();
+            const bool contactIdx = scanFix && idxReady;
             if (!sContactIdle
-                && (!scanFix || !sContactPassActive || sContactGen != sVitaFarCandGen || sContactN != n))
+                && (!scanFix || !sContactPassActive || sContactGen != sVitaFarCandGen || sContactN != n
+                    || sContactByIdx != contactIdx))
             {
                 sContactCursor = sContactRefOffset = 0;
                 sContactRot = sStartRot;
@@ -3856,79 +4171,147 @@ namespace MWWorld
                 sContactPassPending = 0;
                 sContactPassAdds0 = sVitaContactAdds;
                 sContactPassActive = true;
+                sContactByIdx = contactIdx;
+                if (contactIdx)
+                {
+                    vitaIdxTilesInRange(pp.x(), pp.y(), rWarm, false, sContactTiles);
+                    sContactTileIdx = sContactTileRef = 0;
+                }
             }
             int vitaContactMs = 3, vitaRadialMs = 2;
             vitaScanWindowsMs(vitaCatchUp, vitaContactMs, vitaRadialMs);
             const auto contactDeadline = Clock::now() + std::chrono::milliseconds(vitaContactMs);
-            while (!sContactIdle && sContactPassActive && sContactCursor < n)
+            // One ref: give a rendered, collider-less lite object near the
+            // player its body, warming its shape first. `e` is its ref-index
+            // entry (cached model) or null on the cell walk.
+            const auto contactVisit = [&](const MWWorld::Ptr& ptr, VitaIdxTile* tile, VitaIdxRef* e) {
+                ++sScanCount[ScanContact].mVisits;
+                // Cheapest rejects first: almost everything is either
+                // unrendered or out of reach; the physics lookup is last.
+                if (ptr.getRefData().getBaseNode() == nullptr)
+                    return; // not rendered yet; shells own the pair
+                ++sScanCount[ScanContact].mLive;
+                if (!isLiteType(ptr.getType()) || isPagedRef(ptr))
+                    return;
+                const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
+                const float dx = op.x() - pp.x();
+                const float dy = op.y() - pp.y();
+                const float d2 = dx * dx + dy * dy;
+                if (d2 > rWarm * rWarm)
+                    return;
+                if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
+                    return;
+                if (mPhysics->getObject(ptr) != nullptr)
+                    return;
+                ++sScanCount[ScanContact].mWork;
+                std::string pm;
+                if (e != nullptr)
+                {
+                    idxResolve(*tile, *e);
+                    if (e->mModel < sVitaIdx.mModels.size())
+                        pm = sVitaIdx.mModels[e->mModel];
+                }
+                else
+                    pm = std::string(getModel(ptr).value());
+                const bool shapeReady = pm.empty() || mPreloader->vitaShapeCached(pm);
+                if (!shapeReady && !warmPath(pm, d2))
+                {
+                    ++sContactPassPending;
+                    return; // requested; body waits for the ring
+                }
+                if (d2 > rContact * rContact)
+                    return; // warmed only — body comes with proximity
+                try
+                {
+                    addPhysicsOnly(ptr, *mPhysics);
+                    addObject(ptr, mWorld, *mPhysics, mLowestPoint, isInterior, mNavigator, nullptr);
+                    ++vitaOps;
+                    ++sVitaLivePhys;
+                    ++sVitaContactAdds;
+                }
+                catch (const std::exception& ex)
+                {
+                    char pb[176];
+                    snprintf(pb, sizeof(pb), "[PhysFail] %s: %s", ptr.getCellRef().getRefId().toDebugString().c_str(),
+                        ex.what());
+                    Vita::breadcrumb(pb);
+                }
+            };
+            if (sContactByIdx)
             {
-                if (Clock::now() >= contactDeadline)
-                    break;
-                CellStore& cell = *cells[(sContactCursor + sContactRot) % n];
-                if (!cell.getCell()->isExterior() || vitaCellEdge2(cell, pp) > rWarm * rWarm)
+                while (!sContactIdle && sContactPassActive && sContactTileIdx < sContactTiles.size())
                 {
+                    if (Clock::now() >= contactDeadline)
+                        break;
+                    const auto t = sVitaIdx.mTiles.find(sContactTiles[sContactTileIdx]);
+                    if (t == sVitaIdx.mTiles.end())
+                    {
+                        ++sContactTileIdx;
+                        sContactTileRef = 0;
+                        continue;
+                    }
+                    std::vector<VitaIdxRef>& refs = t->second.mRefs;
+                    bool aborted = false;
+                    for (; sContactTileRef < refs.size(); ++sContactTileRef)
+                    {
+                        if ((sContactTileRef & 15) == 15 && Clock::now() >= contactDeadline)
+                        {
+                            aborted = true;
+                            break;
+                        }
+                        VitaIdxRef& e = refs[sContactTileRef];
+                        // Static position from the index: out-of-reach refs
+                        // cost no pointer chase into the cell store.
+                        const float dx = e.mX - pp.x();
+                        const float dy = e.mY - pp.y();
+                        if (dx * dx + dy * dy > rWarm * rWarm)
+                            continue;
+                        const MWWorld::Ptr ptr(e.mRef, e.mCell);
+                        if (!MWWorld::CellStore::isAccessible(ptr.getRefData(), ptr.getCellRef()))
+                            continue;
+                        contactVisit(ptr, &t->second, &e);
+                    }
+                    if (aborted)
+                        break;
+                    ++sContactTileIdx;
+                    sContactTileRef = 0;
+                }
+                if (sContactPassActive && sContactTileIdx >= sContactTiles.size())
+                    sContactCursor = n; // pass complete (shared idle-gate test below)
+            }
+            else
+            {
+                while (!sContactIdle && sContactPassActive && sContactCursor < n)
+                {
+                    if (Clock::now() >= contactDeadline)
+                        break;
+                    CellStore& cell = *cells[(sContactCursor + sContactRot) % n];
+                    if (!cell.getCell()->isExterior() || vitaCellEdge2(cell, pp) > rWarm * rWarm)
+                    {
+                        ++sContactCursor;
+                        continue;
+                    }
+                    std::size_t vRef = 0;
+                    bool vAborted = false;
+                    cell.forEach([&](const MWWorld::Ptr& ptr) {
+                        if (vRef++ < sContactRefOffset)
+                            return true; // done earlier this pass
+                        if ((vRef & 15) == 0 && Clock::now() >= contactDeadline)
+                        {
+                            vAborted = true;
+                            return false; // resume here next tick
+                        }
+                        contactVisit(ptr, nullptr, nullptr);
+                        return true;
+                    });
+                    if (vAborted)
+                    {
+                        sContactRefOffset = vRef - 1;
+                        break;
+                    }
+                    sContactRefOffset = 0;
                     ++sContactCursor;
-                    continue;
                 }
-                std::size_t vRef = 0;
-                bool vAborted = false;
-                cell.forEach([&](const MWWorld::Ptr& ptr) {
-                    if (vRef++ < sContactRefOffset)
-                        return true; // done earlier this pass
-                    if ((vRef & 15) == 0 && Clock::now() >= contactDeadline)
-                    {
-                        vAborted = true;
-                        return false; // resume here next tick
-                    }
-                    // Cheapest rejects first: almost everything is either
-                    // unrendered or out of reach; the physics lookup is last.
-                    if (ptr.getRefData().getBaseNode() == nullptr)
-                        return true; // not rendered yet; shells own the pair
-                    if (!isLiteType(ptr.getType()) || isPagedRef(ptr))
-                        return true;
-                    const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
-                    const float dx = op.x() - pp.x();
-                    const float dy = op.y() - pp.y();
-                    const float d2 = dx * dx + dy * dy;
-                    if (d2 > rWarm * rWarm)
-                        return true;
-                    if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
-                        return true;
-                    if (mPhysics->getObject(ptr) != nullptr)
-                        return true;
-                    const VFS::Path::Normalized pm = getModel(ptr);
-                    const bool shapeReady = pm.empty() || mPreloader->vitaShapeCached(std::string(pm.value()));
-                    if (!shapeReady && !warmPath(std::string(pm.value()), d2))
-                    {
-                        ++sContactPassPending;
-                        return true; // requested; body waits for the ring
-                    }
-                    if (d2 > rContact * rContact)
-                        return true; // warmed only — body comes with proximity
-                    try
-                    {
-                        addPhysicsOnly(ptr, *mPhysics);
-                        addObject(ptr, mWorld, *mPhysics, mLowestPoint, isInterior, mNavigator, nullptr);
-                        ++vitaOps;
-                        ++sVitaLivePhys;
-                        ++sVitaContactAdds;
-                    }
-                    catch (const std::exception& e)
-                    {
-                        char pb[176];
-                        snprintf(pb, sizeof(pb), "[PhysFail] %s: %s",
-                            ptr.getCellRef().getRefId().toDebugString().c_str(), e.what());
-                        Vita::breadcrumb(pb);
-                    }
-                    return true;
-                });
-                if (vAborted)
-                {
-                    sContactRefOffset = vRef - 1;
-                    break;
-                }
-                sContactRefOffset = 0;
-                ++sContactCursor;
             }
             // Arm the idle gate only after a complete pass that did nothing.
             if (!sContactIdle && sContactPassActive && sContactCursor >= n)
@@ -3963,6 +4346,7 @@ namespace MWWorld
                 MWWorld::Ptr ptr;
                 float key; // sort key: dEff - head start
                 float d2;
+                uint32_t model = kVitaIdxUnresolved; // ref-index model id, when listed from the index
             };
             // Two regimes: inside the bubble + buffer, hydration is
             // GUARANTEED — always listed, adds never yield to the frame
@@ -4025,7 +4409,18 @@ namespace MWWorld
                 || (!radCalm && radEpoch != sRadScanEpoch)
                 || (!radCalm && sRadCands.empty() && !sRadScanFoundNothing)
                 || (sRadScanFoundNothing && n != sRadScanN);
-            if (radHardReset || (radStale && !sRadScanInProgress))
+            // Index mode (see VitaRefIndex): the pass walks the ref-index
+            // tiles that can reach the warm runway, resuming by index.
+            static std::vector<int64_t> sRadTiles;
+            static std::size_t sRadTileIdx = 0, sRadTileRef = 0;
+            static bool sRadByIdx = false;
+            // Pass bookkeeping for [RadQ]: pass number (also the per-model
+            // touch stamp), ticks and refs walked in the current pass, and
+            // the last completed pass's length.
+            static unsigned sRadPass = 0, sRadPassTicks = 0, sRadPassRefs = 0;
+            static unsigned sRadLastPassTicks = 0, sRadLastPassRefs = 0;
+            const bool radIdx = idxReady && vitaScanFixEnabled();
+            if (radHardReset || (radStale && !sRadScanInProgress) || (sRadScanInProgress && sRadByIdx != radIdx))
             {
                 sRadScanPos = pp;
                 sRadScanAt = tick0;
@@ -4037,8 +4432,24 @@ namespace MWWorld
                 sRadScanRot = sStartRot;
                 sRadScanN = n;
                 sRadScanInProgress = true;
+                sRadByIdx = radIdx;
+                ++sRadPass;
+                sRadPassTicks = sRadPassRefs = 0;
+                if (radIdx)
+                {
+                    vitaIdxTilesInRange(pp.x(), pp.y(), rWarmReach + rHeadStretch, true, sRadTiles);
+                    // Nearest tiles first: candidates surface in frontier
+                    // order, and a model's one warm touch per pass carries
+                    // roughly its nearest needer's priority.
+                    std::sort(sRadTiles.begin(), sRadTiles.end(), [&](int64_t a, int64_t b) {
+                        return vitaIdxTileDist(a, pp.x(), pp.y()) < vitaIdxTileDist(b, pp.x(), pp.y());
+                    });
+                    sRadTileIdx = sRadTileRef = 0;
+                }
             }
-            if (sRadScanCursor >= n)
+            if (sRadScanInProgress)
+                ++sRadPassTicks;
+            if (!sRadByIdx && sRadScanCursor >= n)
                 sRadScanInProgress = false; // set shrank past the cursor
             // Anchor at NOW, not tick0: earlier passes consume the tick's
             // opening milliseconds, and a tick0-anchored window was already
@@ -4048,7 +4459,179 @@ namespace MWWorld
             int vitaContactMs = 3, vitaRadialMs = 2;
             vitaScanWindowsMs(vitaCatchUp, vitaContactMs, vitaRadialMs);
             const auto scanDeadline = Clock::now() + std::chrono::milliseconds(vitaRadialMs);
-            for (; sRadScanInProgress && sRadScanCursor < n && Clock::now() < scanDeadline;)
+            // One ref: list a bare lite object inside the view reach as a
+            // candidate, or file demand for it in the warm runway. `e` is
+            // its ref-index entry (cached model and bound) or null on the
+            // cell walk, which derives both per visit.
+            const auto radialVisit = [&](const MWWorld::Ptr& ptr, VitaIdxTile* tile, VitaIdxRef* e) {
+                ++sScanCount[ScanRadial].mVisits;
+                if (ptr.getRefData().getBaseNode() != nullptr)
+                {
+                    ++sScanCount[ScanRadial].mLive;
+                    return;
+                }
+                if (!isLiteType(ptr.getType()) || isPagedRef(ptr))
+                    return;
+                if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
+                    return;
+                const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
+                const float dx = op.x() - pp.x();
+                const float dy = op.y() - pp.y();
+                const float d2 = dx * dx + dy * dy;
+                float br;
+                uint32_t modelId = kVitaIdxUnresolved;
+                if (e != nullptr)
+                {
+                    idxResolve(*tile, *e);
+                    if (e->mModel == kVitaIdxNoModel)
+                        return;
+                    modelId = e->mModel;
+                    br = e->mBound;
+                }
+                else
+                {
+                    const VFS::Path::Normalized m = getModel(ptr);
+                    if (m.empty())
+                        return;
+                    br = mPreloader->vitaKnownBoundRadius(std::string(m.value()));
+                }
+                const bool learned = br > 0.f;
+                if (!learned)
+                    br = 1200.f; // unlearned: assume big; first load teaches
+                const float dEff = std::sqrt(d2) - br * ptr.getCellRef().getScale();
+                // Heading-stretched WARM reach: elongate the warm runway
+                // in the direction of travel, shrink it behind. Focuses
+                // the pump's pool-warming AHEAD (where you are going) and
+                // stops wasting half the budget on objects behind you
+                // that are about to be evicted — the "smoother standing
+                // still than walking" asymmetry. Warm only (cheap pool
+                // bytes); the hydration ring stays tight and uniform, so
+                // no extra resident objects.
+                float warmReach = rWarmReach;
+                if (moveDir.length2() > 0.25f && d2 > 1.f)
+                {
+                    const float invD = 1.f / std::sqrt(d2);
+                    const float toward = (dx * invD) * moveDir.x() + (dy * invD) * moveDir.y();
+                    warmReach += rHeadStretch * toward; // +ahead, -behind
+                }
+                if (dEff >= warmReach)
+                    return; // outside the (heading-shaped) warm runway
+                ++sScanCount[ScanRadial].mWork;
+                // Warm demand: once per model per pass on the index (towns
+                // repeat a few hundred models across thousands of refs, each
+                // touch ~37 us of preloader lookups; demand lives 4 s).
+                const auto touch = [&]() {
+                    if (modelId != kVitaIdxUnresolved)
+                    {
+                        unsigned& stamp = sVitaIdx.mModelTouched[modelId];
+                        if (stamp == sRadPass)
+                            return;
+                        stamp = sRadPass;
+                        warmPath(sVitaIdx.mModels[modelId], d2);
+                    }
+                    else
+                        warmOrRequest(ptr, d2);
+                };
+                if (dEff >= rViewReach)
+                {
+                    // Warm band: pool-load ahead, do NOT hydrate. Cheap,
+                    // long runway so the tight ring hydrates warm.
+                    touch();
+                    return;
+                }
+                int tier;
+                if (modelId != kVitaIdxUnresolved)
+                {
+                    // structTier from the cached model name and bound.
+                    const std::string& path = sVitaIdx.mModels[modelId];
+                    const std::size_t slash = path.rfind('/');
+                    const std::string_view name
+                        = slash == std::string::npos ? std::string_view(path) : std::string_view(path).substr(slash + 1);
+                    if (name.rfind("ex_", 0) == 0 || name.rfind("in_", 0) == 0 || name.rfind("terrain_", 0) == 0)
+                        tier = 0;
+                    else if (!learned)
+                        tier = 1; // unlearned: assume big (safe direction)
+                    else
+                        tier = br * ptr.getCellRef().getScale() >= kStructBound ? 1 : 2;
+                }
+                else
+                    tier = structTier(ptr);
+                const float headStart = tier == 0 ? 400.f : (tier == 1 ? 150.f : 0.f);
+                const float key = dEff - headStart;
+                // GUARANTEE RING (bubble + buffer): candidates are always
+                // listed — no cap, no replacement — so completeness in
+                // reach of the player is structural, not best-effort.
+                if (d2 < kRadGuarantee * kRadGuarantee)
+                {
+                    sRadCands.push_back({ ptr, key, d2, modelId });
+                    return;
+                }
+                if (sRadCands.size() < kRadListMax)
+                    sRadCands.push_back({ ptr, key, d2, modelId });
+                else
+                {
+                    // Outer disc: keep the best BY KEY, not by scan
+                    // order; what falls off the list still files demand
+                    // so the pump works the whole reach.
+                    std::size_t worst = 0;
+                    for (std::size_t i = 1; i < sRadCands.size(); ++i)
+                        if (sRadCands[i].key > sRadCands[worst].key)
+                            worst = i;
+                    if (key < sRadCands[worst].key && sRadCands[worst].d2 >= kRadGuarantee * kRadGuarantee)
+                        sRadCands[worst] = { ptr, key, d2, modelId };
+                    else
+                        touch();
+                }
+            };
+            if (sRadByIdx)
+            {
+                for (; sRadScanInProgress && sRadTileIdx < sRadTiles.size() && Clock::now() < scanDeadline;)
+                {
+                    const auto t = sVitaIdx.mTiles.find(sRadTiles[sRadTileIdx]);
+                    if (t == sVitaIdx.mTiles.end())
+                    {
+                        ++sRadTileIdx;
+                        sRadTileRef = 0;
+                        continue;
+                    }
+                    std::vector<VitaIdxRef>& refs = t->second.mRefs;
+                    bool aborted = false;
+                    for (; sRadTileRef < refs.size(); ++sRadTileRef)
+                    {
+                        if ((sRadTileRef & 3) == 3 && Clock::now() >= scanDeadline)
+                        {
+                            aborted = true;
+                            break;
+                        }
+                        VitaIdxRef& e = refs[sRadTileRef];
+                        ++sRadPassRefs;
+                        // Cached position and radius (the big stand-in while
+                        // unknown): beyond the widest warm runway nothing in
+                        // radialVisit would act, so skip the store access.
+                        const float dx = e.mX - pp.x();
+                        const float dy = e.mY - pp.y();
+                        const float far
+                            = rWarmReach + rHeadStretch + (e.mBound > 0.f ? e.mBound : kVitaIdxBigRadius) * e.mScale;
+                        if (dx * dx + dy * dy >= far * far)
+                            continue;
+                        const MWWorld::Ptr ptr(e.mRef, e.mCell);
+                        if (!MWWorld::CellStore::isAccessible(ptr.getRefData(), ptr.getCellRef()))
+                            continue;
+                        radialVisit(ptr, &t->second, &e);
+                    }
+                    if (aborted)
+                        break;
+                    ++sRadTileIdx;
+                    sRadTileRef = 0;
+                }
+                if (sRadScanInProgress && sRadTileIdx >= sRadTiles.size())
+                {
+                    sRadScanCursor = n; // pass complete (shared test below)
+                    sRadLastPassTicks = sRadPassTicks;
+                    sRadLastPassRefs = sRadPassRefs;
+                }
+            }
+            for (; !sRadByIdx && sRadScanInProgress && sRadScanCursor < n && Clock::now() < scanDeadline;)
             {
                 CellStore& cell = *cells[(sRadScanCursor + sRadScanRot) % n];
                 if (!cell.getCell()->isExterior())
@@ -4084,74 +4667,7 @@ namespace MWWorld
                         vScanAborted = true;
                         return false; // resume this cell next tick
                     }
-                    if (ptr.getRefData().getBaseNode() != nullptr)
-                        return true;
-                    if (!isLiteType(ptr.getType()) || isPagedRef(ptr))
-                        return true;
-                    if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
-                        return true;
-                    const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
-                    const float dx = op.x() - pp.x();
-                    const float dy = op.y() - pp.y();
-                    const float d2 = dx * dx + dy * dy;
-                    const VFS::Path::Normalized m = getModel(ptr);
-                    if (m.empty())
-                        return true;
-                    float br = mPreloader->vitaKnownBoundRadius(std::string(m.value()));
-                    if (br <= 0.f)
-                        br = 1200.f; // unlearned: assume big; first load teaches
-                    const float dEff = std::sqrt(d2) - br * ptr.getCellRef().getScale();
-                    // Heading-stretched WARM reach: elongate the warm runway
-                    // in the direction of travel, shrink it behind. Focuses
-                    // the pump's pool-warming AHEAD (where you are going) and
-                    // stops wasting half the budget on objects behind you
-                    // that are about to be evicted — the "smoother standing
-                    // still than walking" asymmetry. Warm only (cheap pool
-                    // bytes); the hydration ring stays tight and uniform, so
-                    // no extra resident objects.
-                    float warmReach = rWarmReach;
-                    if (moveDir.length2() > 0.25f && d2 > 1.f)
-                    {
-                        const float invD = 1.f / std::sqrt(d2);
-                        const float toward = (dx * invD) * moveDir.x() + (dy * invD) * moveDir.y();
-                        warmReach += rHeadStretch * toward; // +ahead, -behind
-                    }
-                    if (dEff >= warmReach)
-                        return true; // outside the (heading-shaped) warm runway
-                    if (dEff >= rViewReach)
-                    {
-                        // Warm band: pool-load ahead, do NOT hydrate. Cheap,
-                        // long runway so the tight ring hydrates warm.
-                        warmOrRequest(ptr, d2);
-                        return true;
-                    }
-                    const int tier = structTier(ptr);
-                    const float headStart = tier == 0 ? 400.f : (tier == 1 ? 150.f : 0.f);
-                    const float key = dEff - headStart;
-                    // GUARANTEE RING (bubble + buffer): candidates are always
-                    // listed — no cap, no replacement — so completeness in
-                    // reach of the player is structural, not best-effort.
-                    if (d2 < kRadGuarantee * kRadGuarantee)
-                    {
-                        sRadCands.push_back({ ptr, key, d2 });
-                        return true;
-                    }
-                    if (sRadCands.size() < kRadListMax)
-                        sRadCands.push_back({ ptr, key, d2 });
-                    else
-                    {
-                        // Outer disc: keep the best BY KEY, not by scan
-                        // order; what falls off the list still files demand
-                        // so the pump works the whole reach.
-                        std::size_t worst = 0;
-                        for (std::size_t i = 1; i < sRadCands.size(); ++i)
-                            if (sRadCands[i].key > sRadCands[worst].key)
-                                worst = i;
-                        if (key < sRadCands[worst].key && sRadCands[worst].d2 >= kRadGuarantee * kRadGuarantee)
-                            sRadCands[worst] = { ptr, key, d2 };
-                        else
-                            warmOrRequest(ptr, d2);
-                    }
+                    radialVisit(ptr, nullptr, nullptr);
                     return true;
                 });
                 if (vScanAborted)
@@ -4218,7 +4734,8 @@ namespace MWWorld
                 ++radTouched;
                 // Touch (files/refreshes demand in frontier order; starved-
                 // but-untouched entries livelocked the far band).
-                const bool warm = warmOrRequest(rc.ptr, rc.d2);
+                const bool warm = rc.model != kVitaIdxUnresolved ? warmPath(sVitaIdx.mModels[rc.model], rc.d2)
+                                                                 : warmOrRequest(rc.ptr, rc.d2);
                 if (radAdds >= kRadMaxAdds)
                     break; // per-tick cap: smooth fill over stutter
                 const bool guaranteed = rc.d2 < kRadGuarantee * kRadGuarantee && guarAdds < kRadGuarAdds;
@@ -4268,9 +4785,11 @@ namespace MWWorld
                     }
                     char rb[176];
                     snprintf(rb, sizeof(rb),
-                        "[RadQ] cells=%d unloaded=%d scan=%s cands=%d(g=%d) adds=%d(g=%d) far=%d reach=%d",
+                        "[RadQ] cells=%d unloaded=%d scan=%s cands=%d(g=%d) adds=%d(g=%d) far=%d reach=%d pass=%s "
+                        "%ut/%urefs (now %ut)",
                         (int)n, sRadUnloadedSeen, sRadScanInProgress ? "prog" : "done", (int)sRadCands.size(),
-                        guarCands, radAdds, guarAdds, (int)farKey, (int)rViewReach);
+                        guarCands, radAdds, guarAdds, (int)farKey, (int)rViewReach, sRadByIdx ? "idx" : "cells",
+                        sRadLastPassTicks, sRadLastPassRefs, sRadPassTicks);
                     Vita::breadcrumb(rb);
                     sRadUnloadedSeen = 0;
                 }
@@ -4343,28 +4862,217 @@ namespace MWWorld
             }
         }
 
-        // ---- Lane A ----        // ---- Lane A ----
+        // ---- Lane A ----
+        // Residency upkeep: physics on/off at rPhysIn/rPhysOut and release
+        // past the view reach for lite objects (plus sprint-lead demand
+        // ahead), item hydration/release and actor release; and the per-cell
+        // actor domain (local scripts, respawn). The per-ref decisions are
+        // shared by the cell walk and the ref-index sweep.
         const auto laneA0 = Clock::now();
         int domainEntries = 0;
-        for (std::size_t ci = 0; ci < n; ++ci)
+        // A lite ref (static, door, activator, container). Returns whether
+        // it was resident. `e`: its ref-index entry (cached model and
+        // bound), or null on the cell walk.
+        const auto laneALite = [&](const MWWorld::Ptr& ptr, VitaIdxTile* tile, VitaIdxRef* e) -> bool {
+            if (isPagedRef(ptr))
+                return false;
+            if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
+                return false;
+            const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
+            const float dx = op.x() - pp.x();
+            const float dy = op.y() - pp.y();
+            const float d2 = dx * dx + dy * dy;
+            const bool live = ptr.getRefData().getBaseNode() != nullptr;
+            // Model path and learned bound (0 = unknown) for this ref.
+            const auto modelAndBound = [&](std::string& model, float& bound) {
+                if (e != nullptr)
+                {
+                    idxResolve(*tile, *e);
+                    if (e->mModel < sVitaIdx.mModels.size())
+                        model = sVitaIdx.mModels[e->mModel];
+                    bound = e->mBound;
+                    return;
+                }
+                const VFS::Path::Normalized m = getModel(ptr);
+                model = std::string(m.value());
+                bound = m.empty() ? 0.f : mPreloader->vitaKnownBoundRadius(model);
+            };
+            if (!live)
+            {
+                // Hydration is the radial queue's job. Here only
+                // pre-warm the load window: sprint-lead demand for
+                // objects arriving just beyond the view reach.
+                if (vitaWindowUnits > 0.f && d2 > 1.f
+                    && d2 < (rViewReach + rHeadStretch + 8192.f) * (rViewReach + rHeadStretch + 8192.f))
+                {
+                    const float invD = 1.f / std::sqrt(d2);
+                    const float toward = (dx * invD) * moveDir.x() + (dy * invD) * moveDir.y();
+                    if (toward > 0.2f)
+                    {
+                        std::string m;
+                        float br = 0.f;
+                        modelAndBound(m, br);
+                        if (!m.empty())
+                        {
+                            if (br <= 0.f)
+                                br = 1200.f;
+                            const float bound = br * ptr.getCellRef().getScale();
+                            const float dEff = std::sqrt(d2) - bound;
+                            if (dEff >= rViewReach && dEff - rViewReach < vitaWindowUnits)
+                            {
+                                ++sScanCount[ScanLaneA].mWork;
+                                const float pbr = std::max(60.f, bound);
+                                mPreloader->vitaDemandTouch(m, d2 / (pbr * pbr));
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+            // Directional retention mirrors eligibility (+500
+            // hysteresis); allowance capped so a canton cannot
+            // pin itself resident from 10k out.
+            float rEffOut = rStructIn + 500.f;
+            if (d2 > 1.f)
+            {
+                const float invD = 1.f / std::sqrt(d2);
+                const float toward = (dx * invD) * moveDir.x() + (dy * invD) * moveDir.y();
+                if (toward > 0.2f)
+                    rEffOut += rHeadStretch * toward;
+            }
+            if (d2 > rEffOut * rEffOut)
+            {
+                std::string mo;
+                float bro = 0.f;
+                modelAndBound(mo, bro);
+                // Same unlearned default as eligibility, or an
+                // unlearned object flaps in/out at the boundary.
+                const float bound = (bro > 0.f ? bro : 1200.f) * ptr.getCellRef().getScale();
+                const float dEffOut = std::sqrt(d2) - bound;
+                // Mirror of eligibility, +500 hysteresis, so the
+                // view-reach boundary does not churn. Detail past
+                // the near band is released regardless of view
+                // reach (structure-only far ring).
+                if (dEffOut > rEffOut && dEffOut > rViewReach + 500.f)
+                {
+                    ++sScanCount[ScanLaneA].mWork;
+                    removeNonLiteObject(ptr, nullptr);
+                    sVitaLiveObjects = std::max(0, sVitaLiveObjects - 1);
+                    sVitaLivePhys = std::max(0, sVitaLivePhys - 1);
+                    return true;
+                }
+            }
+            const bool hasPhys = mPhysics->getObject(ptr) != nullptr;
+            if (!hasPhys && d2 < rPhysIn * rPhysIn)
+            {
+                ++sScanCount[ScanLaneA].mWork;
+                // Physics lane invariant, cache-aware: shapes
+                // usually still sit in the bullet cache from the
+                // render era — only truly cold ones take the
+                // ledger round trip (ledger churn = pop-in).
+                std::string pm;
+                float unused = 0.f;
+                modelAndBound(pm, unused);
+                if (!pm.empty() && !mPreloader->vitaShapeCached(pm) && !warmPath(pm, d2))
+                    return true; // shape warming; add next pass
+                try
+                {
+                    addPhysicsOnly(ptr, *mPhysics);
+                    addObject(ptr, mWorld, *mPhysics, mLowestPoint, isInterior, mNavigator, nullptr);
+                    ++vitaOps;
+                    ++sVitaLivePhys;
+                }
+                catch (const std::exception& ex)
+                {
+                    char pb[176];
+                    snprintf(pb, sizeof(pb), "[PhysFail] %s: %s", ptr.getCellRef().getRefId().toDebugString().c_str(),
+                        ex.what());
+                    Vita::breadcrumb(pb);
+                }
+            }
+            else if (hasPhys && d2 > rPhysOut * rPhysOut)
+            {
+                ++sScanCount[ScanLaneA].mWork;
+                vitaRemovePhysicsOnly(ptr, nullptr);
+                sVitaLivePhys = std::max(0, sVitaLivePhys - 1);
+            }
+            return true;
+        };
+        // A non-lite ref (item, light, actor) of a cell whose edge is at
+        // edge2 and whose actor domain is domainNow. Returns resident.
+        const auto laneAOther = [&](const MWWorld::Ptr& ptr, float edge2, bool domainNow) -> bool {
+            // Items reach to the fog now, not just domain cells;
+            // domainNow still gates actors/scripts bookkeeping.
+            const bool itemCellNear = edge2 < rItemIn * rItemIn;
+            if (!domainNow && !itemCellNear)
+                return false;
+            if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
+                return false;
+            const unsigned int t = ptr.getType();
+            const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
+            const float dx = op.x() - pp.x();
+            const float dy = op.y() - pp.y();
+            const float d2 = dx * dx + dy * dy;
+            const bool live = ptr.getRefData().getBaseNode() != nullptr;
+            const bool actor = isActorType(t);
+            if (!live && !actor && itemCellNear && d2 < rItemIn * rItemIn)
+            {
+                ++sScanCount[ScanLaneA].mWork;
+                if (!warmOrRequest(ptr, d2))
+                    return false;
+                try
+                {
+                    addObject(ptr, mWorld, mPagedRefs, *mPhysics, mRendering);
+                    addObject(ptr, mWorld, *mPhysics, mLowestPoint, isInterior, mNavigator, nullptr);
+                    ++vitaOps;
+                    ++sVitaLiveObjects;
+                    ++sVitaLivePhys;
+                }
+                catch (const std::exception& ex)
+                {
+                    Log(Debug::Error) << "hydrate fail '" << ptr.getCellRef().getRefId() << "': " << ex.what();
+                }
+                return true;
+            }
+            if (live)
+            {
+                if (!isPagedRef(ptr))
+                {
+                    const float outR = actor ? rActorOut : rItemOut;
+                    if (d2 > outR * outR)
+                    {
+                        ++sScanCount[ScanLaneA].mWork;
+                        removeNonLiteObject(ptr, nullptr);
+                        sVitaLiveObjects = std::max(0, sVitaLiveObjects - 1);
+                        sVitaLivePhys = std::max(0, sVitaLivePhys - 1);
+                    }
+                }
+                return true;
+            }
+            return false;
+        };
+        // Per-cell gate and the actor domain entry (local scripts, respawn,
+        // sound warm), shared. Returns false when the cell is out of reach.
+        struct LaneACellGate
         {
-            if (Clock::now() >= deadline)
-                break;
-            CellStore& cell = *cells[(ci + sStartRot) % n];
+            float edge2 = 0.f;
+            bool wantStruct = false, inSceneDomain = false, domainNow = false;
+        };
+        const auto laneAGate = [&](CellStore& cell, LaneACellGate& g) -> bool {
             if (!cell.getCell()->isExterior())
-                continue;
-            const float edge2 = vitaCellEdge2(cell, pp);
-            const bool wantFull = edge2 < rIn * rIn;
+                return false;
+            g.edge2 = vitaCellEdge2(cell, pp);
+            const bool wantFull = g.edge2 < rIn * rIn;
             // Cell gate must reach as far as ref eligibility does: a fresh
             // cell whose edge sits between rStructIn and the view reach was
             // never scanned, so its view-overlapping statics never queued.
             // vitaCellEdge2 already folds the cell's refs' true bound box in.
             const float rStructScan = rViewReach + rHeadStretch;
-            const bool wantStruct = edge2 < rStructScan * rStructScan;
+            g.wantStruct = g.edge2 < rStructScan * rStructScan;
             const bool inActorDomain = mVitaActorDomain.count(&cell) > 0;
-            const bool inSceneDomain = mVitaPhysDomain.count(&cell) > 0;
-            if (!wantFull && !inActorDomain && !wantStruct && !inSceneDomain)
-                continue;
+            g.inSceneDomain = mVitaPhysDomain.count(&cell) > 0;
+            if (!wantFull && !inActorDomain && !g.wantStruct && !g.inSceneDomain)
+                return false;
             // Domain entry (local scripts, respawn, sound warm) is a lump per
             // cell; a crossing that brings several cells into rIn at once
             // paid them all in one tick. Admit kActorDomainEntriesPerTick;
@@ -4381,182 +5089,178 @@ namespace MWWorld
                 MWBase::Environment::get().getSoundManager()->vitaWarmCellSounds(cell.getCell()->getRegion());
                 MWBase::Environment::get().getSoundManager()->vitaWarmActorSounds(cell);
             }
-            const bool domainNow = wantFull || inActorDomain;
-            bool aborted = false;
-            bool anyResident = false;
-            if (!aborted)
+            g.domainNow = wantFull || inActorDomain;
+            return true;
+        };
+        const bool laneAIdx = idxReady && vitaScanFixEnabled();
+        if (!laneAIdx)
+        {
+            for (std::size_t ci = 0; ci < n; ++ci)
             {
+                if (Clock::now() >= deadline)
+                    break;
+                CellStore& cell = *cells[(ci + sStartRot) % n];
+                LaneACellGate g;
+                if (!laneAGate(cell, g))
+                    continue;
+                bool aborted = false;
+                bool anyResident = false;
                 cell.forEach([&](const MWWorld::Ptr& ptr) {
                     if (Clock::now() >= deadline)
                     {
                         aborted = true;
                         return false;
                     }
-                    const unsigned int t = ptr.getType();
-                    if (isLiteType(t))
-                    {
-                        if (isPagedRef(ptr))
-                            return true;
-                        if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
-                        {
-                            return true;
-                        }
-                        const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
-                        const float dx = op.x() - pp.x();
-                        const float dy = op.y() - pp.y();
-                        const float d2 = dx * dx + dy * dy;
-                        const bool live = ptr.getRefData().getBaseNode() != nullptr;
-                        if (!live)
-                        {
-                            // Hydration is the radial queue's job. Here only
-                            // pre-warm the load window: sprint-lead demand for
-                            // objects arriving just beyond the view reach.
-                            if (vitaWindowUnits > 0.f && d2 > 1.f
-                                && d2 < (rViewReach + rHeadStretch + 8192.f) * (rViewReach + rHeadStretch + 8192.f))
-                            {
-                                const float invD = 1.f / std::sqrt(d2);
-                                const float toward = (dx * invD) * moveDir.x() + (dy * invD) * moveDir.y();
-                                if (toward > 0.2f)
-                                {
-                                    const VFS::Path::Normalized m = getModel(ptr);
-                                    if (!m.empty())
-                                    {
-                                        float br = mPreloader->vitaKnownBoundRadius(std::string(m.value()));
-                                        if (br <= 0.f)
-                                            br = 1200.f;
-                                        const float bound = br * ptr.getCellRef().getScale();
-                                        const float dEff = std::sqrt(d2) - bound;
-                                        if (dEff >= rViewReach && dEff - rViewReach < vitaWindowUnits)
-                                        {
-                                            const float pbr = std::max(60.f, bound);
-                                            mPreloader->vitaDemandTouch(std::string(m.value()), d2 / (pbr * pbr));
-                                        }
-                                    }
-                                }
-                            }
-                            return true;
-                        }
-                        anyResident = true;
-                        // Directional retention mirrors eligibility (+500
-                        // hysteresis); allowance capped so a canton cannot
-                        // pin itself resident from 10k out.
-                        float rEffOut = rStructIn + 500.f;
-                        if (d2 > 1.f)
-                        {
-                            const float invD = 1.f / std::sqrt(d2);
-                            const float toward = (dx * invD) * moveDir.x() + (dy * invD) * moveDir.y();
-                            if (toward > 0.2f)
-                                rEffOut += rHeadStretch * toward;
-                        }
-                        if (d2 > rEffOut * rEffOut)
-                        {
-                            const VFS::Path::Normalized mo = getModel(ptr);
-                            const float bro
-                                = mo.empty() ? 0.f : mPreloader->vitaKnownBoundRadius(std::string(mo.value()));
-                            // Same unlearned default as eligibility, or an
-                            // unlearned object flaps in/out at the boundary.
-                            const float bound = (bro > 0.f ? bro : 1200.f) * ptr.getCellRef().getScale();
-                            const float dEffOut = std::sqrt(d2) - bound;
-                            // Mirror of eligibility, +500 hysteresis, so the
-                            // view-reach boundary does not churn. Detail past
-                            // the near band is released regardless of view
-                            // reach (structure-only far ring).
-                            if (dEffOut > rEffOut && dEffOut > rViewReach + 500.f)
-                            {
-                                removeNonLiteObject(ptr, nullptr);
-                                sVitaLiveObjects = std::max(0, sVitaLiveObjects - 1);
-                                sVitaLivePhys = std::max(0, sVitaLivePhys - 1);
-                                return true;
-                            }
-                        }
-                        const bool hasPhys = mPhysics->getObject(ptr) != nullptr;
-                        if (!hasPhys && d2 < rPhysIn * rPhysIn)
-                        {
-                            // Physics lane invariant, cache-aware: shapes
-                            // usually still sit in the bullet cache from the
-                            // render era — only truly cold ones take the
-                            // ledger round trip (ledger churn = pop-in).
-                            const VFS::Path::Normalized pm = getModel(ptr);
-                            if (!pm.empty() && !mPreloader->vitaShapeCached(std::string(pm.value()))
-                                && !warmPath(std::string(pm.value()), d2))
-                                return true; // shape warming; add next pass
-                            try
-                            {
-                                addPhysicsOnly(ptr, *mPhysics);
-                                addObject(ptr, mWorld, *mPhysics, mLowestPoint, isInterior, mNavigator, nullptr);
-                                ++vitaOps;
-                                ++sVitaLivePhys;
-                            }
-                            catch (const std::exception& e)
-                            {
-                                char pb[176];
-                                snprintf(pb, sizeof(pb), "[PhysFail] %s: %s",
-                                    ptr.getCellRef().getRefId().toDebugString().c_str(), e.what());
-                                Vita::breadcrumb(pb);
-                            }
-                        }
-                        else if (hasPhys && d2 > rPhysOut * rPhysOut)
-                        {
-                            vitaRemovePhysicsOnly(ptr, nullptr);
-                            sVitaLivePhys = std::max(0, sVitaLivePhys - 1);
-                        }
-                        return true;
-                    }
-                    // Items reach to the fog now, not just domain cells;
-                    // domainNow still gates actors/scripts bookkeeping.
-                    const bool itemCellNear = edge2 < rItemIn * rItemIn;
-                    if (!domainNow && !itemCellNear)
-                        return true;
-                    if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
-                        return true;
-                    const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
-                    const float dx = op.x() - pp.x();
-                    const float dy = op.y() - pp.y();
-                    const float d2 = dx * dx + dy * dy;
-                    const bool live = ptr.getRefData().getBaseNode() != nullptr;
-                    const bool actor = isActorType(t);
-                    if (!live && !actor && itemCellNear && d2 < rItemIn * rItemIn)
-                    {
-                        if (!warmOrRequest(ptr, d2))
-                            return true;
-                        try
-                        {
-                            addObject(ptr, mWorld, mPagedRefs, *mPhysics, mRendering);
-                            addObject(ptr, mWorld, *mPhysics, mLowestPoint, isInterior, mNavigator, nullptr);
-                            ++vitaOps;
-                            ++sVitaLiveObjects;
-                            ++sVitaLivePhys;
-                        }
-                        catch (const std::exception& e)
-                        {
-                            Log(Debug::Error)
-                                << "hydrate fail '" << ptr.getCellRef().getRefId() << "': " << e.what();
-                        }
-                        anyResident = true;
-                    }
-                    else if (live)
-                    {
-                        anyResident = true;
-                        if (!isPagedRef(ptr))
-                        {
-                            const float outR = actor ? rActorOut : rItemOut;
-                            if (d2 > outR * outR)
-                            {
-                                removeNonLiteObject(ptr, nullptr);
-                                sVitaLiveObjects = std::max(0, sVitaLiveObjects - 1);
-                                sVitaLivePhys = std::max(0, sVitaLivePhys - 1);
-                            }
-                        }
-                    }
+                    ++sScanCount[ScanLaneA].mVisits;
+                    if (ptr.getRefData().getBaseNode() != nullptr)
+                        ++sScanCount[ScanLaneA].mLive;
+                    if (isLiteType(ptr.getType()))
+                        anyResident = laneALite(ptr, nullptr, nullptr) || anyResident;
+                    else
+                        anyResident = laneAOther(ptr, g.edge2, g.domainNow) || anyResident;
                     return true;
                 });
+                if (anyResident)
+                    mVitaPhysDomain.insert(&cell);
+                else if (g.inSceneDomain && !g.wantStruct)
+                    mVitaPhysDomain.erase(&cell);
+                if (aborted)
+                    break;
             }
-            if (anyResident)
-                mVitaPhysDomain.insert(&cell);
-            else if (inSceneDomain && !wantStruct)
-                mVitaPhysDomain.erase(&cell);
-            if (aborted)
-                break;
+        }
+        else
+        {
+            // Index mode. Every decision above depends on where the player
+            // is, so instead of walking every ref of every cell each tick
+            // until the deadline (soaking whatever budget the other lanes
+            // left), a sweep runs once the player has moved 64 units or
+            // 500 ms passed, in slices that resume where they stopped:
+            // items and actors through their own type lists per cell, lite
+            // refs through the ref index (tiles within the old cell reach,
+            // plus tiles that held live refs on the last sweep, so nothing
+            // left resident far away escapes release).
+            static bool sLaneASweep = false;
+            static osg::Vec3f sLaneAPos(1e9f, 1e9f, 0.f);
+            static Clock::time_point sLaneAAt{};
+            static std::vector<CellStore*> sLaneACells;
+            static std::size_t sLaneACell = 0;
+            static std::vector<int64_t> sLaneATiles;
+            static std::size_t sLaneATile = 0, sLaneARef = 0;
+            static std::unordered_set<int64_t> sLaneALiveTiles, sLaneALiveNext;
+            static unsigned sLaneAGen = 0;
+            for (CellStore* c : cells) // domain entry stays per tick (no ref walk)
+            {
+                LaneACellGate g;
+                laneAGate(*c, g);
+            }
+            const float lmx = pp.x() - sLaneAPos.x();
+            const float lmy = pp.y() - sLaneAPos.y();
+            if (sLaneASweep && sLaneAGen != sVitaFarCandGen)
+                sLaneASweep = false; // a cell unloaded: restart (Ptr safety)
+            if (!sLaneASweep
+                && (lmx * lmx + lmy * lmy > 64.f * 64.f || tick0 - sLaneAAt > std::chrono::milliseconds(500)
+                    || vitaCatchUp))
+            {
+                sLaneASweep = true;
+                sLaneAPos = pp;
+                sLaneAAt = tick0;
+                sLaneAGen = sVitaFarCandGen;
+                sLaneACells = cells;
+                sLaneACell = 0;
+                const float reach = rViewReach + rHeadStretch + 8192.f;
+                sLaneATiles.clear();
+                for (const auto& [key, tile] : sVitaIdx.mTiles)
+                    if (vitaIdxTileDist(key, pp.x(), pp.y()) - tile.mReach < reach || sLaneALiveTiles.count(key))
+                        sLaneATiles.push_back(key);
+                sLaneATile = sLaneARef = 0;
+                sLaneALiveNext.clear();
+            }
+            // Slice: 1 ms (3 in catch-up), within the tick deadline but
+            // never less than 0.25 ms, so a sweep always completes.
+            const auto sliceEnd = std::max(std::min(deadline, Clock::now() + std::chrono::microseconds(vitaCatchUp ? 3000 : 1000)),
+                Clock::now() + std::chrono::microseconds(250));
+            while (sLaneASweep && sLaneACell < sLaneACells.size() && Clock::now() < sliceEnd)
+            {
+                CellStore& cell = *sLaneACells[sLaneACell++];
+                if (mActiveCells.count(&cell) == 0)
+                    continue; // left the active set mid-sweep
+                LaneACellGate g;
+                if (!laneAGate(cell, g))
+                    continue;
+                bool anyResident = false;
+                const auto other = [&](const MWWorld::Ptr& ptr) {
+                    ++sScanCount[ScanLaneA].mVisits;
+                    if (ptr.getRefData().getBaseNode() != nullptr)
+                        ++sScanCount[ScanLaneA].mLive;
+                    anyResident = laneAOther(ptr, g.edge2, g.domainNow) || anyResident;
+                    return true;
+                };
+                cell.forEachType<ESM::NPC>(other);
+                cell.forEachType<ESM::Creature>(other);
+                cell.forEachType<ESM::CreatureLevList>(other);
+                cell.forEachType<ESM::Apparatus>(other);
+                cell.forEachType<ESM::Armor>(other);
+                cell.forEachType<ESM::BodyPart>(other);
+                cell.forEachType<ESM::Book>(other);
+                cell.forEachType<ESM::Clothing>(other);
+                cell.forEachType<ESM::Ingredient>(other);
+                cell.forEachType<ESM::ItemLevList>(other);
+                cell.forEachType<ESM::Light>(other);
+                cell.forEachType<ESM::Lockpick>(other);
+                cell.forEachType<ESM::Miscellaneous>(other);
+                cell.forEachType<ESM::Potion>(other);
+                cell.forEachType<ESM::Probe>(other);
+                cell.forEachType<ESM::Repair>(other);
+                cell.forEachType<ESM::Weapon>(other);
+                // Scene domain now tracks non-lite residents only: lite
+                // release is the index sweep's, over every tile in reach.
+                if (anyResident)
+                    mVitaPhysDomain.insert(&cell);
+                else if (g.inSceneDomain && !g.wantStruct)
+                    mVitaPhysDomain.erase(&cell);
+            }
+            while (sLaneASweep && sLaneACell >= sLaneACells.size() && sLaneATile < sLaneATiles.size()
+                && Clock::now() < sliceEnd)
+            {
+                const auto t = sVitaIdx.mTiles.find(sLaneATiles[sLaneATile]);
+                if (t == sVitaIdx.mTiles.end())
+                {
+                    ++sLaneATile;
+                    sLaneARef = 0;
+                    continue;
+                }
+                std::vector<VitaIdxRef>& refs = t->second.mRefs;
+                bool aborted = false;
+                bool tileLive = false;
+                for (; sLaneARef < refs.size(); ++sLaneARef)
+                {
+                    if ((sLaneARef & 7) == 7 && Clock::now() >= sliceEnd)
+                    {
+                        aborted = true;
+                        break;
+                    }
+                    VitaIdxRef& e = refs[sLaneARef];
+                    const MWWorld::Ptr ptr(e.mRef, e.mCell);
+                    if (!MWWorld::CellStore::isAccessible(ptr.getRefData(), ptr.getCellRef()))
+                        continue;
+                    ++sScanCount[ScanLaneA].mVisits;
+                    if (ptr.getRefData().getBaseNode() != nullptr)
+                        ++sScanCount[ScanLaneA].mLive;
+                    if (laneALite(ptr, &t->second, &e) && ptr.getRefData().getBaseNode() != nullptr)
+                        tileLive = true;
+                }
+                if (tileLive)
+                    sLaneALiveNext.insert(t->first);
+                if (aborted)
+                    break;
+                ++sLaneATile;
+                sLaneARef = 0;
+            }
+            if (sLaneASweep && sLaneACell >= sLaneACells.size() && sLaneATile >= sLaneATiles.size())
+            {
+                sLaneASweep = false;
+                sLaneALiveTiles.swap(sLaneALiveNext);
+            }
         }
 
         {
@@ -4579,6 +5283,94 @@ namespace MWWorld
                     (int)rViewReach);
                 sVitaContactAdds = 0;
                 Vita::breadcrumb(mm);
+            }
+        }
+
+        // ---- Coverage probes (coverage.txt) ----
+        // Lite refs (statics, doors, activators, containers) around the
+        // player, by origin distance only (no bound lookups): unloaded ones
+        // well inside the view reach are holes, loaded ones inside the
+        // physics ring without a body are missing collision, loaded ones far
+        // past release are over-retention. [Landing] runs the near count on
+        // touchdown after more than 1 s airborne (Icarian Flight test).
+        if (vitaCoverageProbeEnabled())
+        {
+            struct Coverage
+            {
+                unsigned bare = 0, live = 0, noPhys = 0, farLive = 0;
+            };
+            const auto probe = [&](float rBare, float rPhys, float rFar) {
+                Coverage c;
+                for (CellStore* cell : cells)
+                {
+                    if (!cell->getCell()->isExterior() || cell->getState() != CellStore::State_Loaded)
+                        continue;
+                    cell->forEach([&](const MWWorld::Ptr& ptr) {
+                        if (!isLiteType(ptr.getType()) || isPagedRef(ptr) || ptr.mRef->isDeleted()
+                            || !ptr.getRefData().isEnabled())
+                            return true;
+                        const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
+                        const float dx = op.x() - pp.x();
+                        const float dy = op.y() - pp.y();
+                        const float d2 = dx * dx + dy * dy;
+                        const bool live = ptr.getRefData().getBaseNode() != nullptr;
+                        if (!live)
+                        {
+                            // Markers have no model and are never loaded.
+                            if (d2 < rBare * rBare && !getModel(ptr).empty())
+                                ++c.bare;
+                            return true;
+                        }
+                        if (d2 < rBare * rBare)
+                            ++c.live;
+                        if (d2 < rPhys * rPhys && mPhysics->getObject(ptr) == nullptr)
+                            ++c.noPhys;
+                        if (d2 > rFar * rFar)
+                            ++c.farLive;
+                        return true;
+                    });
+                }
+                return c;
+            };
+            static Clock::time_point sCovAt{};
+            if (tick0 - sCovAt >= std::chrono::seconds(10))
+            {
+                sCovAt = tick0;
+                const Coverage c = probe(rViewReach - 1000.f, rPhysIn - 300.f, rViewReach + 500.f + kVitaIdxBigRadius);
+                char cb[200];
+                snprintf(cb, sizeof(cb),
+                    "[Coverage] %s within %d: bare=%u live=%u | no collision within %d: %u | live past %d: %u",
+                    vitaRefIndexEnabled() ? "index" : "cells", (int)(rViewReach - 1000.f), c.bare, c.live,
+                    (int)(rPhysIn - 300.f), c.noPhys, (int)(rViewReach + 500.f + kVitaIdxBigRadius), c.farLive);
+                Vita::breadcrumb(cb);
+            }
+            MWWorld::Ptr player = mWorld.getPlayerPtr();
+            const bool airborne = !mWorld.isOnGround(player) && !mWorld.isSwimming(player) && !mWorld.isFlying(player);
+            static bool sAir = false;
+            static Clock::time_point sAirSince{};
+            static osg::Vec3f sAirFrom;
+            if (airborne && !sAir)
+            {
+                sAir = true;
+                sAirSince = tick0;
+                sAirFrom = pp;
+            }
+            else if (!airborne && sAir)
+            {
+                sAir = false;
+                const auto airMs = std::chrono::duration_cast<std::chrono::milliseconds>(tick0 - sAirSince).count();
+                if (airMs > 1000)
+                {
+                    const Coverage c = probe(1800.f, 1800.f, 1e9f);
+                    const float fx = pp.x() - sAirFrom.x();
+                    const float fy = pp.y() - sAirFrom.y();
+                    char lb[200];
+                    snprintf(lb, sizeof(lb),
+                        "[Landing] %s after %dms airborne, %d units: within 1800 bare=%u live=%u no-collision=%u",
+                        vitaRefIndexEnabled() ? "index" : "cells", (int)airMs, (int)std::sqrt(fx * fx + fy * fy),
+                        c.bare, c.live, c.noPhys);
+                    Vita::breadcrumb(lb);
+                }
             }
         }
 
@@ -4627,6 +5419,19 @@ namespace MWWorld
                         / 1000);
                 Vita::breadcrumb(pb);
                 sGuardSplit = VitaGuardSplit();
+                {
+                    static const char* const kNames[ScanLaneCount]
+                        = { "guardRing", "guardDisc", "contact", "radial", "laneA", "laneB" };
+                    const unsigned ticks = std::max(1u, sScanTicks);
+                    int w = snprintf(pb, sizeof(pb), "[StreamScan] per tick (%u ticks) visits/live/work:", ticks);
+                    for (int i = 0; i < ScanLaneCount && w > 0 && w < (int)sizeof(pb); ++i)
+                        w += snprintf(pb + w, sizeof(pb) - w, " %s=%u/%u/%u", kNames[i], sScanCount[i].mVisits / ticks,
+                            sScanCount[i].mLive / ticks, sScanCount[i].mWork / ticks);
+                    Vita::breadcrumb(pb);
+                    for (VitaScanCount& c : sScanCount)
+                        c = VitaScanCount();
+                    sScanTicks = 0;
+                }
                 snprintf(pb, sizeof(pb),
                     "[WarmSplit] calls=%u coldskip=%u warmskip=%u common=%ums bound=%ums demand=%ums worst=%uus",
                     sWarmSplit.mCalls, sWarmSplit.mColdSkips, sWarmSplit.mWarmSkips, sWarmSplit.mCommonUs / 1000,
@@ -4686,6 +5491,7 @@ namespace MWWorld
                 // forEach walked every static, door and item in reach each
                 // tick to find a handful of actors.
                 const auto visitActor = [&](const MWWorld::Ptr& ptr) {
+                    ++sScanCount[ScanLaneB].mVisits;
                     if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
                         return true;
                     if (ptr.getRefData().getBaseNode() != nullptr)
@@ -5624,6 +6430,7 @@ namespace MWWorld
     void Scene::clear()
     {
 #ifdef __vita__
+        vitaIdxClear();
         mVitaActorDomain.clear();
         mVitaPhysDomain.clear();
         mVitaCleanSweep.clear();
