@@ -267,8 +267,8 @@ namespace MWGui
         try
         {
             // Render resolution dropdown: maps the (X, Y) cfg pair to the
-            // nearest preset. Width is the distinguishing axis. Capped at
-            // 640x368 — see comment in onVitaResolutionChanged.
+            // nearest preset. Width is the distinguishing axis. See
+            // onVitaResolutionChanged for the supported geometries.
             getWidget(mVitaResolutionList, "VitaResolutionList");
             if (mVitaResolutionList)
             {
@@ -276,7 +276,10 @@ namespace MWGui
                 size_t idx = 1; // 512x288 default
                 if (curX <= 480) idx = 0;
                 else if (curX <= 512) idx = 1;
-                else idx = 2;
+                else if (curX <= 640) idx = 2;
+                else if (curX <= 720) idx = 3;
+                else idx = 4;
+                idx = std::min(idx, mVitaResolutionList->getItemCount() - 1);
                 mVitaResolutionList->setIndexSelected(idx);
                 mVitaResolutionList->eventComboChangePosition
                     += MyGUI::newDelegate(this, &SettingsWindow::onVitaResolutionChanged);
@@ -738,12 +741,13 @@ namespace MWGui
 #ifdef __vita__
     void SettingsWindow::onVitaResolutionChanged(MyGUI::ComboBox* /*sender*/, size_t pos)
     {
-        // Indices aligned with layout AddItem order. Capped at 640x368 to
-        // match the vglInitWithCustomSizes display backbuffer in
-        // VitaInit.cpp — higher widths produced a black screen in testing
-        // (Vita display controller refuses certain backbuffer geometries).
-        static constexpr int kWidths[]  = { 480, 512, 640 };
-        static constexpr int kHeights[] = { 272, 288, 368 };
+        // Indices aligned with layout AddItem order. The display backbuffer
+        // (VitaInit.cpp) follows this at boot for the geometries the Vita
+        // display controller scales (480x272, 640x368, 720x408, 960x544);
+        // other sizes (768x432) were a black screen, and 512x288 renders
+        // inside a 640x368 backbuffer.
+        static constexpr int kWidths[]  = { 480, 512, 640, 720, 960 };
+        static constexpr int kHeights[] = { 272, 288, 368, 408, 544 };
         if (pos >= std::size(kWidths))
             return;
         Settings::video().mResolutionX.set(kWidths[pos]);

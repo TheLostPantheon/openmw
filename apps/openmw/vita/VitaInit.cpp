@@ -1509,13 +1509,40 @@ namespace Vita
         vglSetFragmentBufferSize(2 * 1024 * 1024);        // 512 KB → 2 MB
         vglUseTripleBuffering(GL_TRUE);
         vglWaitVblankStart(GL_FALSE);
-        // Display backbuffer at 640x368. vitaGL only guards against
-        // exceeding the max framebuf resolution (960x544); it does NOT
-        // catch widths the Vita display controller refuses to scale.
-        // 768x432 was tried and produced a black screen — keep the
-        // proven-good 640x368 and cap the Render Resolution combo on
-        // the Vita Settings tab at 640x368 (no 720/768 presets).
-        vglInitWithCustomSizes(0x100000, 640, 368,
+        // Display backbuffer: the render resolution from the user's
+        // settings.cfg (read here directly: settings load after this),
+        // when it is a geometry the display controller scales — 480x272,
+        // 640x368, 720x408 or native 960x544. vitaGL only guards against
+        // exceeding 960x544, not unsupported sizes (768x432 was a black
+        // screen). Anything else (512x288) keeps 640x368 as before.
+        int fbW = 640, fbH = 368;
+        {
+            int resX = 0, resY = 0;
+            if (FILE* f = fopen("ux0:data/openmw/config/settings.cfg", "r"))
+            {
+                char line[256];
+                while (fgets(line, sizeof(line), f))
+                {
+                    int v = 0;
+                    if (sscanf(line, " resolution x = %d", &v) == 1)
+                        resX = v;
+                    else if (sscanf(line, " resolution y = %d", &v) == 1)
+                        resY = v;
+                }
+                fclose(f);
+            }
+            static constexpr int kModes[][2] = { { 480, 272 }, { 640, 368 }, { 720, 408 }, { 960, 544 } };
+            for (const auto& m : kModes)
+                if (resX == m[0] && resY == m[1])
+                {
+                    fbW = resX;
+                    fbH = resY;
+                }
+            char db[96];
+            snprintf(db, sizeof(db), "[Display] backbuffer %dx%d (settings %dx%d)", fbW, fbH, resX, resY);
+            breadcrumb(db);
+        }
+        vglInitWithCustomSizes(0x100000, fbW, fbH,
             36 * 1024 * 1024,
             88 * 1024 * 1024,
             0,

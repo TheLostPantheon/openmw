@@ -869,6 +869,8 @@
                         <Property key="AddItem" value="480x272"/>
                         <Property key="AddItem" value="512x288"/>
                         <Property key="AddItem" value="640x368"/>
+                        <Property key="AddItem" value="720x408"/>
+                        <Property key="AddItem" value="960x544"/>
                     </Widget>
                 </Widget>
                 <!-- Texture Detail (restart) -->
