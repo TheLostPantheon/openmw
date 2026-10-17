@@ -1509,7 +1509,9 @@ namespace MWMechanics
     }
 
 #ifdef __vita__
-    extern uint64_t gVitaAnimUs[6];
+    extern uint64_t gVitaAnimUs[8];
+    extern uint64_t gVitaAiRateUs, gVitaAiPkgUs[2];
+    extern uint32_t gVitaAiRateCalls;
     namespace
     {
         // [MechSplit]: Actors::update by section, ms per frame (sim thread).
@@ -1558,12 +1560,21 @@ namespace MWMechanics
             // CharacterController::update sections (character.cpp), every
             // controller (actors and animated objects).
             snprintf(buf, sizeof(buf),
-                "[AnimSplit] fx=%.2f move=%.2f state=%.2f turn+head=%.2f run=%.2f tail=%.2f ms/frame",
+                "[AnimSplit] fx=%.2f move=%.2f queue=%.2f weapon=%.2f refresh=%.2f turn+head=%.2f run=%.2f "
+                "tail=%.2f ms/frame",
                 gVitaAnimUs[0] / 1000.0 / gVitaMechFrames, gVitaAnimUs[1] / 1000.0 / gVitaMechFrames,
+                gVitaAnimUs[7] / 1000.0 / gVitaMechFrames, gVitaAnimUs[6] / 1000.0 / gVitaMechFrames,
                 gVitaAnimUs[2] / 1000.0 / gVitaMechFrames, gVitaAnimUs[3] / 1000.0 / gVitaMechFrames,
                 gVitaAnimUs[4] / 1000.0 / gVitaMechFrames, gVitaAnimUs[5] / 1000.0 / gVitaMechFrames);
             Vita::breadcrumb(buf);
             std::fill(std::begin(gVitaAnimUs), std::end(gVitaAnimUs), 0);
+            snprintf(buf, sizeof(buf),
+                "[AiSplit] target rating=%.2f (%.1f calls) combat=%.2f other packages=%.2f ms/frame",
+                gVitaAiRateUs / 1000.0 / gVitaMechFrames, (double)gVitaAiRateCalls / gVitaMechFrames,
+                gVitaAiPkgUs[0] / 1000.0 / gVitaMechFrames, gVitaAiPkgUs[1] / 1000.0 / gVitaMechFrames);
+            Vita::breadcrumb(buf);
+            gVitaAiRateUs = gVitaAiPkgUs[0] = gVitaAiPkgUs[1] = 0;
+            gVitaAiRateCalls = 0;
             std::fill(std::begin(gVitaMechUs), std::end(gVitaMechUs), 0);
             gVitaMechFrames = gVitaMechAiActors = gVitaMechAnimActors = 0;
         }

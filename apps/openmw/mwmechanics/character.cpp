@@ -65,7 +65,7 @@ namespace MWMechanics
 {
     // [AnimSplit] (printed with [MechSplit]): CharacterController::update by
     // section, us summed over the report window.
-    uint64_t gVitaAnimUs[6] = {};
+    uint64_t gVitaAnimUs[8] = {};
     namespace
     {
         struct VitaAnimLap
@@ -2398,6 +2398,7 @@ namespace MWMechanics
 
             VITA_ANIM_LAP(1);
             updateAnimQueue();
+            VITA_ANIM_LAP(7);
             if (!mAnimQueue.empty())
                 idlestate = CharState_SpecialIdle;
             else if (sneak && !mInJump)
@@ -2410,7 +2411,13 @@ namespace MWMechanics
 
             if (!mSkipAnim)
             {
+#ifdef __vita__
+                const bool vitaWeaponForce = updateWeaponState();
+                VITA_ANIM_LAP(6);
+                refreshCurrentAnims(idlestate, movestate, jumpstate, vitaWeaponForce);
+#else
                 refreshCurrentAnims(idlestate, movestate, jumpstate, updateWeaponState());
+#endif
                 updateIdleStormState(inwater);
             }
             VITA_ANIM_LAP(2);
