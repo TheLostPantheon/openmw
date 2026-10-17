@@ -77,6 +77,9 @@ namespace Vita
     // Pool exhaustion enters gpu_alloc's unsafe path (sceGxmFinish + 1s
     // sleeps per failed alloc) — watch it like heap pressure.
     size_t getVglRamFreeKB();
+    /// Free space across every pool a vitaGL allocation falls back through
+    /// (VRAM, RAM, phycont, budget): what "out of GPU memory" means.
+    size_t getVglTotalFreeKB();
 }
 
 // Convenience macro that compiles to nothing on non-Vita

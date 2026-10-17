@@ -217,6 +217,11 @@ namespace Vita
         return vglMemFree(VGL_MEM_RAM) / 1024;
     }
 
+    size_t getVglTotalFreeKB()
+    {
+        return vglMemFree(VGL_MEM_ALL) / 1024;
+    }
+
     void auditDialogueStore(const MWWorld::ESMStore& store)
     {
         const auto& dialogues = store.get<ESM::Dialogue>();

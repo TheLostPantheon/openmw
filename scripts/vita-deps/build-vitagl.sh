@@ -23,7 +23,7 @@ VITAGL_REPO="${VITAGL_REPO:-https://github.com/TheLostPantheon/vitaGL.git}"
 # matches) + vglSetStaticVboRam + synchronous compressed texture transfers
 # + GPU backpressure counters + guarded default uniform reservations
 # (failed scene starts no longer crash) with failure counters.
-VITAGL_COMMIT="${VITAGL_COMMIT:-441a5fed20f018ea3589df5c4efd181c7353b948}"
+VITAGL_COMMIT="${VITAGL_COMMIT:-ec4a3959e0ef471f4feaacd8d84f8b08dcf35251}"
 
 export VITASDK
 export PATH="${VITASDK}/bin:${PATH}"

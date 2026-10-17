@@ -1528,12 +1528,37 @@ namespace MWWorld
             // vitaGL pool exhaustion enters gpu_alloc's unsafe path
             // (sceGxmFinish + 1s sleep per failed alloc — seconds frozen at
             // the GL fence). Fire the battery BEFORE an allocation can fail.
-            const bool vglStarved = Vita::getVglRamFreeKB() < 2048;
+            // Exhaustion means every pool: an allocation falls back from the
+            // RAM pool to phycont, budget and VRAM. The RAM pool alone fills
+            // with vertex buffers in normal play while VRAM has ~60 MB free;
+            // watching only it fired this flush ~9 times a second for nothing.
+            //
+            // A healthy heap resets the flush latch every frame, so with the
+            // pool starved by live data the flush re-fired ~9 times a second
+            // (15 ms each, freeing nothing: frames 32 -> 70 ms over ten
+            // minutes standing still). A pool flush that freed under 512 KB
+            // by the next check backs pool-triggered flushes off for 30 s.
+            static uint64_t s_vglNextUs = 0;
+            static long long s_vglFreeBeforeKB = -1;
+            const long long vglFreeKB = (long long)std::min<size_t>(Vita::getVglTotalFreeKB(), 1u << 30);
+            bool vglStarved = vglFreeKB < 4096 && nowUs >= s_vglNextUs;
+            if (vglStarved && s_vglFreeBeforeKB >= 0 && vglFreeKB < s_vglFreeBeforeKB + 512)
+            {
+                char vb[112];
+                snprintf(vb, sizeof(vb), "[MemWatchdog] vgl flush freed nothing (%lldKB free); next in 30 s",
+                    vglFreeKB);
+                Vita::breadcrumb(vb);
+                s_vglNextUs = nowUs + 30ULL * 1000000ULL;
+                s_vglFreeBeforeKB = -1;
+                vglStarved = false;
+            }
             if ((usedMB > budget - 20 || vglStarved) && !s_cachesFlushed)
             {
                 if (vglStarved)
                 {
-                    const unsigned vglBefore = (unsigned)Vita::getVglRamFreeKB();
+                    const unsigned vglBefore = (unsigned)vglFreeKB;
+                    s_vglFreeBeforeKB = vglFreeKB;
+                    s_vglNextUs = nowUs + 2ULL * 1000000ULL; // let the worker and GC free first
                     // vgl RAM holds TEXTURE objects for cached/warm templates.
                     // Freeing them needs the TEMPLATE ref dropped so the image
                     // goes unreferenced and its texture is released — that is
@@ -5564,7 +5589,7 @@ namespace MWWorld
             if (std::chrono::duration_cast<std::chrono::seconds>(tick0 - sLastMap).count() >= 10)
             {
                 sLastMap = tick0;
-                char mm[192];
+                char mm[224];
                 int dw = 0, dl = 0, dr = 0;
                 const auto vitaIcoQueue = [this]() -> unsigned {
                     osgUtil::IncrementalCompileOperation* ico = mRendering.getIncrementalCompileOperation();
@@ -5578,12 +5603,13 @@ namespace MWWorld
                 SceneUtil::getRigCacheStats(rigH, rigM, rigN);
                 snprintf(mm, sizeof(mm),
                     "[MemMap] heap=%dMB objs=%d phys=%d stores=%d dmd=%du%d/%d/%d rig=%u/%u/%u ct=%u bud=%d/%d%s "
-                    "issued=%u/10s reach=%d ico=%u",
+                    "issued=%u/10s reach=%d ico=%u vgl ram/all=%u/%uKB",
                     Vita::getHeapUsedMB(), (int)mRendering.getObjects().getObjectCount(),
                     (int)mPhysics->getObjectCount(), (int)mWorld.getWorldModel().vitaCellStoreCount(), dw,
                     mPreloader->vitaDemandUrgentCount(), dl, dr, rigH, rigM, rigN, sVitaContactAdds, maxMs,
                     vitaOtherMs, vitaCatchUp ? "C" : "", (unsigned)mPreloader->vitaDemandIssuedAndReset(),
-                    (int)rViewReach, vitaIcoQueue());
+                    (int)rViewReach, vitaIcoQueue(), (unsigned)std::min<size_t>(Vita::getVglRamFreeKB(), 999999),
+                    (unsigned)std::min<size_t>(Vita::getVglTotalFreeKB(), 999999));
                 sVitaContactAdds = 0;
                 Vita::breadcrumb(mm);
             }
