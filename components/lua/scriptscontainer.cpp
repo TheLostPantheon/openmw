@@ -13,8 +13,91 @@ namespace
     };
 }
 
+#ifdef __vita__
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <unordered_map>
+#include <vector>
+
+#include <psp2/io/stat.h>
+#include <psp2/kernel/processmgr.h>
+#endif
+
 namespace LuaUtil
 {
+#ifdef __vita__
+    namespace
+    {
+        struct VitaLuaHistEntry
+        {
+            std::string mName; // "handler:script"
+            unsigned long long mUs = 0;
+            unsigned mCalls = 0;
+        };
+        // Keyed by handler-name literal + script id; Lua runs on one thread
+        // at a time (inline on main, or the Lua worker).
+        std::unordered_map<unsigned long long, VitaLuaHistEntry> sVitaLuaHist;
+    }
+
+    bool vitaLuaProfOn()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/luaprof.txt", &st) >= 0;
+        }();
+        return sOn;
+    }
+
+    unsigned long long vitaLuaNowUs()
+    {
+        return sceKernelGetProcessTimeWide();
+    }
+
+    void vitaLuaHistAdd(std::string_view handler, int scriptId, const VFS::Path::Normalized& path,
+        unsigned long long us)
+    {
+        const unsigned long long key
+            = (static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(handler.data())) << 20)
+            ^ static_cast<unsigned long long>(static_cast<unsigned>(scriptId));
+        VitaLuaHistEntry& e = sVitaLuaHist[key];
+        if (e.mName.empty())
+        {
+            const std::string_view p = path.value();
+            const std::size_t slash = p.rfind('/');
+            e.mName = std::string(handler) + ":" + std::string(slash == std::string_view::npos ? p : p.substr(slash + 1));
+        }
+        e.mUs += us;
+        ++e.mCalls;
+    }
+
+    int vitaLuaHistReport(char* buf, std::size_t len, unsigned frames)
+    {
+        if (!vitaLuaProfOn() || sVitaLuaHist.empty() || frames == 0)
+            return 0;
+        std::vector<const VitaLuaHistEntry*> top;
+        unsigned long long total = 0;
+        for (const auto& [k, e] : sVitaLuaHist)
+        {
+            top.push_back(&e);
+            total += e.mUs;
+        }
+        std::sort(top.begin(), top.end(), [](auto* a, auto* b) { return a->mUs > b->mUs; });
+        int w = snprintf(buf, len, "[LuaHist] handlers=%.2f ms/frame:", total / 1000.0 / frames);
+        for (std::size_t i = 0; i < top.size() && i < 10 && w > 0 && (std::size_t)w < len; ++i)
+            w += snprintf(buf + w, len - w, " %s=%.2f/%u", top[i]->mName.c_str(), top[i]->mUs / 1000.0 / frames,
+                top[i]->mCalls / frames);
+        if (w >= (int)len)
+            w = (int)len - 1;
+        for (auto& [k, e] : sVitaLuaHist)
+        {
+            e.mUs = 0;
+            e.mCalls = 0;
+        }
+        return w;
+    }
+#endif
+
     static constexpr std::string_view ENGINE_HANDLERS = "engineHandlers";
     static constexpr std::string_view EVENT_HANDLERS = "eventHandlers";
 

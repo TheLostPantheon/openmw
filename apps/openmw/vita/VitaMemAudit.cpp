@@ -3,6 +3,8 @@
 #include "VitaMemAudit.h"
 #include "VitaCullTimer.h"
 #include "VitaStaticRenderer.h"
+
+#include <components/lua/scriptscontainer.hpp>
 #include "VitaInit.h"
 #include "VitaSimWorker.h"
 
@@ -59,6 +61,9 @@ extern "C"
     uint32_t vita_cullfence_us = 0, vita_gl_cull_us = 0, vita_cullongl_frames = 0;
     // Lua's explicit per-frame GC step (luamanagerimp.cpp), part of [PhaseAvg] lua.
     uint32_t vita_lua_gc_us = 0;
+    // [LuaSync] (luaprof.txt): Lua synchronizedUpdate by block.
+    uint32_t vita_lsync_input_us = 0, vita_lsync_actions_us = 0, vita_lsync_menu_us = 0, vita_lsync_player_us = 0,
+             vita_lsync_delayed_us = 0, vita_lsync_delayed_n = 0;
     uint32_t vita_lua_kb = 0; // Lua heap size (LUA_GCCOUNT), last frame
     // PlayGroup calls on objects with no animation controller (mwmechanics/objects.cpp).
     unsigned int vita_playgroup_missing = 0;
@@ -81,6 +86,8 @@ extern "C"
 namespace MyGUIPlatform
 {
     extern uint32_t g_vitaGuiWalks;
+    extern char g_vitaGuiLayerNames[12][24];
+    extern uint32_t g_vitaGuiLayerUs[12], g_vitaGuiLayerBatches[12];
     extern uint32_t g_vitaGuiSkips;
     extern uint32_t g_vitaGuiWalkUs, g_vitaGuiCheckUs, g_vitaGuiRepeatUs;
     extern char g_vitaGuiDirtyLayers[8][24];
@@ -625,6 +632,20 @@ namespace Vita
         vgl_memo_hits = vgl_memo_miss = 0;
         vgl_vprog_hits = vgl_vprog_miss = 0;
         vita_bin2_graphs = vita_bin2_leaves = 0;
+        if (MyGUIPlatform::g_vitaGuiWalks > 0 && MyGUIPlatform::g_vitaGuiLayerNames[0][0])
+        {
+            // Per-walk averages (guiprof.txt): which layer the rebuild spends in.
+            char gl[400];
+            const unsigned walks = MyGUIPlatform::g_vitaGuiWalks;
+            int n = snprintf(gl, sizeof(gl), "[GuiLayers] per walk (%u walks):", walks);
+            for (int i = 0; i < 12 && MyGUIPlatform::g_vitaGuiLayerNames[i][0] && n > 0 && n < (int)sizeof(gl); ++i)
+            {
+                n += snprintf(gl + n, sizeof(gl) - n, " %s=%.2fms/%ub", MyGUIPlatform::g_vitaGuiLayerNames[i],
+                    MyGUIPlatform::g_vitaGuiLayerUs[i] / 1000.0 / walks, MyGUIPlatform::g_vitaGuiLayerBatches[i] / walks);
+                MyGUIPlatform::g_vitaGuiLayerUs[i] = MyGUIPlatform::g_vitaGuiLayerBatches[i] = 0;
+            }
+            auditLog(gl);
+        }
         {
             char gl[200];
             int n = snprintf(gl, sizeof(gl), "[GuiWalks]");
@@ -732,6 +753,21 @@ namespace Vita
             auditLog(buf);
         }
         vita_simjob_us = vita_simjob_upd_us = vita_simjob_cull_us = 0;
+        if (LuaUtil::vitaLuaProfOn())
+        {
+            const double kf = kReportEveryFrames * 1000.0;
+            snprintf(buf, sizeof(buf),
+                "[LuaSync] input=%.2f actions=%.2f menu=%.2f player=%.2f delayed=%.2f (%.1f/frame) ms/frame",
+                vita_lsync_input_us / kf, vita_lsync_actions_us / kf, vita_lsync_menu_us / kf,
+                vita_lsync_player_us / kf, vita_lsync_delayed_us / kf,
+                (double)vita_lsync_delayed_n / kReportEveryFrames);
+            auditLog(buf);
+            vita_lsync_input_us = vita_lsync_actions_us = vita_lsync_menu_us = vita_lsync_player_us = 0;
+            vita_lsync_delayed_us = vita_lsync_delayed_n = 0;
+            char lb[600];
+            if (LuaUtil::vitaLuaHistReport(lb, sizeof(lb), kReportEveryFrames) > 0)
+                auditLog(lb);
+        }
         if (vita_lua_overlap_frames > 0)
         {
             snprintf(buf, sizeof(buf),

@@ -35,6 +35,9 @@
 // [MainAvg] luagc: the explicit per-frame GC step, luamem: Lua heap in KB
 // (apps/openmw/vita/VitaMemAudit.cpp).
 extern "C" uint32_t vita_lua_gc_us, vita_lua_kb;
+// [LuaSync] (luaprof.txt): synchronizedUpdate by block.
+extern "C" uint32_t vita_lsync_input_us, vita_lsync_actions_us, vita_lsync_menu_us, vita_lsync_player_us,
+    vita_lsync_delayed_us, vita_lsync_delayed_n;
 
 namespace
 {
@@ -333,6 +336,17 @@ namespace MWLua
         // We apply input events in `synchronizedUpdate` rather than in `update` in order to reduce input latency.
         {
             BoolScopeGuard processingGuard(mProcessingInputEvents);
+#ifdef __vita__
+            const bool prof = LuaUtil::vitaLuaProfOn();
+            uint64_t lt = prof ? sceKernelGetProcessTimeWide() : 0;
+            const auto lap = [&](uint32_t& bucket) {
+                if (!prof)
+                    return;
+                const uint64_t now = sceKernelGetProcessTimeWide();
+                bucket += (uint32_t)(now - lt);
+                lt = now;
+            };
+#endif
 
             for (const auto& event : mMenuInputEvents)
                 mMenuScripts.processInputEvent(event);
@@ -344,13 +358,25 @@ namespace MWLua
             }
             mInputEvents.clear();
             mLuaEvents.callMenuEventHandlers();
+#ifdef __vita__
+            lap(vita_lsync_input_us);
+#endif
             float frameDuration = MWBase::Environment::get().getWorld()->getTimeManager()->isPaused()
                 ? 0.f
                 : MWBase::Environment::get().getFrameDuration();
             mInputActions.update(frameDuration);
+#ifdef __vita__
+            lap(vita_lsync_actions_us);
+#endif
             mMenuScripts.onFrame(frameDuration);
+#ifdef __vita__
+            lap(vita_lsync_menu_us);
+#endif
             if (playerScripts)
                 playerScripts->onFrame(frameDuration);
+#ifdef __vita__
+            lap(vita_lsync_player_us);
+#endif
         }
 
         for (const auto& [message, mode] : mUIMessages)
@@ -360,7 +386,19 @@ namespace MWLua
             windowManager->printToConsole(msg, "#" + color.toHex());
         mInGameConsoleMessages.clear();
 
+#ifdef __vita__
+        if (LuaUtil::vitaLuaProfOn())
+        {
+            vita_lsync_delayed_n += (uint32_t)mActionQueue.size();
+            const uint64_t d0 = sceKernelGetProcessTimeWide();
+            applyDelayedActions();
+            vita_lsync_delayed_us += (uint32_t)(sceKernelGetProcessTimeWide() - d0);
+        }
+        else
+            applyDelayedActions();
+#else
         applyDelayedActions();
+#endif
 
         if (mReloadAllScriptsRequested)
         {

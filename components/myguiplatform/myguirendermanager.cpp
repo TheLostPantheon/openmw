@@ -474,6 +474,10 @@ namespace MyGUIPlatform
         delete buffer;
     }
 
+#ifdef __vita__
+    static uint32_t sVitaBatchCount = 0; // [GuiLayers]: batches per layer walk
+#endif
+
     void RenderManager::begin()
     {
         mDrawable->clear();
@@ -501,6 +505,9 @@ namespace MyGUIPlatform
             batch.mStateSet = mInjectState;
 
         mDrawable->addBatch(batch);
+#ifdef __vita__
+        ++sVitaBatchCount;
+#endif
     }
 
     void RenderManager::setInjectState(osg::StateSet* stateSet)
@@ -528,6 +535,17 @@ namespace MyGUIPlatform
     // Time spent in full walks (batch rebuilds), for [Scene] guiwalk; in the
     // per-frame dirty check across layers, and in clean-frame batch replays.
     uint32_t g_vitaGuiWalkUs = 0, g_vitaGuiCheckUs = 0, g_vitaGuiRepeatUs = 0;
+    // [GuiLayers] (guiprof.txt): walk time and batches per layer.
+    char g_vitaGuiLayerNames[12][24] = {};
+    uint32_t g_vitaGuiLayerUs[12] = {}, g_vitaGuiLayerBatches[12] = {};
+    static bool vitaGuiProf()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/guiprof.txt", &st) >= 0;
+        }();
+        return sOn;
+    }
     // Dirty attribution: every sub-widget dirty site reports (via the
     // MyGUI probe macro). Keyed by owning widget name/type + parent chain
     // + thread; top rows printed per audit window.
@@ -674,7 +692,31 @@ namespace MyGUIPlatform
         const uint64_t walkT0 = sceKernelGetProcessTimeWide();
 #endif
         begin();
+#ifdef __vita__
+        if (vitaGuiProf())
+        {
+            // Same order as LayerManager::renderToTarget, one layer at a time.
+            MyGUI::LayerManager::EnumeratorLayer layers = MyGUI::LayerManager::getInstance().getEnumerator();
+            for (int i = 0; layers.next(); ++i)
+            {
+                const uint64_t l0 = sceKernelGetProcessTimeWide();
+                const uint32_t b0 = sVitaBatchCount;
+                layers.current()->renderToTarget(this, mUpdate);
+                if (i < 12)
+                {
+                    if (g_vitaGuiLayerNames[i][0] == 0)
+                        snprintf(g_vitaGuiLayerNames[i], sizeof(g_vitaGuiLayerNames[i]), "%s",
+                            layers.current()->getName().c_str());
+                    g_vitaGuiLayerUs[i] += (uint32_t)(sceKernelGetProcessTimeWide() - l0);
+                    g_vitaGuiLayerBatches[i] += sVitaBatchCount - b0;
+                }
+            }
+        }
+        else
+            onRenderToTarget(this, mUpdate);
+#else
         onRenderToTarget(this, mUpdate);
+#endif
         end();
 #ifdef __vita__
         g_vitaGuiWalkUs += (uint32_t)(sceKernelGetProcessTimeWide() - walkT0);

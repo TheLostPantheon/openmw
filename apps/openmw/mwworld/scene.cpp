@@ -4011,9 +4011,19 @@ namespace MWWorld
             // healthy). Mid-scan set changes just make one pass approximate;
             // the next staleness rescan corrects coverage.
             const bool radHardReset = sRadScanGen != sVitaFarCandGen;
+            // Restart triggers in live play (noscanfix.txt restores the old
+            // ones): movement or 1.5 s. A delivery doesn't change which
+            // objects are candidates (adds re-check warmth every tick), and
+            // restarting whenever the list drained kept a trickle of town
+            // candidates rescanning every cell continuously -- the scan ran
+            // its whole window every frame. Demand lives 4 s untouched and
+            // the guard disc covers the near ring every 500 ms.
+            const bool radCalm = vitaScanFixEnabled() && !bigBudget;
             const bool radStale = rmx * rmx + rmy * rmy > 200.f * 200.f
-                || tick0 - sRadScanAt > std::chrono::milliseconds(sRadScanFoundNothing ? 2000 : 750)
-                || radEpoch != sRadScanEpoch || (sRadCands.empty() && !sRadScanFoundNothing)
+                || tick0 - sRadScanAt
+                    > std::chrono::milliseconds(sRadScanFoundNothing ? 2000 : (radCalm ? 1500 : 750))
+                || (!radCalm && radEpoch != sRadScanEpoch)
+                || (!radCalm && sRadCands.empty() && !sRadScanFoundNothing)
                 || (sRadScanFoundNothing && n != sRadScanN);
             if (radHardReset || (radStale && !sRadScanInProgress))
             {
@@ -4067,7 +4077,9 @@ namespace MWWorld
                 cell.forEach([&](const MWWorld::Ptr& ptr) {
                     if (vScanRef++ < sRadScanRefOffset)
                         return true; // already processed this cell up to here
-                    if ((vScanRef & 15) == 0 && Clock::now() >= scanDeadline)
+                    // Every 4 refs: a warm-band ref files demand (~37 us), so
+                    // checking every 16 overshot the window by up to ~0.5 ms.
+                    if ((vScanRef & 3) == 0 && Clock::now() >= scanDeadline)
                     {
                         vScanAborted = true;
                         return false; // resume this cell next tick

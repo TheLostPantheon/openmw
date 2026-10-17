@@ -597,7 +597,17 @@
  } // namespace MyGUI
 --- a/MyGUIEngine/src/MyGUI_LayerNode.cpp
 +++ b/MyGUIEngine/src/MyGUI_LayerNode.cpp
-@@ -40,7 +40,7 @@
+@@ -8,6 +8,9 @@
+ #include "MyGUI_LayerNode.h"
+ #include "MyGUI_ILayerItem.h"
+ #include "MyGUI_ITexture.h"
++#ifdef __vita__
++#include "MyGUI_Widget.h"
++#endif
+ #include "MyGUI_ISubWidget.h"
+ #include "MyGUI_ISubWidgetText.h"
+ 
+@@ -40,7 +43,7 @@
  		LayerNode* layer = new LayerNode(mLayer, this);
  		mChildItems.push_back(layer);
  
@@ -606,7 +616,7 @@
  
  		return layer;
  	}
-@@ -54,7 +54,7 @@
+@@ -54,7 +57,7 @@
  				delete _node;
  				mChildItems.erase(iter);
  
@@ -615,7 +625,7 @@
  
  				return;
  			}
-@@ -71,7 +71,7 @@
+@@ -71,7 +74,7 @@
  				mChildItems.erase(iter);
  				mChildItems.push_back(_item);
  
@@ -624,7 +634,30 @@
  
  				return;
  			}
-@@ -157,7 +157,7 @@
+@@ -101,7 +104,22 @@
+ 			childItem->renderToTarget(_target, _update);
+ 
+ 		mOutOfDate = false;
++	}
++
++#ifdef __vita__
++	bool LayerNode::vitaHasVisibleItem() const
++	{
++		if (mLayerItems.empty())
++			return true; // no known owner: keep walking
++		for (ILayerItem* item : mLayerItems)
++		{
++			const Widget* widget = dynamic_cast<const Widget*>(item);
++			if (widget == nullptr || widget->getVisible())
++				return true;
++		}
++		return false;
+ 	}
++#endif
+ 
+ 	void LayerNode::resizeView(const IntSize& _viewSize)
+ 	{
+@@ -157,7 +175,7 @@
  		}
  
  		mOutOfDateCompression = true;
@@ -633,7 +666,7 @@
  
  		// first queue keep order
  
-@@ -221,7 +221,7 @@
+@@ -221,7 +239,7 @@
  		mLayerItems.push_back(_item);
  		_item->attachItemToNode(mLayer, this);
  
@@ -642,7 +675,7 @@
  	}
  
  	void LayerNode::detachLayerItem(ILayerItem* _item)
-@@ -232,7 +232,7 @@
+@@ -232,7 +250,7 @@
  			{
  				mLayerItems.erase(iter);
  
@@ -651,7 +684,7 @@
  
  				return;
  			}
-@@ -242,7 +242,7 @@
+@@ -242,7 +260,7 @@
  
  	void LayerNode::outOfDate(RenderItem* _item)
  	{
@@ -715,3 +748,40 @@
  
  				return;
  			}
+@@ -150,7 +151,21 @@
+ 	void OverlappedLayer::renderToTarget(IRenderTarget* _target, bool _update)
+ 	{
+ 		for (auto& childItem : mChildItems)
++		{
++#ifdef __vita__
++			// A hidden window renders nothing, yet walking its node tree
++			// (OpenMW keeps the inventory, map, stats and settings windows
++			// built while closed) was most of every GUI rebuild. Showing it
++			// marks its items out of date, so it rebuilds when it appears.
++			if (!_update)
++			{
++				const LayerNode* node = dynamic_cast<const LayerNode*>(childItem);
++				if (node != nullptr && !node->vitaHasVisibleItem())
++					continue;
++			}
++#endif
+ 			childItem->renderToTarget(_target, _update);
++		}
+ 
+ 		mOutOfDate = false;
+ 	}
+--- a/MyGUIEngine/include/MyGUI_LayerNode.h
++++ b/MyGUIEngine/include/MyGUI_LayerNode.h
+@@ -62,6 +62,12 @@
+ 		// рисует леер
+ 		void renderToTarget(IRenderTarget* _target, bool _update) override;
+ 
++#ifdef __vita__
++		// False when every widget attached to this node is hidden: the node
++		// then renders nothing, and an overlapped layer may skip walking it.
++		bool vitaHasVisibleItem() const;
++#endif
++
+ 		void resizeView(const IntSize& _viewSize) override;
+ 
+ 		float getNodeDepth() const override;

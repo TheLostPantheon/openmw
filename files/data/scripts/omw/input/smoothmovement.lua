@@ -54,14 +54,31 @@ local function computeSmoothMovement()
     return remapToWalkRun(self, controllerInput)
 end
 
+-- Every binding below needs the same per-frame values; computing them in
+-- each (four SmoothMove bindings, four Move bindings and Run) repeated the
+-- axis reads, the ground/swim/sneak checks, the walk and run speeds and the
+-- settings lookups up to five times a frame. Bindings run before onFrame,
+-- so onFrame starts the next frame's cache.
+local frame = 0
+local cachedFrame = -1
+local cachedSmoothEnabled, cachedRun, cachedMovement
+local function perFrame()
+    if cachedFrame ~= frame then
+        cachedFrame = frame
+        cachedSmoothEnabled = settings:get('smoothControllerMovement')
+        cachedRun, cachedMovement = computeSmoothMovement()
+    end
+end
+
 local function bindSmoothMove(key, axis, direction)
     local smoothKey = 'Smooth' .. key
     input.bindAction(smoothKey, async:callback(function()
-        local _, movement = computeSmoothMovement()
-        return math.max(direction * movement[axis], 0)
+        perFrame()
+        return math.max(direction * cachedMovement[axis], 0)
     end), {})
     input.bindAction(key, async:callback(function(_, standardMovement, smoothMovement)
-        if not settings:get('smoothControllerMovement') then
+        perFrame()
+        if not cachedSmoothEnabled then
             return standardMovement
         end
 
@@ -79,14 +96,22 @@ bindSmoothMove('MoveRight', 'y', 1)
 bindSmoothMove('MoveLeft', 'y', -1)
 
 input.bindAction('Run', async:callback(function(_, run)
-    if not settings:get('smoothControllerMovement') then
+    perFrame()
+    if not cachedSmoothEnabled then
         return run
     end
-    local smoothRun, movement = computeSmoothMovement()
-    if movement:length2() > 0 then
+    if cachedMovement:length2() > 0 then
         -- ignore always run
-        return smoothRun ~= settings:get('alwaysRun')
+        return cachedRun ~= settings:get('alwaysRun')
     else
         return run
     end
 end), {})
+
+return {
+    engineHandlers = {
+        onFrame = function()
+            frame = frame + 1
+        end,
+    },
+}
