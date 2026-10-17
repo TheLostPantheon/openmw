@@ -150,7 +150,9 @@ namespace MWWorld
         void vitaLoadWarmResource(const std::string& path, osg::ref_ptr<const osg::Referenced>& tmpl,
             osg::ref_ptr<const osg::Referenced>& shape) const;
         // Drains warm work in small batches, only when crossings are quiet.
-        void vitaPumpWarm(bool idle);
+        // starved: urgent demand blocked at the memory gate; issue only a
+        // few of the nearest demand loads, no anticipatory warming.
+        void vitaPumpWarm(bool idle, bool starved = false);
         void vitaDrainWarmSync(int maxMs);
         // Post-screen grace: clamp pump batches while visible frames catch up.
         void vitaPumpGrace(int ms);

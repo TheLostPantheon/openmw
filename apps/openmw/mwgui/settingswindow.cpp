@@ -297,6 +297,29 @@ namespace MWGui
                 mVitaTextureDetailList->setIndexSelected(idx);
                 mVitaTextureDetailList->eventComboChangePosition
                     += MyGUI::newDelegate(this, &SettingsWindow::onVitaTextureDetailChanged);
+                // Optional: an older layout without them must not stop the
+                // rows below from being set up.
+                const MyGUI::Colour warn = MyGUI::Colour::parse(
+                    MyGUI::LanguageManager::getInstance().replaceTags("#{fontcolour=negative}"));
+                try
+                {
+                    getWidget(mVitaTextureDetailWarning, "VitaTextureDetailWarning");
+                    mVitaTextureDetailWarning->setTextColour(warn);
+                    updateVitaTextureDetailWarning(idx);
+                }
+                catch (...)
+                {
+                    mVitaTextureDetailWarning = nullptr;
+                }
+                try
+                {
+                    MyGUI::TextBox* note = nullptr;
+                    getWidget(note, "VitaStreamingNote");
+                    note->setTextColour(warn);
+                }
+                catch (...)
+                {
+                }
             }
 
             // Small object culling: nearest preset to the current pixel size
@@ -800,9 +823,20 @@ namespace MWGui
         if (pos >= std::size(kValues))
             return;
         Settings::general().mVitaTextureDetail.set(kValues[pos]);
-        // No apply() — texture downsample happens at image-load time
-        // inside ImageManager::getImage. Already-cached textures retain
-        // their old caps. The new preset takes effect on next boot.
+        updateVitaTextureDetailWarning(pos);
+        // No apply() — ImageManager reads the preset once, at the first
+        // image load; the new preset takes effect on next boot.
+    }
+
+    void SettingsWindow::updateVitaTextureDetailWarning(size_t pos)
+    {
+        // High keeps world textures up to 256 px (4x the area of Balanced),
+        // Off at full size. Streaming loads nothing while the heap sits at
+        // its gate, so these trade pop-in in dense towns for detail.
+        if (mVitaTextureDetailWarning == nullptr)
+            return;
+        mVitaTextureDetailWarning->setCaption(pos == 3 ? "Heavy on memory" : "More memory");
+        mVitaTextureDetailWarning->setVisible(pos == 2 || pos == 3);
     }
 
     void SettingsWindow::onVitaCullingChanged(MyGUI::ComboBox* /*sender*/, size_t pos)

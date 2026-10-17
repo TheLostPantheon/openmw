@@ -164,6 +164,8 @@ namespace
     // loader is disabled and nothing is working to re-enable it -- which is
     // exactly where the heap parks.
     constexpr int kVitaWarmGateMB = 12;
+    // Starved urgent demand may load past the gate up to budget + this.
+    constexpr int kVitaValveCeilMB = 6;
     // Store-eviction distance floors (world units to cell edge, player-based).
     constexpr float kVitaEvictKeepNear = 12288.f;
     constexpr float kVitaEvictKeepFar = 24576.f;
@@ -1165,6 +1167,29 @@ namespace MWWorld
             // eligibility, was why "guaranteed" streaming kept missing.
             // Memory headroom is the only gate; frame health governs adds.
             const bool urgentDemand = mPreloader->vitaDemandUrgentCount() > 0;
+            // The gate below must not wedge streaming. Held 1 MB over it with
+            // nothing left to flush, 128 urgent requests once went 80 s
+            // without one issued (72 objects live, Balmora bare). Blocked
+            // 1 s: give back the warm pools. Blocked 2 s: load the nearest
+            // few anyway while the heap stays inside budget + 6 (34 MB of
+            // the reserve left).
+            static std::chrono::steady_clock::time_point sValveSince{};
+            static unsigned sValveCalls = 0;
+            static int sValveHeap0 = 0;
+            const int heapMB = Vita::getHeapUsedMB();
+            const int budgetMB = getVitaCellBudgetMB();
+            const auto valveEnd = [&] {
+                if (sValveSince.time_since_epoch().count() == 0)
+                    return;
+                char vb[128];
+                snprintf(vb, sizeof(vb), "[DemandValve] released after %.1f s, %u starved pumps, heap %d->%dMB",
+                    std::chrono::duration<float>(std::chrono::steady_clock::now() - sValveSince).count(),
+                    sValveCalls, sValveHeap0, heapMB);
+                Vita::breadcrumb(vb);
+                sValveSince = {};
+            };
+            if (!urgentDemand)
+                valveEnd();
             if ((urgentDemand || (sFastTick >= 8 && mPreloader->vitaDemandWantedCount() > 0)) && sWarmTick < 29)
             {
                 sFastTick = 0;
@@ -1174,8 +1199,37 @@ namespace MWWorld
                 // Anticipatory work keeps the wider gate. Dense scenes sat
                 // exactly AT the old gate with 128 wanted / 0 loading.
                 const int gateMB = urgentDemand ? kVitaWarmGateMB / 2 : kVitaWarmGateMB;
-                if (Vita::getHeapUsedMB() < getVitaCellBudgetMB() - gateMB)
+                if (heapMB < budgetMB - gateMB)
+                {
                     mPreloader->vitaPumpWarm(false);
+                    valveEnd();
+                }
+                else if (urgentDemand)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (sValveSince.time_since_epoch().count() == 0)
+                    {
+                        sValveSince = now;
+                        sValveCalls = 0;
+                        sValveHeap0 = heapMB;
+                    }
+                    const auto blocked = now - sValveSince;
+                    if (blocked >= std::chrono::seconds(1))
+                        mPreloader->vitaRelievePressure(false);
+                    if (blocked >= std::chrono::seconds(2) && heapMB < budgetMB + kVitaValveCeilMB)
+                    {
+                        if (sValveCalls == 0)
+                        {
+                            char vb[128];
+                            snprintf(vb, sizeof(vb),
+                                "[DemandValve] urgent demand blocked 2 s at heap %dMB (gate %dMB): loading nearest",
+                                heapMB, budgetMB - gateMB);
+                            Vita::breadcrumb(vb);
+                        }
+                        ++sValveCalls;
+                        mPreloader->vitaPumpWarm(false, true);
+                    }
+                }
             }
             if (++sWarmTick >= 30)
             {

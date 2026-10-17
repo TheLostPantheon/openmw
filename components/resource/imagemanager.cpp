@@ -20,6 +20,8 @@ extern "C" void vitaBreadcrumb(const char* msg);
 #include <ctime>
 #include <malloc.h>
 #include <components/settings/values.hpp>
+
+extern "C" unsigned int _newlib_heap_size_user;
 #endif
 
 #include "objectcache.hpp"
@@ -43,6 +45,13 @@ namespace
             s_lastSec = now;
         }
         return s_cachedMB;
+    }
+
+    // Same budget the streaming gates use (heap minus the reserve).
+    int heapBudgetMB()
+    {
+        return static_cast<int>(_newlib_heap_size_user / (1024 * 1024))
+            - Settings::general().mVitaMemoryReserveMb;
     }
 }
 #endif
@@ -515,13 +524,11 @@ namespace Resource
             // Cap world textures; skip UI/normal/spec; atlases get a higher
             // cap so individual tiles inside stay usable.
             //
-            // Caps come from Settings::general().mVitaTextureDetail. Tuned at
-            // boot from the in-game Vita Settings tab; "off" disables the cap
-            // entirely. We deliberately re-read the setting on every image
-            // load rather than cache: the value is rarely changed mid-session
-            // (restart-required UX), the lookup is O(log n) on a string, and
-            // skipping the cache avoids any "old textures still using prior
-            // cap" surprise after a runtime change.
+            // Caps come from Settings::general().mVitaTextureDetail, read once
+            // at the first load: the Vita tab says restart, and a mid-session
+            // switch mixed full-size and capped textures in memory (a switch
+            // to "off" filled the heap and the switch back freed nothing that
+            // was already loaded). "off" disables the cap.
             {
                 std::string_view p = path.value();
                 bool isUI = p.find("menu") != std::string_view::npos
@@ -540,7 +547,7 @@ namespace Resource
 
                 int worldCap = 64, atlasCap = 512; // performance preset
                 bool downsampleEnabled = true;
-                const std::string& preset = Settings::general().mVitaTextureDetail.get();
+                static const std::string preset = Settings::general().mVitaTextureDetail.get();
                 if (preset == "balanced") { worldCap = 128; atlasCap = 768; }
                 else if (preset == "high") { worldCap = 256; atlasCap = 1024; }
                 else if (preset == "off")  { downsampleEnabled = false; }
@@ -549,25 +556,23 @@ namespace Resource
                 // texture loads below what the user selected. Existing
                 // cached textures hold their size until cache expiry; over
                 // a few seconds of high pressure the texture mix shifts
-                // toward what the heap can afford. The thresholds sit just
-                // below the MemWatchdog flush trigger (budget - 20 =
-                // 244 MB on the 320 MB heap config) so tier-down kicks in
-                // BEFORE the watchdog fires, easing pressure pre-emptively.
-                // "off" stays off — opt-in users get their full textures.
-                if (downsampleEnabled)
+                // toward what the heap can afford. Thresholds follow the
+                // streaming budget: balanced caps (the default preset, so
+                // this only touches "high") from budget - 14, performance
+                // caps from just below the urgent streaming gate
+                // (budget - 8), "off" included there: full textures that hold
+                // the heap at the gate stop streaming altogether.
                 {
                     const int heapMB = getCachedHeapUsedMB();
-                    if (heapMB > 270)
+                    const int budgetMB = heapBudgetMB();
+                    if (heapMB > budgetMB - 8)
                     {
-                        // Emergency: clamp to performance caps regardless
-                        // of preset. Same numbers as the "performance"
-                        // tier above.
+                        downsampleEnabled = true;
                         worldCap = std::min(worldCap, 64);
                         atlasCap = std::min(atlasCap, 512);
                     }
-                    else if (heapMB > 240)
+                    else if (downsampleEnabled && heapMB > budgetMB - 14)
                     {
-                        // Moderate pressure: clamp to balanced caps.
                         worldCap = std::min(worldCap, 128);
                         atlasCap = std::min(atlasCap, 768);
                     }

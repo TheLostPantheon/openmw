@@ -884,6 +884,10 @@
                         <Property key="AddItem" value="High (256 / 1024)"/>
                         <Property key="AddItem" value="Off (Full)"/>
                     </Widget>
+                    <!-- Shown for High / Off: larger textures leave streaming less memory -->
+                    <Widget type="TextBox" skin="SandText" position="208 23 144 20" align="Left Top" name="VitaTextureDetailWarning">
+                        <Property key="Visible" value="false"/>
+                    </Widget>
                 </Widget>
                 <!-- Small Object Culling: hides objects smaller than a few pixels -->
                 <Widget type="Widget" position="4 252 352 46" align="Left Top HStretch" name="VitaCullingRow">
@@ -910,6 +914,10 @@
                 <!-- Hint: texture filtering lives on the Video tab to avoid duplicate UI. -->
                 <Widget type="TextBox" skin="SandText" position="4 352 352 20" align="Left Top HStretch">
                     <Property key="Caption" value="Texture filtering: see the Video tab."/>
+                </Widget>
+                <!-- Switching streaming rebuilds the world in memory: long pause, heap spike. -->
+                <Widget type="TextBox" skin="SandText" position="4 372 352 20" align="Left Top HStretch" name="VitaStreamingNote">
+                    <Property key="Caption" value="Switching streaming reloads the world (~40 s)."/>
                 </Widget>
             </Widget>
         </Widget>

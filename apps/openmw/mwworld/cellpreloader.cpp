@@ -1130,7 +1130,7 @@ namespace MWWorld
         constexpr std::size_t kVitaWarmPoolBudget = 32u << 20;
     }
 
-    void CellPreloader::vitaPumpWarm(bool idle)
+    void CellPreloader::vitaPumpWarm(bool idle, bool starved)
     {
         // Always-on: the hydrator's cold requests need the worker MOST
         // while the player moves. Idle gets full batches; movement small.
@@ -1176,7 +1176,7 @@ namespace MWWorld
         // ("guaranteed" queueing with no throughput behind it). Demand
         // batches are governed by memory headroom instead.
         const std::size_t kBatch = grace ? 5 : (idle ? 25 : (pumpDt > 37 ? 5 : 12));
-        const std::size_t kDemandBatch = grace ? 8 : 24;
+        const std::size_t kDemandBatch = starved ? 4 : (grace ? 8 : 24);
         vitaDemandGC();
         // Demand first: these models block eligible hydrations right now.
         // Two demand lanes keep both preload threads fed; each lane takes
@@ -1215,6 +1215,8 @@ namespace MWWorld
                 return;
             }
         }
+        if (starved)
+            return;
         if (!mVitaRegionBacklog.empty())
         {
             if (mVitaRegionItem && !mVitaRegionItem->isDone())
