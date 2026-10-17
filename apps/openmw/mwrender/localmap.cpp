@@ -187,6 +187,19 @@ namespace MWRender
 
     void LocalMap::requestMap(const MWWorld::CellStore* cell)
     {
+#ifdef __vita__
+        // ux0:data/openmw/nolocalmap.txt: no map renders (render-target A/B).
+        static const bool sNoMap = [] {
+            if (FILE* f = fopen("ux0:data/openmw/nolocalmap.txt", "rb"))
+            {
+                fclose(f);
+                return true;
+            }
+            return false;
+        }();
+        if (sNoMap)
+            return;
+#endif
         if (!cell->isExterior())
         {
             requestInteriorMap(cell);

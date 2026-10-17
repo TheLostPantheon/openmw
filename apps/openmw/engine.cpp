@@ -495,6 +495,45 @@ void OMW::Engine::runSimPhases(osg::Timer_t frameStart, unsigned frameNumber, fl
 #ifdef __vita__
 namespace
 {
+    // With an incremental compile operation installed, OSG frees deleted GL
+    // objects only when that operation runs, which the viewer's
+    // renderingTraversals() does after the draw. The Vita draw paths call
+    // Renderer::draw() directly, so it ran only behind loading screens: in
+    // seamless play deleted framebuffers were never freed (each local map
+    // render kept a GXM render target until 47 were live and every
+    // off-screen render failed). Flush them here, within 1 ms. Running the
+    // whole operation instead cost ~13 ms a frame in uploads.
+    // ux0:data/openmw/noicorun.txt restores the old behaviour (A/B).
+    bool vitaIcoFixOff()
+    {
+        static const bool sOff = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/noicorun.txt", &st) >= 0;
+        }();
+        return sOff;
+    }
+
+    void vitaRunCompileOperation(osgUtil::IncrementalCompileOperation* /*ico*/, osg::GraphicsContext* gc)
+    {
+        if (gc == nullptr || gc->getState() == nullptr || vitaIcoFixOff())
+            return;
+        double budget = 0.001;
+        osg::flushDeletedGLObjects(gc->getState()->getContextID(), osg::Timer::instance()->time_s(), budget);
+    }
+
+    // Compile sets queued in play (each loaded cell root and model) are
+    // compiled only behind loading screens; between them the queue grew
+    // without bound (0 -> 826 sets on a flight route) and kept the scene
+    // graphs of cells long left behind alive. Objects upload on first draw
+    // in play, so the queue is dropped each frame outside loading screens.
+    void vitaDropPlayCompileQueue(osgUtil::IncrementalCompileOperation* ico)
+    {
+        if (ico == nullptr || vitaIcoFixOff())
+            return;
+        std::lock_guard<OpenThreads::Mutex> lock(*ico->getToCompiledMutex());
+        ico->getToCompile().clear();
+    }
+
     // Draw + swap one culled frame on the GL thread, with spike anatomy and
     // [GlJob] timings. Ends the draw-in-flight window.
     void vitaDrawAndSwap(osgViewer::Renderer* renderer, osg::GraphicsContext* gc,
@@ -506,6 +545,7 @@ namespace
         const unsigned int icoSets = icoProbe ? (unsigned int)icoProbe->getToCompile().size() : 0u;
         vita_gl_phase = "draw";
         renderer->draw();
+        vitaRunCompileOperation(icoProbe, gc);
         const uint64_t t1 = sceKernelGetProcessTimeWide();
         vita_gl_phase = "swap";
         gc->swapBuffers();
@@ -903,6 +943,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 #ifdef __vita__
     vitaMainPhase("render");
     const uint64_t renderStartUs = sceKernelGetProcessTimeWide();
+    vitaDropPlayCompileQueue(mViewer->getIncrementalCompileOperation());
     // Sampled cull profiling ([CullProf] times, [CullStage]): one frame in
     // eight pays the per-node clock reads; set before cull is kicked.
     osg_vita_cullprof_sample = (frameNumber & 7u) == 0;
@@ -999,6 +1040,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             else
             {
                 renderer->draw();
+                vitaRunCompileOperation(mViewer->getIncrementalCompileOperation(), mViewer->getCamera()->getGraphicsContext());
                 mViewer->getCamera()->getGraphicsContext()->swapBuffers();
                 Vita::setDrawInFlight(false);
             }
@@ -1024,9 +1066,11 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         });
         mSimPrimed = true;
         osg::GraphicsContext* gc = mViewer->getCamera()->getGraphicsContext();
+        auto* ico = mViewer->getIncrementalCompileOperation();
         Vita::callOnGL(
-            [renderer, gc] {
+            [renderer, gc, ico] {
                 renderer->draw();
+                vitaRunCompileOperation(ico, gc);
                 gc->swapBuffers();
             },
             "draw");

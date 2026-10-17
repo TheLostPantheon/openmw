@@ -70,6 +70,9 @@ namespace Vita
             // join without waiting for the physics step (the overlap that
             // corrupted Bullet; a lock test)
             bool mRace = false;
+            // replay: "god" turns god mode on (tgm) when the start is placed:
+            // routes recorded with it fall from heights that kill without it
+            bool mGod = false;
             bool mExit = false;
         };
 
@@ -112,6 +115,8 @@ namespace Vita
                             c.mExit = true;
                         else if (strcmp(line, "race") == 0)
                             c.mRace = true;
+                        else if (strcmp(line, "god") == 0)
+                            c.mGod = true;
                     }
                     fclose(f);
                 }
@@ -344,6 +349,11 @@ namespace Vita
                     // post-load fill is not what a route measures.
                     mSettleUntil = nowSeconds() + config().mSettleSeconds;
                     mPlacedAt = nowSeconds();
+                    if (config().mGod && !world->getGodModeState())
+                    {
+                        world->toggleGodMode();
+                        breadcrumb("[Bench] god mode on");
+                    }
                     if (!config().mShots.empty())
                         MWBase::Environment::get().getInputManager()->vitaShowTouchIntro();
                     return;

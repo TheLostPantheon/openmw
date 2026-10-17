@@ -181,6 +181,7 @@ def main():
     ap.add_argument("--route", help="route file in ux0:data/openmw/bench/ (default route.txt)")
     ap.add_argument("--settle", type=float, help="seconds at the route start before timing (default 2)")
     ap.add_argument("--fps", type=float, help="session frame cap and streaming target (0 = uncapped, target 60)")
+    ap.add_argument("--god", action="store_true", help="god mode on at the route start (routes recorded with tgm)")
     ap.add_argument("--race", action="store_true",
                     help="move the player without waiting for the physics step (physics lock test)")
     ap.add_argument("--shot", help="screenshot times in seconds after the route start is placed, e.g. 2,3.5; "
@@ -196,6 +197,8 @@ def main():
         BENCH_OPTIONS.append(f"shot={args.shot}")
     if args.race:
         BENCH_OPTIONS.append("race")
+    if args.god:
+        BENCH_OPTIONS.append("god")
 
     if args.deploy:
         say(dev.tool_deploy({}))

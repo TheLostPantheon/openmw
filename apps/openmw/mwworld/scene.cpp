@@ -166,6 +166,40 @@ namespace
     constexpr int kVitaWarmGateMB = 12;
     // Starved urgent demand may load past the gate up to budget + this.
     constexpr int kVitaValveCeilMB = 6;
+
+    // [Land] a cell whose heights did not load gets the flat default
+    // heightfield (far below sea level: the player falls under the terrain
+    // and swims) and no terrain. Logged with the reason.
+    void vitaLogLandMiss(const ESM::ExteriorCellLocation& at, const ESMTerrain::LandObject* land)
+    {
+        const MWWorld::ESMStore& store = *MWBase::Environment::get().getESMStore();
+        const ESM::Land* record = ESM::isEsm4Ext(at.mWorldspace)
+            ? nullptr
+            : store.get<ESM::Land>().search(at.mX, at.mY);
+        if (record == nullptr || !(record->mDataTypes & ESM::Land::DATA_VHGT))
+            return; // no land here: the flat default is correct
+        char b[160];
+        snprintf(b, sizeof(b), "[Land] (%d,%d) no height data: land=%s loaded=0x%x heap=%dMB", at.mX, at.mY,
+            land ? "yes" : "null", land ? land->getData(0)->getLoadFlags() : 0, Vita::getHeapUsedMBFresh());
+        Vita::breadcrumb(b);
+    }
+
+    osg::ref_ptr<const ESMTerrain::LandObject> vitaGetLand(
+        MWRender::LandManager& landManager, const ESM::ExteriorCellLocation& at)
+    {
+        try
+        {
+            return landManager.getLand(at);
+        }
+        catch (const std::exception& e)
+        {
+            char b[200];
+            snprintf(b, sizeof(b), "[Land] (%d,%d) load failed: %s heap=%dMB", at.mX, at.mY, e.what(),
+                Vita::getHeapUsedMBFresh());
+            Vita::breadcrumb(b);
+            return nullptr;
+        }
+    }
     // Store-eviction distance floors (world units to cell edge, player-based).
     constexpr float kVitaEvictKeepNear = 12288.f;
     constexpr float kVitaEvictKeepFar = 24576.f;
@@ -2794,8 +2828,10 @@ namespace MWWorld
         // Heightfield (terrain collision) — always needed
         if (cellVariant.isExterior())
         {
-            osg::ref_ptr<const ESMTerrain::LandObject> land = mRendering.getLandManager()->getLand(cellIndex);
+            osg::ref_ptr<const ESMTerrain::LandObject> land = vitaGetLand(*mRendering.getLandManager(), cellIndex);
             const ESM::LandData* data = land ? land->getData(ESM::Land::DATA_VHGT) : nullptr;
+            if (data == nullptr)
+                vitaLogLandMiss(cellIndex, land.get());
             const int verts = ESM::getLandSize(worldspace);
             const int worldsize = ESM::getCellSize(worldspace);
 
@@ -2918,8 +2954,10 @@ namespace MWWorld
         // Heightfield (terrain collision)
         if (cellVariant.isExterior())
         {
-            osg::ref_ptr<const ESMTerrain::LandObject> land = mRendering.getLandManager()->getLand(cellIndex);
+            osg::ref_ptr<const ESMTerrain::LandObject> land = vitaGetLand(*mRendering.getLandManager(), cellIndex);
             const ESM::LandData* data = land ? land->getData(ESM::Land::DATA_VHGT) : nullptr;
+            if (data == nullptr)
+                vitaLogLandMiss(cellIndex, land.get());
             const int verts = ESM::getLandSize(worldspace);
             const int worldsize = ESM::getCellSize(worldspace);
 
@@ -5346,19 +5384,26 @@ namespace MWWorld
             if (std::chrono::duration_cast<std::chrono::seconds>(tick0 - sLastMap).count() >= 10)
             {
                 sLastMap = tick0;
-                char mm[176];
+                char mm[192];
                 int dw = 0, dl = 0, dr = 0;
+                const auto vitaIcoQueue = [this]() -> unsigned {
+                    osgUtil::IncrementalCompileOperation* ico = mRendering.getIncrementalCompileOperation();
+                    if (ico == nullptr)
+                        return 0;
+                    std::lock_guard<OpenThreads::Mutex> lock(*ico->getToCompiledMutex());
+                    return (unsigned)ico->getToCompile().size();
+                };
                 mPreloader->vitaDemandStats(dw, dl, dr);
                 unsigned rigH = 0, rigM = 0, rigN = 0;
                 SceneUtil::getRigCacheStats(rigH, rigM, rigN);
                 snprintf(mm, sizeof(mm),
                     "[MemMap] heap=%dMB objs=%d phys=%d stores=%d dmd=%du%d/%d/%d rig=%u/%u/%u ct=%u bud=%d/%d%s "
-                    "issued=%u/10s reach=%d",
+                    "issued=%u/10s reach=%d ico=%u",
                     Vita::getHeapUsedMB(), (int)mRendering.getObjects().getObjectCount(),
                     (int)mPhysics->getObjectCount(), (int)mWorld.getWorldModel().vitaCellStoreCount(), dw,
                     mPreloader->vitaDemandUrgentCount(), dl, dr, rigH, rigM, rigN, sVitaContactAdds, maxMs,
                     vitaOtherMs, vitaCatchUp ? "C" : "", (unsigned)mPreloader->vitaDemandIssuedAndReset(),
-                    (int)rViewReach);
+                    (int)rViewReach, vitaIcoQueue());
                 sVitaContactAdds = 0;
                 Vita::breadcrumb(mm);
             }
@@ -6409,8 +6454,10 @@ namespace MWWorld
 
         if (cellVariant.isExterior())
         {
-            osg::ref_ptr<const ESMTerrain::LandObject> land = mRendering.getLandManager()->getLand(cellIndex);
+            osg::ref_ptr<const ESMTerrain::LandObject> land = vitaGetLand(*mRendering.getLandManager(), cellIndex);
             const ESM::LandData* data = land ? land->getData(ESM::Land::DATA_VHGT) : nullptr;
+            if (data == nullptr)
+                vitaLogLandMiss(cellIndex, land.get());
             const int verts = ESM::getLandSize(worldspace);
             const int worldsize = ESM::getCellSize(worldspace);
 
