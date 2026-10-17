@@ -41,6 +41,8 @@ extern "C" void vglSetStaticVboRam(unsigned char enable);
 extern "C" uint32_t phase_evt_us, phase_upd_us, phase_focus_us, phase_lua_us, phase_pre_us, phase_pace_us;
 extern "C" uint32_t phase_fin_us, phase_inp_us, phase_unref_us, phase_stats_us;
 extern "C" uint32_t vita_simjob_us, vita_simjob_upd_us, vita_simjob_cull_us;
+extern "C" uint32_t vita_lua_overlap_start_us, vita_lua_overlap_us, vita_lua_overlap_wait_us,
+    vita_lua_overlap_frames;
 extern "C" uint32_t phase_snd_us, phase_lsync_us, phase_state_us;
 extern "C" uint32_t phase_world_us, phase_wm_us;
 extern "C" unsigned int vita_bin2_graphs, vita_bin2_leaves;
@@ -561,6 +563,36 @@ namespace
         std::atomic<bool>& mFlag;
         ~VitaSignalOnExit() { mFlag.store(true, std::memory_order_release); }
     };
+
+    // Waits for a hand-off flag; returns the microseconds spent waiting.
+    uint32_t vitaWaitFlag(const std::atomic<bool>& flag)
+    {
+        if (flag.load(std::memory_order_acquire))
+            return 0;
+        const uint64_t t0 = sceKernelGetProcessTimeWide();
+        while (!flag.load(std::memory_order_acquire))
+            sceKernelDelayThread(10);
+        return (uint32_t)(sceKernelGetProcessTimeWide() - t0);
+    }
+
+    // Lua update overlapped with cull. With inline Lua (lua num threads = 0)
+    // the update ran on main before the worker was kicked, on the critical
+    // path. Its world changes are queued for the next synchronizedUpdate
+    // (the property upstream's Lua thread relies on to overlap rendering),
+    // so main now runs it while the worker culls: after the worker's update
+    // traversal, and before the worker's sim phases, which mutate the
+    // state Lua reads. ux0:data/openmw/noluaoverlap.txt turns it off.
+    bool vitaLuaOverlapEnabled()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            const bool on = sceIoGetstat("ux0:data/openmw/noluaoverlap.txt", &st) < 0;
+            Vita::breadcrumb(on ? "[LuaOverlap] on: Lua update runs during cull"
+                                : "[LuaOverlap] off (noluaoverlap.txt)");
+            return on;
+        }();
+        return sOn;
+    }
 }
 
 void OMW::Engine::vitaWorkerUpdate()
@@ -853,10 +885,17 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 
     // if there is a separate Lua thread, it starts the update now
 #ifdef __vita__
-    vitaPhaseT0 = sceKernelGetProcessTimeWide();
-    vitaMainPhase("lua");
-    mLuaWorker->allowUpdate(frameStart, frameNumber, *stats);
-    phase_lua_us += (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
+    // Stage C with inline Lua: the update moves after the kick (see
+    // vitaLuaOverlapEnabled); every other path runs it here as before.
+    mVitaLuaOverlap = vitaLuaOverlapEnabled() && Settings::lua().mLuaNumThreads == 0 && mSimWorker && mSimOverlap
+        && mCullOverlap && !mCullOnGL;
+    if (!mVitaLuaOverlap)
+    {
+        vitaPhaseT0 = sceKernelGetProcessTimeWide();
+        vitaMainPhase("lua");
+        mLuaWorker->allowUpdate(frameStart, frameNumber, *stats);
+        phase_lua_us += (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
+    }
 #else
     mLuaWorker->allowUpdate(frameStart, frameNumber, *stats);
 #endif
@@ -920,18 +959,30 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         const float nextDt = frametime; // estimate; corrected next frame
         const unsigned nextFrame = frameNumber + 1;
         const bool havePrev = mCullPrimed;
+        const bool luaOverlap = mVitaLuaOverlap;
+        if (luaOverlap)
+        {
+            mVitaWorkerUpdDone.store(false, std::memory_order_release);
+            mVitaLuaUpdDone.store(false, std::memory_order_release);
+        }
         Vita::setDrawInFlight(true);
-        mSimWorker->run([this, renderer, frameStart, nextFrame, nextDt, nextPaused] {
+        mSimWorker->run([this, renderer, frameStart, nextFrame, nextDt, nextPaused, luaOverlap] {
             // Sim-job split for [SimSplit]: the main thread's join waits on
             // this whole job (update traversal + cull + sim phases).
             const uint64_t jobT0 = sceKernelGetProcessTimeWide();
-            vitaWorkerUpdate();
+            {
+                VitaSignalOnExit updDone{ mVitaWorkerUpdDone }; // main's Lua update may start
+                vitaWorkerUpdate();
+            }
             const uint64_t cullT0 = sceKernelGetProcessTimeWide();
             vita_simjob_upd_us += (uint32_t)(cullT0 - jobT0);
             renderer->cull();
             Vita::staticVerifyAfterCull(); // no-op unless staticverify.txt
             const uint64_t simT0 = sceKernelGetProcessTimeWide();
             vita_simjob_cull_us += (uint32_t)(simT0 - cullT0);
+            // Sim phases mutate what Lua's update reads: wait it out.
+            if (luaOverlap)
+                vita_lua_overlap_wait_us += vitaWaitFlag(mVitaLuaUpdDone);
             runSimPhases(frameStart, nextFrame, nextDt, nextPaused);
             vita_simjob_us += (uint32_t)(sceKernelGetProcessTimeWide() - jobT0);
         });
@@ -990,6 +1041,20 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 #endif
 
 #ifdef __vita__
+    if (mVitaLuaOverlap)
+    {
+        // The worker culls; run Lua's update meanwhile (see
+        // vitaLuaOverlapEnabled). The worker waits for this before its sim
+        // phases, so signal even if the update throws.
+        VitaSignalOnExit luaDone{ mVitaLuaUpdDone };
+        vita_lua_overlap_start_us += vitaWaitFlag(mVitaWorkerUpdDone);
+        vitaPhaseT0 = sceKernelGetProcessTimeWide();
+        vitaMainPhase("lua");
+        mLuaWorker->allowUpdate(frameStart, frameNumber, *stats);
+        const uint32_t luaUs = (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
+        vita_lua_overlap_us += luaUs;
+        ++vita_lua_overlap_frames;
+    }
     vitaPhaseT0 = sceKernelGetProcessTimeWide();
     mLuaWorker->finishUpdate(frameStart, frameNumber, *stats);
     phase_lua_us += (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);

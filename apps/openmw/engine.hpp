@@ -163,6 +163,11 @@ namespace OMW
         bool mCullOnGL = false;
         std::atomic<bool> mVitaUpdDone{ true }; // worker update traversal N done; GL may cull
         std::atomic<bool> mVitaCullDone{ true }; // cull N done; main may mutate the scene
+        // Lua update overlapped with the worker's cull (noluaoverlap.txt off):
+        // main runs it after the kick, between these two hand-offs.
+        bool mVitaLuaOverlap = false; // decided this frame, before the kick
+        std::atomic<bool> mVitaWorkerUpdDone{ true }; // worker update traversal done; Lua may run
+        std::atomic<bool> mVitaLuaUpdDone{ true }; // Lua update done; the worker may run sim phases
 #endif
         std::unique_ptr<L10n::Manager> mL10nManager;
         MWBase::Environment mEnvironment;

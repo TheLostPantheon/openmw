@@ -324,6 +324,19 @@ namespace
         return sOn;
     }
 
+    // Contact ring scan fix (hydrate tick): the pass resumes across ticks and
+    // checks distance before the physics lookup. noscanfix.txt turns it off.
+    bool vitaScanFixEnabled()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            const bool on = sceIoGetstat("ux0:data/openmw/noscanfix.txt", &st) < 0;
+            Vita::breadcrumb(on ? "[Hydrate] scan fixes on" : "[Hydrate] scan fixes off (noscanfix.txt)");
+            return on;
+        }();
+        return sOn;
+    }
+
     // Guard pass fixes (hydrate tick): actor-list scans outside the near ring,
     // memoized actor part lists, a warm memo that survives deliveries, and a
     // slower delivery re-arm. ux0:data/openmw/noguardfix.txt turns them off.
@@ -3823,37 +3836,55 @@ namespace MWWorld
                     && sVitaRenderGen == sContactIdleRenderGen
                     && tick0 - sContactIdleAt < std::chrono::milliseconds(1000);
             }
-            const unsigned contactAdds0 = sVitaContactAdds;
-            int contactPending = 0;
-            bool contactComplete = true;
+            // The pass resumes across ticks (cell cursor + ref offset). It used
+            // to restart at the first cell every tick and stop at its window,
+            // so in a dense town no pass ever completed, the idle gate never
+            // armed, and the ring spent its whole window every frame.
+            // noscanfix.txt restores the per-tick restart.
+            static std::size_t sContactCursor = 0, sContactRefOffset = 0, sContactRot = 0, sContactN = 0;
+            static unsigned sContactGen = 0, sContactPassAdds0 = 0;
+            static int sContactPassPending = 0;
+            static bool sContactPassActive = false;
+            const bool scanFix = vitaScanFixEnabled();
+            if (!sContactIdle
+                && (!scanFix || !sContactPassActive || sContactGen != sVitaFarCandGen || sContactN != n))
+            {
+                sContactCursor = sContactRefOffset = 0;
+                sContactRot = sStartRot;
+                sContactN = n;
+                sContactGen = sVitaFarCandGen;
+                sContactPassPending = 0;
+                sContactPassAdds0 = sVitaContactAdds;
+                sContactPassActive = true;
+            }
             int vitaContactMs = 3, vitaRadialMs = 2;
             vitaScanWindowsMs(vitaCatchUp, vitaContactMs, vitaRadialMs);
             const auto contactDeadline = Clock::now() + std::chrono::milliseconds(vitaContactMs);
-            for (std::size_t ci = 0; !sContactIdle && ci < n; ++ci)
+            while (!sContactIdle && sContactPassActive && sContactCursor < n)
             {
                 if (Clock::now() >= contactDeadline)
-                {
-                    contactComplete = false;
                     break;
+                CellStore& cell = *cells[(sContactCursor + sContactRot) % n];
+                if (!cell.getCell()->isExterior() || vitaCellEdge2(cell, pp) > rWarm * rWarm)
+                {
+                    ++sContactCursor;
+                    continue;
                 }
-                CellStore& cell = *cells[(ci + sStartRot) % n];
-                if (!cell.getCell()->isExterior())
-                    continue;
-                if (vitaCellEdge2(cell, pp) > rWarm * rWarm)
-                    continue;
+                std::size_t vRef = 0;
+                bool vAborted = false;
                 cell.forEach([&](const MWWorld::Ptr& ptr) {
-                    if (Clock::now() >= contactDeadline)
+                    if (vRef++ < sContactRefOffset)
+                        return true; // done earlier this pass
+                    if ((vRef & 15) == 0 && Clock::now() >= contactDeadline)
                     {
-                        contactComplete = false;
-                        return false;
+                        vAborted = true;
+                        return false; // resume here next tick
                     }
-                    if (!isLiteType(ptr.getType()) || isPagedRef(ptr))
-                        return true;
-                    if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
-                        return true;
+                    // Cheapest rejects first: almost everything is either
+                    // unrendered or out of reach; the physics lookup is last.
                     if (ptr.getRefData().getBaseNode() == nullptr)
                         return true; // not rendered yet; shells own the pair
-                    if (mPhysics->getObject(ptr) != nullptr)
+                    if (!isLiteType(ptr.getType()) || isPagedRef(ptr))
                         return true;
                     const osg::Vec3f op = ptr.getRefData().getPosition().asVec3();
                     const float dx = op.x() - pp.x();
@@ -3861,11 +3892,15 @@ namespace MWWorld
                     const float d2 = dx * dx + dy * dy;
                     if (d2 > rWarm * rWarm)
                         return true;
+                    if (ptr.mRef->isDeleted() || !ptr.getRefData().isEnabled())
+                        return true;
+                    if (mPhysics->getObject(ptr) != nullptr)
+                        return true;
                     const VFS::Path::Normalized pm = getModel(ptr);
                     const bool shapeReady = pm.empty() || mPreloader->vitaShapeCached(std::string(pm.value()));
                     if (!shapeReady && !warmPath(std::string(pm.value()), d2))
                     {
-                        ++contactPending;
+                        ++sContactPassPending;
                         return true; // requested; body waits for the ring
                     }
                     if (d2 > rContact * rContact)
@@ -3887,16 +3922,26 @@ namespace MWWorld
                     }
                     return true;
                 });
+                if (vAborted)
+                {
+                    sContactRefOffset = vRef - 1;
+                    break;
+                }
+                sContactRefOffset = 0;
+                ++sContactCursor;
             }
             // Arm the idle gate only after a complete pass that did nothing.
-            if (!sContactIdle && contactComplete && contactPending == 0 && sVitaContactAdds == contactAdds0
-                && vitaScanIdleEnabled())
+            if (!sContactIdle && sContactPassActive && sContactCursor >= n)
             {
-                sContactIdle = true;
-                sContactIdlePos = pp;
-                sContactIdleEpoch = contactEpoch;
-                sContactIdleRenderGen = sVitaRenderGen;
-                sContactIdleAt = tick0;
+                sContactPassActive = false;
+                if (sContactPassPending == 0 && sVitaContactAdds == sContactPassAdds0 && vitaScanIdleEnabled())
+                {
+                    sContactIdle = true;
+                    sContactIdlePos = pp;
+                    sContactIdleEpoch = contactEpoch;
+                    sContactIdleRenderGen = sVitaRenderGen;
+                    sContactIdleAt = tick0;
+                }
             }
         }
 

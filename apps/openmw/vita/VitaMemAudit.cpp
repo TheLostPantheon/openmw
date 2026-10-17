@@ -49,6 +49,11 @@ extern "C"
     uint32_t phase_pre_us = 0, phase_pace_us = 0;
     uint32_t phase_fin_us = 0, phase_inp_us = 0, phase_unref_us = 0, phase_stats_us = 0;
     uint32_t vita_simjob_us = 0, vita_simjob_upd_us = 0, vita_simjob_cull_us = 0;
+    // Lua update overlapped with cull (engine.cpp): main's wait for the
+    // worker's update traversal, the update itself, the worker's wait for it
+    // before sim phases, frames run that way.
+    uint32_t vita_lua_overlap_start_us = 0, vita_lua_overlap_us = 0, vita_lua_overlap_wait_us = 0,
+             vita_lua_overlap_frames = 0;
     // Cull-on-GL pipeline (engine.cpp): main's wait on the cull fence, cull
     // time on the GL thread, frames run in that mode; OSG patch counters.
     uint32_t vita_cullfence_us = 0, vita_gl_cull_us = 0, vita_cullongl_frames = 0;
@@ -727,6 +732,16 @@ namespace Vita
             auditLog(buf);
         }
         vita_simjob_us = vita_simjob_upd_us = vita_simjob_cull_us = 0;
+        if (vita_lua_overlap_frames > 0)
+        {
+            snprintf(buf, sizeof(buf),
+                "[LuaOverlap] frames=%u lua=%.2f start-wait=%.2f worker-wait=%.2f ms/frame",
+                vita_lua_overlap_frames, (double)vita_lua_overlap_us / 1000.0 / kReportEveryFrames,
+                (double)vita_lua_overlap_start_us / 1000.0 / kReportEveryFrames,
+                (double)vita_lua_overlap_wait_us / 1000.0 / kReportEveryFrames);
+            auditLog(buf);
+        }
+        vita_lua_overlap_start_us = vita_lua_overlap_us = vita_lua_overlap_wait_us = vita_lua_overlap_frames = 0;
         if (vita_cullongl_frames > 0)
         {
             // Cull on GL: fence = main blocked on the cull after joining the
