@@ -212,6 +212,19 @@ def main():
             result = after[-1]
             outcome = "done"
     say(f"result: {result or '(no result line)'}")
+    # Leave the device as it plays normally: bench.txt would make every
+    # manual launch replay the route and quit, and a toggle this run turned
+    # on (e.g. an A/B "off" switch) would silently persist into play and
+    # into later runs. Each run sets its own toggles explicitly.
+    try:
+        set_toggle("bench.txt", False)
+        for name in args.on:
+            set_toggle(name, False)
+        for spec in args.set:
+            dev.tool_delete({"remote": spec.split("=", 1)[0]})
+        say("cleared bench.txt and this run's --on/--set toggles")
+    except Exception as e:  # noqa: BLE001 -- a cleanup failure must not lose the result
+        say(f"toggle cleanup failed: {e}")
     if outcome != "done":
         say("crash dump: scripts/vita/vita_crash.py (or the vita_crash MCP tool)")
     new = not os.path.exists(LEDGER)
