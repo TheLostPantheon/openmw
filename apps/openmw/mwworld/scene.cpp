@@ -1454,12 +1454,15 @@ namespace MWWorld
             // expiring them made terrain preloads miss and crossings build
             // terrain synchronously (terr= 0.3-3 s, 11-13 crossings on the
             // route instead of 4-6).
-            // ux0:data/openmw/nofastexpiry.txt turns that part off (A/B).
+            // Off by default since 2026-10-17: a new game's hold-to-deck
+            // transition (counted as fast travel) lost part of the ship's
+            // model and the dock guard's race prompt with it on. Opt in with
+            // ux0:data/openmw/fastexpiry.txt (optionally holding seconds).
             if (vitaMemGovEnabled())
             {
                 constexpr double kGovMinExpiry = 2.0;
                 constexpr double kGovRate = 2.0;
-                // ux0:data/openmw/fastexpiry.txt holding seconds overrides (tuning).
+                // fastexpiry.txt enables it; seconds in it override the 0.5 s.
                 static const double kFastExpiry = [] {
                     double v = 0.5;
                     if (FILE* f = fopen("ux0:data/openmw/fastexpiry.txt", "r"))
@@ -1473,7 +1476,7 @@ namespace MWWorld
                 constexpr double kFastKeyframeExpiry = 2.0;
                 static const bool sFastOff = [] {
                     SceIoStat st;
-                    return sceIoGetstat("ux0:data/openmw/nofastexpiry.txt", &st) >= 0;
+                    return sceIoGetstat("ux0:data/openmw/fastexpiry.txt", &st) < 0;
                 }();
                 const bool fastTravel = !sFastOff && std::chrono::steady_clock::now() < mVitaFastTravelUntil;
                 const double base = Settings::cells().mCacheExpiryDelay;

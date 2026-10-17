@@ -293,12 +293,14 @@ namespace
         // flat ground) get a full solve on one step in four, staggered per
         // actor: the solve is 1-2 convex sweeps that find the same ground
         // again, ~0.1-0.3 ms each in a town. Gravity resumes within 3 steps
-        // if the ground goes away. ux0:data/openmw/nophysidle.txt: every step.
+        // if the ground goes away. Off by default since 2026-10-17: with it
+        // on, a new game's dock guard never saw the player arrive (no race
+        // prompt). ux0:data/openmw/physidle.txt opts in.
         bool vitaSkipIdleSolve(const MWPhysics::Actor* actor, const MWPhysics::ActorFrameData& d)
         {
             static const bool sOff = [] {
                 SceIoStat st;
-                return sceIoGetstat("ux0:data/openmw/nophysidle.txt", &st) >= 0;
+                return sceIoGetstat("ux0:data/openmw/physidle.txt", &st) < 0;
             }();
             if (sOff || d.mIsPlayer || d.mSkipCollisionDetection || d.mFlying || !d.mIsOnGround || d.mIsOnSlope
                 || d.mStuckFrames != 0 || d.mMovement.length2() != 0.f || d.mInertia.length2() != 0.f
