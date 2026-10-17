@@ -1,5 +1,14 @@
 #include "riggeometry.hpp"
 
+#ifdef __vita__
+#include <psp2/io/stat.h>
+#include <psp2/kernel/processmgr.h>
+namespace Vita
+{
+    void breadcrumb(const char* msg);
+}
+#endif
+
 #include <unordered_map>
 
 #include <osg/MatrixTransform>
@@ -15,6 +24,92 @@
 
 #ifdef __vita__
 extern "C" unsigned int rig_cull_count, rig_cull_verts;
+// Time in RigGeometry cull (CPU skinning + leaf), for [GlJob] rig=.
+extern "C" unsigned int rig_cull_us;
+// [RigSplit]: bone matrices, skinning (groups + vertices), dirty, leaf add.
+extern "C" unsigned int rig_bones_us, rig_skin_us, rig_dirty_us, rig_apply_us, rig_groups, rig_lod_skips;
+#endif
+
+#if defined(__vita__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+
+namespace
+{
+    // CPU skinning was ~80% of actor cull on the Vita (4.8 ms a frame for 47
+    // parts, 8k vertices, at a city overlook): scalar VFP code (GCC keeps
+    // float math off NEON without unsafe-math flags), with a 4x4 transform
+    // and a divide per position. Skinning matrices are affine (column 3 stays
+    // 0,0,0,1: bone sums skip it and the transforms are affine), so the
+    // divide is by 1; this computes the same rows-times-vector products with
+    // NEON multiply-accumulates. osg::Matrixf is row-major with row vectors:
+    // p' = x*row0 + y*row1 + z*row2 + row3, n' = x*row0 + y*row1 + z*row2.
+    struct NeonRows
+    {
+        float32x4_t r[4];
+    };
+
+    // The group matrix of the scalar path, without osg::Matrixf temporaries:
+    // the weighted sum of bone rows (column 3 of affine bones is 0, so full
+    // rows sum to the same 3x3 and translation; m33 is reset to 1 as the
+    // scalar path leaves it), times the part transform (row-major:
+    // out[r] = sum_k a[r][k] * T[k]).
+    NeonRows vitaGroupMatrixNeon(const std::vector<std::pair<size_t, float>>& influences,
+        const std::vector<osg::Matrixf>& boneMatrices, const std::vector<SceneUtil::Bone*>& nodes,
+        const NeonRows& transform)
+    {
+        float32x4_t a0 = vdupq_n_f32(0.f), a1 = a0, a2 = a0, a3 = a0;
+        for (const auto& [index, weight] : influences)
+        {
+            if (nodes[index] == nullptr)
+                continue;
+            const float* b = boneMatrices[index].ptr();
+            a0 = vmlaq_n_f32(a0, vld1q_f32(b), weight);
+            a1 = vmlaq_n_f32(a1, vld1q_f32(b + 4), weight);
+            a2 = vmlaq_n_f32(a2, vld1q_f32(b + 8), weight);
+            a3 = vmlaq_n_f32(a3, vld1q_f32(b + 12), weight);
+        }
+        a0 = vsetq_lane_f32(0.f, a0, 3);
+        a1 = vsetq_lane_f32(0.f, a1, 3);
+        a2 = vsetq_lane_f32(0.f, a2, 3);
+        a3 = vsetq_lane_f32(1.f, a3, 3);
+        const float32x4_t* t = transform.r;
+        const auto mulRow = [t](float32x4_t a) {
+            const float32x2_t lo = vget_low_f32(a), hi = vget_high_f32(a);
+            float32x4_t out = vmulq_lane_f32(t[0], lo, 0);
+            out = vmlaq_lane_f32(out, t[1], lo, 1);
+            out = vmlaq_lane_f32(out, t[2], hi, 0);
+            return vmlaq_lane_f32(out, t[3], hi, 1);
+        };
+        return NeonRows{ { mulRow(a0), mulRow(a1), mulRow(a2), mulRow(a3) } };
+    }
+
+    void vitaSkinGroupNeon(const NeonRows& m, const std::vector<unsigned short>& vertices,
+        const osg::Vec3f* posSrc, osg::Vec3f* posDst, const osg::Vec3f* nrmSrc, osg::Vec3f* nrmDst)
+    {
+        const float32x4_t row0 = m.r[0];
+        const float32x4_t row1 = m.r[1];
+        const float32x4_t row2 = m.r[2];
+        const float32x4_t row3 = m.r[3];
+        for (const unsigned short vertex : vertices)
+        {
+            const float* s = posSrc[vertex].ptr();
+            const float32x4_t p
+                = vmlaq_n_f32(vmlaq_n_f32(vmlaq_n_f32(row3, row0, s[0]), row1, s[1]), row2, s[2]);
+            float* d = posDst[vertex].ptr();
+            vst1_f32(d, vget_low_f32(p));
+            vst1q_lane_f32(d + 2, p, 2);
+            if (nrmDst != nullptr)
+            {
+                const float* n = nrmSrc[vertex].ptr();
+                const float32x4_t q
+                    = vmlaq_n_f32(vmlaq_n_f32(vmulq_n_f32(row0, n[0]), row1, n[1]), row2, n[2]);
+                float* dn = nrmDst[vertex].ptr();
+                vst1_f32(dn, vget_low_f32(q));
+                vst1q_lane_f32(dn + 2, q, 2);
+            }
+        }
+    }
+}
 #endif
 
 namespace SceneUtil
@@ -159,7 +254,34 @@ namespace SceneUtil
         }
 
         unsigned int traversalNumber = nv->getTraversalNumber();
+#ifdef __vita__
+        // Skinning rate by distance: a part beyond 1500 units re-skins every
+        // 2nd frame, reusing its last skinned buffer (as an inactive skeleton
+        // does). Skinning was ~80% of actor cull. Not slower than every 2nd:
+        // buffers are picked by frame % kRigBufferSlots (3), so a 3rd-frame
+        // write would land in the buffer the GL thread is drawing.
+        // ux0:data/openmw/noskinlod.txt turns it off (A/B).
+        bool vitaSkinReuse = false;
+        {
+            static const bool sNoLod = [] {
+                SceIoStat st;
+                return sceIoGetstat("ux0:data/openmw/noskinlod.txt", &st) >= 0;
+            }();
+            if (!sNoLod && mLastFrameNumber != 0 && mLastFrameNumber != traversalNumber)
+            {
+                const float dist = static_cast<osgUtil::CullVisitor*>(nv)->getDistanceFromEyePoint(
+                    getBound().center(), false);
+                const unsigned int every = dist > 1500.f ? 2u : 1u;
+                vitaSkinReuse = traversalNumber - mLastFrameNumber < every;
+                if (vitaSkinReuse)
+                    ++rig_lod_skips;
+            }
+        }
+        if (mLastFrameNumber == traversalNumber || (mLastFrameNumber != 0 && !mSkeleton->getActive())
+            || vitaSkinReuse)
+#else
         if (mLastFrameNumber == traversalNumber || (mLastFrameNumber != 0 && !mSkeleton->getActive()))
+#endif
         {
             osg::Geometry& geom = *getGeometry(mLastFrameNumber);
             nv->pushOntoNodePath(&geom);
@@ -170,6 +292,14 @@ namespace SceneUtil
         mLastFrameNumber = traversalNumber;
         osg::Geometry& geom = *getGeometry(mLastFrameNumber);
 
+#ifdef __vita__
+        uint64_t rigLapT = sceKernelGetProcessTimeWide();
+        const auto rigLap = [&rigLapT](unsigned int& out) {
+            const uint64_t now = sceKernelGetProcessTimeWide();
+            out += (unsigned int)(now - rigLapT);
+            rigLapT = now;
+        };
+#endif
         mSkeleton->updateBoneMatrices(traversalNumber);
 
         // skinning
@@ -181,7 +311,14 @@ namespace SceneUtil
         osg::Vec3Array* normalDst = static_cast<osg::Vec3Array*>(geom.getNormalArray());
         osg::Vec4Array* tangentDst = static_cast<osg::Vec4Array*>(geom.getTexCoordArray(7));
 
+#ifdef __vita__
+        // Reused scratch: a vector per skinned part per frame was a heap
+        // allocation in the cull hot path.
+        std::vector<osg::Matrixf>& boneMatrices = mVitaBoneMatrices;
+        boneMatrices.resize(mNodes.size());
+#else
         std::vector<osg::Matrixf> boneMatrices(mNodes.size());
+#endif
         std::vector<Bone*>::const_iterator bone = mNodes.begin();
         std::vector<BoneInfo>::const_iterator boneInfo = mData->mBones.begin();
         for (osg::Matrixf& boneMat : boneMatrices)
@@ -191,6 +328,9 @@ namespace SceneUtil
             ++bone;
             ++boneInfo;
         }
+#ifdef __vita__
+        rigLap(rig_bones_us);
+#endif
 
         osg::Matrixf transform;
         if (mSkinToSkelMatrix)
@@ -198,6 +338,63 @@ namespace SceneUtil
         else
             transform = mData->mTransform;
 
+#if defined(__vita__) && defined(__ARM_NEON)
+        if (!tangentDst)
+        {
+            static const bool sVerify = [] {
+                SceIoStat st;
+                return sceIoGetstat("ux0:data/openmw/skinverify.txt", &st) >= 0;
+            }();
+            const float* tp = transform.ptr();
+            const NeonRows transformRows{ { vld1q_f32(tp), vld1q_f32(tp + 4), vld1q_f32(tp + 8), vld1q_f32(tp + 12) } };
+            const osg::Vec3f* posSrcData = &(*positionSrc)[0];
+            osg::Vec3f* posDstData = &(*positionDst)[0];
+            const osg::Vec3f* nrmSrcData = normalDst ? &(*normalSrc)[0] : nullptr;
+            osg::Vec3f* nrmDstData = normalDst ? &(*normalDst)[0] : nullptr;
+            for (const auto& [influences, vertices] : mData->mInfluences)
+            {
+                const NeonRows m = vitaGroupMatrixNeon(influences, boneMatrices, mNodes, transformRows);
+                vitaSkinGroupNeon(m, vertices, posSrcData, posDstData, nrmSrcData, nrmDstData);
+                if (!sVerify)
+                    continue;
+                // skinverify.txt: compare against the scalar code ([SkinVerify]).
+                osg::Matrixf resultMat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1);
+                for (const auto& [index, weight] : influences)
+                {
+                    if (mNodes[index] == nullptr)
+                        continue;
+                    const float* boneMatPtr = boneMatrices[index].ptr();
+                    float* resultMatPtr = resultMat.ptr();
+                    for (int i = 0; i < 16; ++i, ++resultMatPtr, ++boneMatPtr)
+                        if (i % 4 != 3)
+                            *resultMatPtr += *boneMatPtr * weight;
+                }
+                resultMat *= transform;
+                static float sMaxPos = 0.f, sMaxNrm = 0.f;
+                static unsigned sGroups = 0;
+                for (unsigned short vertex : vertices)
+                {
+                    const osg::Vec3f p = resultMat.preMult((*positionSrc)[vertex]);
+                    sMaxPos = std::max(sMaxPos, ((*positionDst)[vertex] - p).length());
+                    if (normalDst)
+                    {
+                        const osg::Vec3f n = osg::Matrixf::transform3x3((*normalSrc)[vertex], resultMat);
+                        sMaxNrm = std::max(sMaxNrm, ((*normalDst)[vertex] - n).length());
+                    }
+                }
+                if (++sGroups >= 20000)
+                {
+                    char b[128];
+                    snprintf(b, sizeof(b), "[SkinVerify] %u groups: max diff position %.6f, normal %.6f", sGroups,
+                        sMaxPos, sMaxNrm);
+                    Vita::breadcrumb(b);
+                    sGroups = 0;
+                    sMaxPos = sMaxNrm = 0.f;
+                }
+            }
+        }
+        else
+#endif
         for (const auto& [influences, vertices] : mData->mInfluences)
         {
             osg::Matrixf resultMat(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1);
@@ -231,6 +428,10 @@ namespace SceneUtil
             }
         }
 
+#ifdef __vita__
+        rigLap(rig_skin_us);
+        rig_groups += (unsigned int)mData->mInfluences.size();
+#endif
         positionDst->dirty();
         if (normalDst)
             normalDst->dirty();
@@ -238,10 +439,16 @@ namespace SceneUtil
             tangentDst->dirty();
 
         geom.osg::Drawable::dirtyGLObjects();
+#ifdef __vita__
+        rigLap(rig_dirty_us);
+#endif
 
         nv->pushOntoNodePath(&geom);
         nv->apply(geom);
         nv->popFromNodePath();
+#ifdef __vita__
+        rigLap(rig_apply_us);
+#endif
     }
 
     void RigGeometry::updateBounds(osg::NodeVisitor* nv)
@@ -413,7 +620,13 @@ namespace SceneUtil
             if (stateset)
                 cv->pushStateSet(stateset);
 
+#ifdef __vita__
+            const uint64_t rigT0 = sceKernelGetProcessTimeWide();
+#endif
             cull(&nv);
+#ifdef __vita__
+            rig_cull_us += (unsigned int)(sceKernelGetProcessTimeWide() - rigT0);
+#endif
             if (stateset)
                 cv->popStateSet();
         }

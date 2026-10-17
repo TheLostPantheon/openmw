@@ -73,7 +73,9 @@ extern "C"
     unsigned int vita_bin2_graphs = 0, vita_bin2_leaves = 0;
     uint32_t gl_draw_us = 0, gl_swap_us = 0, gl_draw_max = 0, gl_swap_max = 0;
     extern uint32_t osgprof_dyn_leaves, osgprof_dyn_verts, osgprof_dyn_us;
-    unsigned int rig_cull_count = 0, rig_cull_verts = 0;
+    unsigned int rig_cull_count = 0, rig_cull_verts = 0, rig_cull_us = 0;
+    unsigned int rig_bones_us = 0, rig_skin_us = 0, rig_dirty_us = 0, rig_apply_us = 0, rig_groups = 0;
+    unsigned int rig_lod_skips = 0;
     unsigned int cullprof_creplay = 0, cullprof_crep_drop = 0;
     uint32_t cullprof_terr_us = 0;
     extern uint32_t osgapply_calls, osgapply_tex_us, osgapply_mode_us, osgapply_attr_us, osgapply_unif_us;
@@ -601,11 +603,18 @@ namespace Vita
                 gl_draw_us / 1000.0 / kReportEveryFrames, gl_draw_max / 1000.0,
                 gl_swap_us / 1000.0 / kReportEveryFrames, gl_swap_max / 1000.0,
                 rig_cull_count / kReportEveryFrames, rig_cull_verts / kReportEveryFrames / 1000,
-                osgprof_dyn_us / 1000.0 / kReportEveryFrames);
+                rig_cull_us / 1000.0 / kReportEveryFrames);
             auditLog(buf);
             gl_draw_us = gl_swap_us = gl_draw_max = gl_swap_max = 0;
             osgprof_dyn_leaves = osgprof_dyn_verts = osgprof_dyn_us = 0;
-            rig_cull_count = rig_cull_verts = 0;
+            snprintf(buf, sizeof(buf),
+                "[RigSplit] bones=%.2f skin=%.2f (%u groups) dirty=%.2f leaf=%.2f ms/frame, lod reuse %u/frame",
+                rig_bones_us / 1000.0 / kReportEveryFrames, rig_skin_us / 1000.0 / kReportEveryFrames,
+                rig_groups / kReportEveryFrames, rig_dirty_us / 1000.0 / kReportEveryFrames,
+                rig_apply_us / 1000.0 / kReportEveryFrames, rig_lod_skips / kReportEveryFrames);
+            auditLog(buf);
+            rig_bones_us = rig_skin_us = rig_dirty_us = rig_apply_us = rig_groups = rig_lod_skips = 0;
+            rig_cull_count = rig_cull_verts = rig_cull_us = 0;
             snprintf(buf, sizeof(buf), "[Vgl] rt=%u live, failures rt=%u scene=%u reserve=%u", vgl_rt_live,
                 vgl_rt_fail, vgl_scene_fail, vgl_reserve_fail);
             auditLog(buf);

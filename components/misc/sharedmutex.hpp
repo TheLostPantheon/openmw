@@ -23,13 +23,14 @@ namespace Misc
     /// that way (a streaming removal and a replay move racing the physics
     /// thread).
     ///
-    /// A writer holds a std::mutex (the layer's mutex is semaphore-based and
-    /// sound) for its whole section and waits for readers to drain; readers
-    /// pass through the same mutex to register. A blocked thread is woken by
-    /// the unlock instead of polling: an atomic spin-then-sleep version made
-    /// the main thread's physics queries wait 2.7-3.4 ms a frame while the
-    /// physics thread re-took the lock actor after actor.
-    /// Shared locks must not nest on one thread while a writer may wait.
+    /// Writers queue on a std::mutex (the layer's mutex is semaphore-based and
+    /// sound), so a blocked writer is woken by the unlock: polling made the
+    /// main thread's physics queries, all writers under "exclusive locks
+    /// only", wait 2.7-3.4 ms a frame. The writer at the head then claims the
+    /// lock once no reader is inside. Readers wait only while a writer holds
+    /// it, never for a queued one: a thread holding a shared lock can take it
+    /// again (the physics step does), which a writer-preferring version
+    /// deadlocked on (main stuck in the world update).
     /// ux0:data/openmw/stdrwlock.txt selects std::shared_mutex instead (A/B).
     class SharedMutex
     {
@@ -38,51 +39,49 @@ namespace Misc
         {
             if (useStd())
                 return mStd.lock();
-            mWriter.lock();
-            waitForReaders();
+            mWriters.lock();
+            for (int tries = 0;; ++tries)
+            {
+                int expected = 0;
+                if (mState.compare_exchange_weak(
+                        expected, -1, std::memory_order_acquire, std::memory_order_relaxed))
+                    return;
+                pause(tries); // readers are inside: lookups and queries, short
+            }
         }
         bool try_lock()
         {
             if (useStd())
                 return mStd.try_lock();
-            if (!mWriter.try_lock())
+            if (!mWriters.try_lock())
                 return false;
-            if (mReaders.load(std::memory_order_acquire) > 0)
-            {
-                mWriter.unlock();
-                return false;
-            }
-            return true;
+            int expected = 0;
+            if (mState.compare_exchange_strong(expected, -1, std::memory_order_acquire, std::memory_order_relaxed))
+                return true;
+            mWriters.unlock();
+            return false;
         }
         void unlock()
         {
             if (useStd())
                 return mStd.unlock();
-            mWriter.unlock();
+            mState.store(0, std::memory_order_release);
+            mWriters.unlock();
         }
 
         void lock_shared()
         {
             if (useStd())
                 return mStd.lock_shared();
-            const std::lock_guard<std::mutex> pass(mWriter);
-            mReaders.fetch_add(1, std::memory_order_acq_rel);
+            for (int tries = 0; !tryRead(); ++tries)
+                pause(tries); // a writer holds it: one query or one actor move
         }
-        bool try_lock_shared()
-        {
-            if (useStd())
-                return mStd.try_lock_shared();
-            if (!mWriter.try_lock())
-                return false;
-            mReaders.fetch_add(1, std::memory_order_acq_rel);
-            mWriter.unlock();
-            return true;
-        }
+        bool try_lock_shared() { return useStd() ? mStd.try_lock_shared() : tryRead(); }
         void unlock_shared()
         {
             if (useStd())
                 return mStd.unlock_shared();
-            mReaders.fetch_sub(1, std::memory_order_release);
+            mState.fetch_sub(1, std::memory_order_release);
         }
 
     private:
@@ -95,16 +94,24 @@ namespace Misc
             return sStd;
         }
 
-        // Readers hold the lock for a lookup or a query: spin briefly.
-        void waitForReaders()
+        bool tryRead()
         {
-            for (int tries = 0; mReaders.load(std::memory_order_acquire) > 0; ++tries)
-                if (tries >= 256)
-                    sceKernelDelayThread(10);
+            int state = mState.load(std::memory_order_relaxed);
+            while (state >= 0)
+                if (mState.compare_exchange_weak(
+                        state, state + 1, std::memory_order_acquire, std::memory_order_relaxed))
+                    return true;
+            return false;
         }
 
-        std::mutex mWriter;
-        std::atomic<int> mReaders{ 0 };
+        static void pause(int tries)
+        {
+            if (tries >= 256)
+                sceKernelDelayThread(10);
+        }
+
+        std::mutex mWriters; // queues writers; the holder owns or is claiming the lock
+        std::atomic<int> mState{ 0 }; // -1: a writer holds it; n > 0: n readers inside
         std::shared_mutex mStd;
     };
 #else
