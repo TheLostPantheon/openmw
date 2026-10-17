@@ -57,6 +57,34 @@
 #include "spellcasting.hpp"
 #include "weapontype.hpp"
 
+#ifdef __vita__
+#include <psp2/io/stat.h>
+#include <psp2/kernel/processmgr.h>
+
+namespace MWMechanics
+{
+    // [AnimSplit] (printed with [MechSplit]): CharacterController::update by
+    // section, us summed over the report window.
+    uint64_t gVitaAnimUs[6] = {};
+    namespace
+    {
+        struct VitaAnimLap
+        {
+            uint64_t mT = sceKernelGetProcessTimeWide();
+            void to(int k)
+            {
+                const uint64_t now = sceKernelGetProcessTimeWide();
+                gVitaAnimUs[k] += now - mT;
+                mT = now;
+            }
+        };
+    }
+}
+#define VITA_ANIM_LAP(k) vitaAnimLap.to(k)
+#else
+#define VITA_ANIM_LAP(k)
+#endif
+
 namespace
 {
 
@@ -1964,8 +1992,12 @@ namespace MWMechanics
         const MWWorld::Class& cls = mPtr.getClass();
         osg::Vec3f movement(0.f, 0.f, 0.f);
         float speed = 0.f;
+#ifdef __vita__
+        VitaAnimLap vitaAnimLap;
+#endif
 
         updateMagicEffects();
+        VITA_ANIM_LAP(0);
 
         bool isPlayer = mPtr == MWMechanics::getPlayer();
         bool isFirstPersonPlayer = isPlayer && MWBase::Environment::get().getWorld()->isFirstPerson();
@@ -2364,6 +2396,7 @@ namespace MWMechanics
                 jumpstate = JumpState_None;
             }
 
+            VITA_ANIM_LAP(1);
             updateAnimQueue();
             if (!mAnimQueue.empty())
                 idlestate = CharState_SpecialIdle;
@@ -2380,6 +2413,7 @@ namespace MWMechanics
                 refreshCurrentAnims(idlestate, movestate, jumpstate, updateWeaponState());
                 updateIdleStormState(inwater);
             }
+            VITA_ANIM_LAP(2);
 
             if (isTurning())
             {
@@ -2440,8 +2474,10 @@ namespace MWMechanics
             }
         }
 
+        VITA_ANIM_LAP(3);
         osg::Vec3f movementFromAnimation
             = mAnimation->runAnimation(mSkipAnim && !isScriptedAnimPlaying() ? 0.f : duration);
+        VITA_ANIM_LAP(4);
 
         if (mPtr.getClass().isActor() && !isScriptedAnimPlaying())
         {
@@ -2501,6 +2537,7 @@ namespace MWMechanics
         mSkipAnim = false;
 
         mAnimation->enableHeadAnimation(cls.isActor() && !cls.getCreatureStats(mPtr).isDead());
+        VITA_ANIM_LAP(5);
     }
 
     void CharacterController::persistAnimationState() const
@@ -3099,7 +3136,22 @@ namespace MWMechanics
         float zAngleRadians = 0.f;
         float xAngleRadians = 0.f;
 
+#ifdef __vita__
+        static const bool sEveryFrame = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/headeveryframe.txt", &st) >= 0;
+        }();
+        const bool vitaReuse = !sEveryFrame && !mHeadTrackTarget.isEmpty() && mHeadTrackTarget == mVitaHeadTarget
+            && mPtr != getPlayer() && (mVitaHeadFrame++ % 3) != 0;
+        if (vitaReuse)
+        {
+            zAngleRadians = mVitaHeadZ;
+            xAngleRadians = mVitaHeadX;
+        }
+        else if (!mHeadTrackTarget.isEmpty())
+#else
         if (!mHeadTrackTarget.isEmpty())
+#endif
         {
             osg::NodePathList nodepaths = head->getParentalNodePaths();
             if (nodepaths.empty())
@@ -3135,6 +3187,11 @@ namespace MWMechanics
                 Misc::normalizeAngle(zAngleRadians - mAnimation->getHeadYaw()) + mAnimation->getHeadYaw());
             zAngleRadians *= (1 - direction.z() * direction.z());
             xAngleRadians = std::asin(direction.z());
+#ifdef __vita__
+            mVitaHeadTarget = mHeadTrackTarget;
+            mVitaHeadZ = zAngleRadians;
+            mVitaHeadX = xAngleRadians;
+#endif
         }
 
         const float xLimit = osg::DegreesToRadians(40.f);

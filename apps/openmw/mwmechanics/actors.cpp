@@ -1509,6 +1509,7 @@ namespace MWMechanics
     }
 
 #ifdef __vita__
+    extern uint64_t gVitaAnimUs[6];
     namespace
     {
         // [MechSplit]: Actors::update by section, ms per frame (sim thread).
@@ -1554,6 +1555,15 @@ namespace MWMechanics
                 snprintf(buf + n, sizeof(buf) - n, " ms/frame; actors ai=%.1f anim=%.1f",
                     (double)gVitaMechAiActors / gVitaMechFrames, (double)gVitaMechAnimActors / gVitaMechFrames);
             Vita::breadcrumb(buf);
+            // CharacterController::update sections (character.cpp), every
+            // controller (actors and animated objects).
+            snprintf(buf, sizeof(buf),
+                "[AnimSplit] fx=%.2f move=%.2f state=%.2f turn+head=%.2f run=%.2f tail=%.2f ms/frame",
+                gVitaAnimUs[0] / 1000.0 / gVitaMechFrames, gVitaAnimUs[1] / 1000.0 / gVitaMechFrames,
+                gVitaAnimUs[2] / 1000.0 / gVitaMechFrames, gVitaAnimUs[3] / 1000.0 / gVitaMechFrames,
+                gVitaAnimUs[4] / 1000.0 / gVitaMechFrames, gVitaAnimUs[5] / 1000.0 / gVitaMechFrames);
+            Vita::breadcrumb(buf);
+            std::fill(std::begin(gVitaAnimUs), std::end(gVitaAnimUs), 0);
             std::fill(std::begin(gVitaMechUs), std::end(gVitaMechUs), 0);
             gVitaMechFrames = gVitaMechAiActors = gVitaMechAnimActors = 0;
         }

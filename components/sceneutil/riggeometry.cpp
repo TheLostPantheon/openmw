@@ -9,6 +9,7 @@ namespace Vita
 }
 #endif
 
+#include <atomic>
 #include <unordered_map>
 
 #include <osg/MatrixTransform>
@@ -28,6 +29,7 @@ extern "C" unsigned int rig_cull_count, rig_cull_verts;
 extern "C" unsigned int rig_cull_us;
 // [RigSplit]: bone matrices, skinning (groups + vertices), dirty, leaf add.
 extern "C" unsigned int rig_bones_us, rig_skin_us, rig_dirty_us, rig_apply_us, rig_groups, rig_lod_skips;
+extern "C" unsigned int rig_glskin_us, rig_glskin_parts;
 #endif
 
 #if defined(__vita__) && defined(__ARM_NEON)
@@ -108,6 +110,83 @@ namespace
                 vst1q_lane_f32(dn + 2, q, 2);
             }
         }
+    }
+
+    using VitaInfluences
+        = std::vector<std::pair<std::vector<std::pair<size_t, float>>, std::vector<unsigned short>>>;
+
+    // Deferred skinning: cull (sim worker, the frame's critical path) computes
+    // each vertex group's matrix and the GL thread skins the buffer's
+    // vertices just before drawing it (4.4 ms a frame with 6 NPCs fighting
+    // close by, against ~25 ms of GL thread idle time). The callback lives on
+    // the buffer geometry and owns what it reads: a render leaf can hold the
+    // geometry after its RigGeometry is gone. Buffers rotate by frame % 3, so
+    // cull writes one callback while the GL thread draws another.
+    // ux0:data/openmw/noglskin.txt skins in cull as before (A/B).
+    class VitaDeferredSkin : public osg::Drawable::DrawCallback
+    {
+    public:
+        VitaDeferredSkin(const osg::Referenced* owner, const VitaInfluences& influences,
+            const osg::Vec3Array* posSrc, const osg::Vec3Array* nrmSrc, osg::Vec3Array* posDst,
+            osg::Vec3Array* nrmDst)
+            : mOwner(owner)
+            , mInfluences(&influences)
+            , mPosSrc(posSrc)
+            , mNrmSrc(nrmSrc)
+            , mPosDst(posDst)
+            , mNrmDst(nrmDst)
+            , mGroupMats(influences.size())
+        {
+        }
+
+        bool matches(const VitaInfluences& influences, const osg::Vec3Array* posDst, const osg::Vec3Array* nrmDst) const
+        {
+            return mInfluences == &influences && mGroupMats.size() == influences.size() && mPosDst == posDst
+                && mNrmDst == nrmDst;
+        }
+
+        // Cull side: the matrices for this buffer's next draw.
+        NeonRows* groupMatrices() { return mGroupMats.data(); }
+        void publish() { mPending.store(true, std::memory_order_release); }
+
+        void drawImplementation(osg::RenderInfo& renderInfo, const osg::Drawable* drawable) const override
+        {
+            if (mPending.load(std::memory_order_acquire))
+            {
+                const uint64_t t0 = sceKernelGetProcessTimeWide();
+                const osg::Vec3f* posSrc = &(*mPosSrc)[0];
+                osg::Vec3f* posDst = &(*mPosDst)[0];
+                const osg::Vec3f* nrmSrc = mNrmDst ? &(*mNrmSrc)[0] : nullptr;
+                osg::Vec3f* nrmDst = mNrmDst ? &(*mNrmDst)[0] : nullptr;
+                size_t g = 0;
+                for (const auto& [influences, vertices] : *mInfluences)
+                    vitaSkinGroupNeon(mGroupMats[g++], vertices, posSrc, posDst, nrmSrc, nrmDst);
+                mPosDst->dirty();
+                if (mNrmDst)
+                    mNrmDst->dirty();
+                mPending.store(false, std::memory_order_relaxed);
+                rig_glskin_us += (unsigned int)(sceKernelGetProcessTimeWide() - t0);
+                ++rig_glskin_parts;
+            }
+            drawable->drawImplementation(renderInfo);
+        }
+
+    private:
+        osg::ref_ptr<const osg::Referenced> mOwner; // keeps *mInfluences alive
+        const VitaInfluences* mInfluences;
+        osg::ref_ptr<const osg::Vec3Array> mPosSrc, mNrmSrc;
+        osg::ref_ptr<osg::Vec3Array> mPosDst, mNrmDst;
+        std::vector<NeonRows> mGroupMats; // sized once, never reallocated
+        mutable std::atomic<bool> mPending{ false };
+    };
+
+    bool vitaGlSkinEnabled()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/noglskin.txt", &st) < 0;
+        }();
+        return sOn;
     }
 }
 #endif
@@ -351,6 +430,29 @@ namespace SceneUtil
             osg::Vec3f* posDstData = &(*positionDst)[0];
             const osg::Vec3f* nrmSrcData = normalDst ? &(*normalSrc)[0] : nullptr;
             osg::Vec3f* nrmDstData = normalDst ? &(*normalDst)[0] : nullptr;
+            if (!sVerify && vitaGlSkinEnabled())
+            {
+                auto* deferred = dynamic_cast<VitaDeferredSkin*>(geom.getDrawCallback());
+                if (deferred == nullptr || !deferred->matches(mData->mInfluences, positionDst, normalDst))
+                {
+                    deferred = new VitaDeferredSkin(
+                        mData.get(), mData->mInfluences, positionSrc, normalSrc, positionDst, normalDst);
+                    geom.setDrawCallback(deferred);
+                }
+                NeonRows* groupMats = deferred->groupMatrices();
+                for (const auto& [influences, vertices] : mData->mInfluences)
+                    *groupMats++ = vitaGroupMatrixNeon(influences, boneMatrices, mNodes, transformRows);
+                deferred->publish();
+                rigLap(rig_skin_us);
+                rig_groups += (unsigned int)mData->mInfluences.size();
+                geom.osg::Drawable::dirtyGLObjects();
+                rigLap(rig_dirty_us);
+                nv->pushOntoNodePath(&geom);
+                nv->apply(geom);
+                nv->popFromNodePath();
+                rigLap(rig_apply_us);
+                return;
+            }
             for (const auto& [influences, vertices] : mData->mInfluences)
             {
                 const NeonRows m = vitaGroupMatrixNeon(influences, boneMatrices, mNodes, transformRows);
