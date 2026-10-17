@@ -154,7 +154,7 @@ namespace
         struct WithLockedPtr
         {
             const Impl& mImpl;
-            std::shared_mutex& mCollisionWorldMutex;
+            Misc::SharedMutex& mCollisionWorldMutex;
             const MWPhysics::LockingPolicy mLockingPolicy;
 
             template <class Ptr, class FrameData>
@@ -167,7 +167,7 @@ namespace
                 // Locked shared_ptr has to be destructed after releasing mCollisionWorldMutex to avoid
                 // possible deadlock. Ptr destructor also acquires mCollisionWorldMutex.
                 const std::pair arg(std::move(ptr), frameData);
-                const Lock<std::shared_mutex> lock(mCollisionWorldMutex, mLockingPolicy);
+                const Lock<Misc::SharedMutex> lock(mCollisionWorldMutex, mLockingPolicy);
                 mImpl(arg);
             }
         };

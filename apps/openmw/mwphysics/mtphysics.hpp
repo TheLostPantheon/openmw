@@ -19,6 +19,7 @@
 #include <osg/Timer>
 
 #include "components/misc/budgetmeasurement.hpp"
+#include "components/misc/sharedmutex.hpp"
 #include "physicssystem.hpp"
 #include "ptrholder.hpp"
 
@@ -136,9 +137,9 @@ namespace MWPhysics
         std::vector<std::thread> mThreads;
 #endif
 
-        mutable std::shared_mutex mSimulationMutex;
-        mutable std::shared_mutex mCollisionWorldMutex;
-        mutable std::shared_mutex mLOSCacheMutex;
+        mutable Misc::SharedMutex mSimulationMutex;
+        mutable Misc::SharedMutex mCollisionWorldMutex;
+        mutable Misc::SharedMutex mLOSCacheMutex;
         mutable std::mutex mUpdateAabbMutex;
 
         unsigned int mFrameNumber;

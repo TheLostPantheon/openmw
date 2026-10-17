@@ -66,6 +66,10 @@ namespace Vita
             // replay: "shot=<s>[,<s>...]" screenshots that many seconds after
             // the start is placed, with the touch-zone overlay shown first
             std::vector<float> mShots;
+            // replay: "race" moves the player on main right after the sim
+            // join without waiting for the physics step (the overlap that
+            // corrupted Bullet; a lock test)
+            bool mRace = false;
             bool mExit = false;
         };
 
@@ -106,6 +110,8 @@ namespace Vita
                         }
                         else if (strcmp(line, "exit") == 0)
                             c.mExit = true;
+                        else if (strcmp(line, "race") == 0)
+                            c.mRace = true;
                     }
                     fclose(f);
                 }
@@ -480,7 +486,8 @@ namespace Vita
         // Moving the player's collision object while the async physics step
         // ran corrupted Bullet's broadphase (two replay crashes): wait for
         // the step first. By the sim job's start it has usually finished.
-        world->vitaWaitPhysics();
+        if (!config().mRace)
+            world->vitaWaitPhysics();
         MWWorld::Ptr player = world->moveObject(world->getPlayerPtr(), sPending.mPos);
         world->rotateObject(player, sPending.mRot, MWBase::RotationFlag_none);
     }
@@ -496,6 +503,10 @@ namespace Vita
                 return;
             case Mode::Replay:
                 sPlayer.tick(frameSeconds);
+                // "race": move now, on main after the sim join, where the
+                // async physics step may still run (the original crash site).
+                if (config().mRace)
+                    benchApplyMove();
                 return;
         }
     }
