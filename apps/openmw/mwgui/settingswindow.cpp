@@ -752,6 +752,18 @@ namespace MWGui
             return;
         Settings::video().mResolutionX.set(kWidths[pos]);
         Settings::video().mResolutionY.set(kHeights[pos]);
+        // 640x368 was the old default, upgraded to native at boot unless
+        // chosen here (VitaInit.cpp): record the choice.
+        if (kWidths[pos] == 640)
+        {
+            if (FILE* f = fopen("ux0:data/openmw/config/res640.txt", "w"))
+            {
+                fputs("chosen in the Vita settings tab\n", f);
+                fclose(f);
+            }
+        }
+        else
+            remove("ux0:data/openmw/config/res640.txt");
         // No apply() — render resolution requires a restart (engine creates
         // its render FBO once at startup; resizing mid-session is not safe
         // on vitaGL). The new value persists to user cfg and takes effect

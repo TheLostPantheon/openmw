@@ -1357,6 +1357,12 @@ namespace Vita
     // restores room; resize if it recurs.
     extern "C" const char g_vitaSegmentPad[8192] = { 1 };
 
+    bool vitaRes640Chosen()
+    {
+        SceIoStat st;
+        return sceIoGetstat("ux0:data/openmw/config/res640.txt", &st) >= 0;
+    }
+
     void initialize()
     {
         // Force the linker to keep sceUserMainThreadStackSize — it lives in its
@@ -1531,6 +1537,16 @@ namespace Vita
                 }
                 fclose(f);
             }
+            // Native 960x544 is the default since 2026-10. A 640x368 left
+            // over from the old default is upgraded, unless the player has
+            // picked 640x368 in the Vita settings tab since (it writes
+            // config/res640.txt). applySettingsOverrides() applies the same
+            // rule to the setting, so window, GUI and backbuffer agree.
+            if (resX == 640 && resY == 368 && !vitaRes640Chosen())
+            {
+                resX = 960;
+                resY = 544;
+            }
             static constexpr int kModes[][2] = { { 480, 272 }, { 640, 368 }, { 720, 408 }, { 960, 544 } };
             for (const auto& m : kModes)
                 if (resX == m[0] && resY == m[1])
@@ -1673,6 +1689,15 @@ namespace Vita
     void applySettingsOverrides()
     {
         debugLog("Applying Vita platform defaults...");
+
+        // Native resolution default (see the backbuffer choice in initialize()).
+        if (Settings::video().mResolutionX.get() == 640 && Settings::video().mResolutionY.get() == 368
+            && !vitaRes640Chosen())
+        {
+            Settings::video().mResolutionX.set(960);
+            Settings::video().mResolutionY.set(544);
+            breadcrumb("[Display] 640x368 (old default) upgraded to 960x544");
+        }
 
         // --- Video: resolution X/Y are NOT forced — bundled settings.cfg
         // supplies 640x368 as the default (matches the vglInit backbuffer

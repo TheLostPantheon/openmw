@@ -33,6 +33,10 @@ namespace Vita
     // Must be called before anything else. Sets up clocks, OOM handler, logging.
     void initialize();
 
+    /// The player picked 640x368 in the Vita settings tab (config/res640.txt):
+    /// keep it instead of upgrading the old default to native 960x544.
+    bool vitaRes640Chosen();
+
     // Pin the calling thread to one user core (0-2): main, sim and GL each
     // get their own so the pipeline stages never time-slice one core.
     // Disabled by ux0:data/openmw/nopin.txt (A/B without a rebuild).

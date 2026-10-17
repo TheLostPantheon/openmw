@@ -3459,10 +3459,29 @@ namespace MWWorld
         } tickTimer{ tick0, &sLastHydrateMs };
         const auto deadline = tick0 + std::chrono::milliseconds(maxMs);
         const osg::Vec3f pp = mWorld.getPlayerPtr().getRefData().getPosition().asVec3();
-        constexpr float rIn = 3000.f;
         // Actors are the costliest add; give them the closest tier of their
-        // own rather than riding the items+lights radius.
-        constexpr float rActorIn = 2000.f;
+        // own rather than riding the items+lights radius. Build radius 3000
+        // (was 2000: NPCs appeared well inside the ~5000 view, too close);
+        // ux0:data/openmw/npcrange.txt holding a number overrides it. The
+        // actor domain (local scripts, respawn) leads it by 400 so a built
+        // actor's cell is always active, and ring 3 pre-warms parts 800
+        // further out. Release stays at rActorOut.
+        static const float sActorIn = [] {
+            float r = 3000.f;
+            if (FILE* f = fopen("ux0:data/openmw/npcrange.txt", "r"))
+            {
+                float v = 0.f;
+                if (fscanf(f, "%f", &v) == 1)
+                    r = std::clamp(v, 1500.f, 4400.f);
+                fclose(f);
+            }
+            char nb[64];
+            snprintf(nb, sizeof(nb), "[ActorPace] NPC build radius %d", (int)r);
+            Vita::breadcrumb(nb);
+            return r;
+        }();
+        const float rActorIn = sActorIn;
+        const float rIn = std::max(3000.f, rActorIn + 400.f);
         // rItemOut is derived below from the view reach (was fixed 3500:
         // items/lights popped at a sharp border well inside visible range).
         constexpr float rActorOut = 4800.f;
@@ -3833,7 +3852,7 @@ namespace MWWorld
                 // pass, regardless of frame health. Rings 2/3 make this
                 // fire rarely; when it fires, presence beats one frame.
                 constexpr float rNear = 400.f;
-                constexpr float rActorWarm = 2000.f;
+                const float rActorWarm = rActorIn + 800.f;
                 // Warm-actor memo; pool relief can re-cool assets, so it is
                 // dropped whenever the ready epoch moves (new deliveries).
                 static std::set<const LiveCellRefBase*> sRing3Warm;
