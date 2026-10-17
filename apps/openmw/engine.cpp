@@ -38,6 +38,7 @@
 #include <psp2/display.h>
 // Pin API; vitasdk's stock vitaGL.h lacks it.
 extern "C" void vglSetStaticVboRam(unsigned char enable);
+extern "C" int osgapply_unif_hist_report(char* buf, unsigned int buflen);
 extern "C" uint32_t phase_evt_us, phase_upd_us, phase_focus_us, phase_lua_us, phase_pre_us, phase_pace_us;
 extern "C" uint32_t phase_fin_us, phase_inp_us, phase_unref_us, phase_stats_us;
 extern "C" uint32_t vita_simjob_us, vita_simjob_upd_us, vita_simjob_cull_us;
@@ -607,6 +608,20 @@ namespace
         if ((uint32_t)(t2 - t1) > gl_swap_max)
             gl_swap_max = (uint32_t)(t2 - t1);
         Vita::noteRenderTime(t2 - t0);
+        // [UnifHist]: the uniform table grows during draw on this thread
+        // (a resize under main's walk could crash), so report it here.
+        static unsigned sUnifFrames = 0;
+        if (++sUnifFrames >= 150)
+        {
+            sUnifFrames = 0;
+            char hb[224];
+            if (osgapply_unif_hist_report(hb, sizeof(hb)) > 0)
+            {
+                char line[240];
+                snprintf(line, sizeof(line), "[UnifHist] %s", hb);
+                Vita::breadcrumb(line);
+            }
+        }
         Vita::setDrawInFlight(false);
     }
 

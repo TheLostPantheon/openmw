@@ -6,6 +6,7 @@
 
 #include <components/lua/scriptscontainer.hpp>
 #include "VitaInit.h"
+#include "VitaGLWorker.h"
 #include "VitaSimWorker.h"
 
 #include <cstdio>
@@ -884,7 +885,11 @@ namespace Vita
         osgapply_unif_n = osgapply_unif_up = osgapply_unif_rup = 0;
         osgapply_push = osgapply_pop = 0;
 
-        // Upload histogram: name=up/redundant, top 8 per window.
+        // Upload histogram: name=up/redundant, top 8 per window. Its table
+        // grows on the drawing thread; with the GL worker that thread
+        // reports it (vitaDrawAndSwap), so only the main-thread draw path
+        // reports here.
+        if (Vita::getGLWorker() == nullptr)
         {
             char hb[224];
             if (osgapply_unif_hist_report(hb, sizeof(hb)) > 0)

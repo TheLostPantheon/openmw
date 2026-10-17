@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -414,8 +415,15 @@ namespace Vita
             std::vector<std::string> mExamples;
         } sVerify;
 
+        // sStats.mReject and sVerify.mExamples grow during cull (sim worker)
+        // while main's audit reports and resets them mid-job: a map insert
+        // racing the report's walk and reset could follow a freed node.
+        // The counters beside them are plain and only ever read for logs.
+        std::mutex sStatsMutex;
+
         void verifyExample(const std::string& s)
         {
+            const std::lock_guard<std::mutex> lock(sStatsMutex);
             if (sVerify.mExamples.size() < 4)
                 sVerify.mExamples.push_back(s);
         }
@@ -559,7 +567,10 @@ namespace Vita
                 {
                     mOsg.push_back(child);
                     mRejected.emplace(child, children);
-                    ++sStats.mReject[why];
+                    {
+                        const std::lock_guard<std::mutex> lock(sStatsMutex);
+                        ++sStats.mReject[why];
+                    }
                     if (verify)
                         collectDrawables(child, mOsgDrawables);
                 }
@@ -808,6 +819,7 @@ namespace Vita
             sStats.mFastObjs / f, sStats.mOsgObjs / f, sStats.mObjCulled / f, sStats.mDrwEmitted / f,
             sStats.mDrwCulled / f, sStats.mRebuilds);
         std::vector<std::pair<uint32_t, std::string>> reasons;
+        const std::lock_guard<std::mutex> lock(sStatsMutex);
         for (const auto& [why, n] : sStats.mReject)
             reasons.emplace_back(n, why);
         std::sort(reasons.rbegin(), reasons.rend());
@@ -833,6 +845,7 @@ namespace Vita
             sVerify.mFrames, sVerify.mLeaves, sVerify.mMatched, sVerify.mMissing, sVerify.mAmbiguous,
             sVerify.mExtra, sVerify.mMatrixBad, sVerify.mMaxMatErr, sVerify.mStateBad, sVerify.mBinBad,
             sVerify.mLightBad, sVerify.mLightChecked);
+        const std::lock_guard<std::mutex> lock(sStatsMutex);
         for (const std::string& e : sVerify.mExamples)
             if (w > 0 && (std::size_t)w < len)
                 w += snprintf(buf + w, len - w, " | %s", e.c_str());

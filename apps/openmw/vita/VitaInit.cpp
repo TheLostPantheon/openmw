@@ -201,6 +201,17 @@ namespace
     std::atomic<bool> s_logThreadStarted{ false };
     char s_logFlushBuf[kLogRingSize];
 
+    // Spin briefly, then sleep between tries. A pure spin could starve the
+    // lock holder: the flusher runs at priority 191 on any core, and a
+    // higher-priority thread pinned to that core spinning on the lock would
+    // keep it from ever running again (no time slicing between priorities).
+    void logLockAcquire(std::atomic_flag& lock)
+    {
+        for (unsigned spins = 0; lock.test_and_set(std::memory_order_acquire); ++spins)
+            if (spins >= 64)
+                sceKernelDelayThread(50);
+    }
+
     int logFlushThread(SceSize, void*)
     {
         for (;;)
@@ -250,9 +261,7 @@ namespace
     void logAppend(const char* data, size_t len)
     {
         logStartFlusherOnce();
-        while (s_logLock.test_and_set(std::memory_order_acquire))
-        {
-        }
+        logLockAcquire(s_logLock);
         if (s_logHead + len <= kLogRingSize)
         {
             memcpy(s_logRing + s_logHead, data, len);
@@ -301,15 +310,11 @@ extern "C" int vitaLogFlushTry(void)
 extern "C" void vitaLogFlushNow(void)
 {
     // Copy out under data lock; SD write outside it.
-    while (s_logIoLock.test_and_set(std::memory_order_acquire))
-    {
-    }
+    logLockAcquire(s_logIoLock);
     size_t len;
     unsigned dropped;
     {
-        while (s_logLock.test_and_set(std::memory_order_acquire))
-        {
-        }
+        logLockAcquire(s_logLock);
         len = s_logHead;
         dropped = s_logDropped;
         if (len > 0)
