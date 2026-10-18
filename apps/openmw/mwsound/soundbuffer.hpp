@@ -93,6 +93,8 @@ namespace MWSound
 #ifdef __vita__
         /// Bookkeeping tail of loadSfx for a worker-decoded buffer.
         void vitaFinishLoad(SoundBuffer* sfx, Sound_Handle handle, size_t size);
+        /// Decoded sound data held by the pool (memory audit).
+        std::size_t vitaCacheBytes() const { return mBufferCacheSize; }
 #endif
 
         void use(SoundBuffer& sfx)

@@ -956,9 +956,9 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgShadow/MinimalCullBoundsShadowMap
          osg::Polytope polytope;
  #if 1
 diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUtil/CullVisitor.cpp
---- a/src/osgUtil/CullVisitor.cpp	2022-01-11 08:08:55.000000000 -0700
-+++ b/src/osgUtil/CullVisitor.cpp	2026-08-05 17:31:37.419330115 -0600
-@@ -38,6 +38,74 @@
+--- a/src/osgUtil/CullVisitor.cpp
++++ b/src/osgUtil/CullVisitor.cpp
+@@ -38,6 +38,83 @@
  using namespace osg;
  using namespace osgUtil;
  
@@ -973,6 +973,12 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
 +    // Time buckets: drawable-apply total, cull-callback share, pre-traverse
 +    // exclusive cost of Transform/Group applies.
 +    unsigned int cullprof_drw_us = 0, cullprof_cb_us = 0, cullprof_xf_us = 0, cullprof_grp_us = 0;
++    // SceneView::cullStage split (sampled): setup before the traversal
++    // (render graph clean, stage reset), the traversal, sort + prune after.
++    unsigned int cullprof_stage_setup_us = 0, cullprof_stage_trav_us = 0, cullprof_stage_sort_us = 0;
++    // Parts of the Group/Transform exclusive times (sampled): visibility test
++    // (bound fetch + frustum/small-feature), and state set pushes.
++    unsigned int cullprof_isculled_us = 0, cullprof_pushss_us = 0;
 +}
 +#include <cstdio>
 +namespace
@@ -1018,11 +1024,14 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
 +}
 +#define CULLPROF_INC(x) (++x)
 +// Timing probes cost ~4 kernel clock reads per node visit — about 4900 per
-+// frame — so they inflated the very number they were measuring. Counts are
-+// nearly free and stay; the timers are compiled out.
-+#define CULLPROF_T() 0
-+#define CULLPROF_ADD(var, t0)
-+#define CULLPROF_CB_NOTE(name, owner, us)
++// frame — so always-on they inflated the very number they were measuring.
++// Counts are nearly free and stay; timers run only on frames the engine
++// samples (osg_vita_cullprof_sample, one frame in eight), and cost a load
++// and a branch otherwise. The audit scales the sums back to per frame.
++extern "C" { int osg_vita_cullprof_sample = 0; }
++#define CULLPROF_T() (osg_vita_cullprof_sample ? (unsigned int)sceKernelGetProcessTimeWide() : 0u)
++#define CULLPROF_ADD(var, t0) if (osg_vita_cullprof_sample) { var += (unsigned int)sceKernelGetProcessTimeWide() - (t0); }
++#define CULLPROF_CB_NOTE(name, owner, us) if (osg_vita_cullprof_sample) { cullprofCbNote(name, owner, us); }
 +#else
 +#define CULLPROF_INC(x) ((void)0)
 +#define CULLPROF_T() 0
@@ -1033,7 +1042,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  inline float MAX_F(float a, float b)
      { return a>b?a:b; }
  inline int EQUAL_F(float a, float b)
-@@ -861,6 +929,7 @@
+@@ -861,6 +938,7 @@
  
  void CullVisitor::apply(Node& node)
  {
@@ -1041,7 +1050,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
      if (isCulled(node)) return;
  
      // push the culling mode.
-@@ -882,6 +951,7 @@
+@@ -882,6 +960,7 @@
  
  void CullVisitor::apply(Geode& node)
  {
@@ -1049,7 +1058,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
      if (isCulled(node)) return;
  
      // push the culling mode.
-@@ -902,24 +972,52 @@
+@@ -902,24 +981,52 @@
  
  void CullVisitor::apply(osg::Drawable& drawable)
  {
@@ -1104,7 +1113,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  
  
      if (_computeNearFar && bb.valid())
-@@ -969,6 +1067,7 @@
+@@ -969,6 +1076,7 @@
      }
      else
      {
@@ -1112,14 +1121,16 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
          addDrawableAndDepth(&drawable,&matrix,depth);
      }
  
-@@ -1136,7 +1235,13 @@
+@@ -1136,41 +1244,76 @@
  
  void CullVisitor::apply(Group& node)
  {
 -    if (isCulled(node)) return;
 +    CULLPROF_INC(cullprof_group);
 +    const unsigned int grp0 = CULLPROF_T();
-+    if (isCulled(node))
++    const bool grpCulled = isCulled(node);
++    CULLPROF_ADD(cullprof_isculled_us, grp0)
++    if (grpCulled)
 +    {
 +        CULLPROF_ADD(cullprof_grp_us, grp0)
 +        return;
@@ -1127,9 +1138,16 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  
      // push the culling mode.
      pushCurrentMask();
-@@ -1145,18 +1250,31 @@
+ 
+     // push the node's state.
      StateSet* node_state = node.getStateSet();
-     if (node_state) pushStateSet(node_state);
+-    if (node_state) pushStateSet(node_state);
++    if (node_state)
++    {
++        const unsigned int ss0 = CULLPROF_T();
++        pushStateSet(node_state);
++        CULLPROF_ADD(cullprof_pushss_us, ss0)
++    }
  
 +    CULLPROF_ADD(cullprof_grp_us, grp0)
      handle_cull_callbacks_and_traverse(node);
@@ -1152,7 +1170,9 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
 +        ++cullprof_xf_bone;
 +#endif
 +    const unsigned int xf0 = CULLPROF_T();
-+    if (isCulled(node))
++    const bool xfCulled = isCulled(node);
++    CULLPROF_ADD(cullprof_isculled_us, xf0)
++    if (xfCulled)
 +    {
 +        CULLPROF_ADD(cullprof_xf_us, xf0)
 +        return;
@@ -1160,7 +1180,18 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  
      // push the culling mode.
      pushCurrentMask();
-@@ -1169,8 +1287,10 @@
+ 
+     // push the node's state.
+     StateSet* node_state = node.getStateSet();
+-    if (node_state) pushStateSet(node_state);
++    if (node_state)
++    {
++        const unsigned int ss0 = CULLPROF_T();
++        pushStateSet(node_state);
++        CULLPROF_ADD(cullprof_pushss_us, ss0)
++    }
+ 
+     RefMatrix* matrix = createOrReuseMatrix(*getModelViewMatrix());
      node.computeLocalToWorldMatrix(*matrix,this);
      pushModelViewMatrix(matrix, node.getReferenceFrame());
  
@@ -1171,7 +1202,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
      popModelViewMatrix();
  
      // pop the node's state off the render graph stack.
-@@ -1178,6 +1298,7 @@
+@@ -1178,6 +1321,7 @@
  
      // pop the culling mode.
      popCurrentMask();
@@ -1179,7 +1210,7 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/CullVisitor.cpp b/src/osgUti
  }
  
  void CullVisitor::apply(Projection& node)
-@@ -1747,3 +1868,4 @@
+@@ -1747,3 +1891,4 @@
      popCurrentMask();
  }
  
@@ -1616,3 +1647,294 @@ diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/RenderLeaf.cpp b/src/osgUtil
      }
  
      if (_dynamic)
+diff -ruN '--exclude=.git' pristine-osg/src/osg/Group.cpp b/src/osg/Group.cpp
+--- a/src/osg/Group.cpp
++++ b/src/osg/Group.cpp
+@@ -23,6 +23,135 @@
+ 
+ #include <algorithm>
+ 
++#ifdef __vita__
++#include <atomic>
++#include <thread>
++#include <vector>
++
++// OpenMW Vita: cull can run on the GL thread while the sim thread changes the
++// scene graph (scripts enabling/placing objects, spell effects, equipment).
++// On the registered cull thread, a cull traversal of a Group iterates a
++// snapshot of its child list taken under a lock; writers take the same lock
++// around the child-list write. Snapshots hold raw pointers (a reference per
++// child would cost two barriered atomics each, thousands per frame), so
++// children the live-scene writer (the sim thread) or the cull thread removes
++// while a cull is in flight are parked in a graveyard, and the engine releases
++// them with osg_vita_cow_drain() once the cull is done. Other threads (work
++// queue loaders, optimizer passes) edit private graphs a cull never sees:
++// their removals release at once, on their own thread, as stock OSG does.
++// Parking those once let main destroy a node mid-pass while a loader's
++// optimizer still reached it through a parent list (use-after-free).
++extern "C"
++{
++    // TPIDRURO of the thread whose culls snapshot (0 = off); set on that
++    // thread by osg_vita_cow_enable().
++    unsigned int osg_vita_cow_cull = 0;
++    // TPIDRURO of the thread that edits the live scene while a cull runs
++    // (the sim thread); set on it by osg_vita_cow_set_writer().
++    unsigned int osg_vita_cow_writer = 0;
++    volatile int osg_vita_cull_in_flight = 0;
++    // Structural changes made while a cull was in flight (telemetry: proof
++    // the snapshot path is exercised).
++    unsigned int osg_vita_cow_mutations = 0;
++    // Cull traversals on another thread while snapshotting is on; they
++    // iterate unprotected, so this should stay 0.
++    unsigned int osg_vita_cow_foreign = 0;
++    // Bound recomputes ([Bounds] audit line): Group::computeBound calls and
++    // the children they visited. A dirty bound (a moved child, an animated
++    // bone) is recomputed on its next getBound(), usually inside cull.
++    unsigned int osg_vita_bound_calls = 0, osg_vita_bound_children = 0;
++}
++
++namespace
++{
++    inline unsigned int vitaThreadKey()
++    {
++        unsigned int v;
++        asm volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(v));
++        return v;
++    }
++
++    // Threads whose removals a cull may still point at.
++    inline bool vitaLiveWriter()
++    {
++        const unsigned int key = vitaThreadKey();
++        return key == osg_vita_cow_cull || key == osg_vita_cow_writer;
++    }
++
++    std::atomic_flag sVitaChildLock = ATOMIC_FLAG_INIT;
++
++    struct VitaChildLock
++    {
++        bool mOn;
++        VitaChildLock()
++            : mOn(osg_vita_cow_cull != 0)
++        {
++            if (!mOn)
++                return;
++            for (unsigned spins = 0; sVitaChildLock.test_and_set(std::memory_order_acquire); ++spins)
++            {
++                if (spins > 256)
++                    std::this_thread::yield();
++            }
++        }
++        ~VitaChildLock()
++        {
++            if (mOn)
++                sVitaChildLock.clear(std::memory_order_release);
++        }
++    };
++
++    // Removed children a cull may still point at; guarded by sVitaChildLock.
++    osg::NodeList sVitaGraveyard;
++
++    struct VitaWriteLock : VitaChildLock
++    {
++        const bool mInFlight;
++        VitaWriteLock()
++            : mInFlight(mOn && osg_vita_cull_in_flight && vitaLiveWriter())
++        {
++            if (mInFlight)
++                ++osg_vita_cow_mutations;
++        }
++        void park(osg::Node* removed)
++        {
++            if (mInFlight)
++                sVitaGraveyard.push_back(removed);
++        }
++    };
++
++    // The cull thread's snapshots, one stack for all traversal depths: a
++    // level appends its children, iterates them by index (a nested level
++    // may reallocate the buffer) and truncates back. Only the registered
++    // cull thread touches it; capacity is kept, so steady state does not
++    // allocate.
++    std::vector<osg::Node*> sVitaCullStack;
++}
++
++extern "C" void osg_vita_cow_enable(int on)
++{
++    osg_vita_cow_cull = on ? vitaThreadKey() : 0u;
++}
++
++extern "C" void osg_vita_cow_set_writer(void)
++{
++    osg_vita_cow_writer = vitaThreadKey();
++}
++
++extern "C" void osg_vita_cow_drain(void)
++{
++    osg::NodeList released;
++    {
++        VitaChildLock lock;
++        if (osg_vita_cull_in_flight)
++            return;
++        released.swap(sVitaGraveyard);
++    }
++    // Last references drop here, outside the lock: destructors may edit
++    // other groups.
++}
++#endif
++
+ using namespace osg;
+ 
+ Group::Group()
+@@ -56,6 +185,33 @@
+ 
+ void Group::traverse(NodeVisitor& nv)
+ {
++#ifdef __vita__
++    if (osg_vita_cow_cull && nv.getVisitorType() == NodeVisitor::CULL_VISITOR)
++    {
++        if (vitaThreadKey() == osg_vita_cow_cull)
++        {
++            const size_t base = sVitaCullStack.size();
++            // Outermost level: flag the cull before the first snapshot (the
++            // lock's release publishes it to writers).
++            if (base == 0)
++                osg_vita_cull_in_flight = 1;
++            {
++                VitaChildLock lock;
++                for (NodeList::iterator itr = _children.begin(); itr != _children.end(); ++itr)
++                    sVitaCullStack.push_back(itr->get());
++            }
++            const size_t end = sVitaCullStack.size();
++            for (size_t i = base; i < end; ++i)
++                sVitaCullStack[i]->accept(nv);
++            sVitaCullStack.resize(base);
++            // Release: every use of a snapshot pointer precedes the clear.
++            if (base == 0)
++                __atomic_store_n(&osg_vita_cull_in_flight, 0, __ATOMIC_RELEASE);
++            return;
++        }
++        ++osg_vita_cow_foreign;
++    }
++#endif
+     for(NodeList::iterator itr=_children.begin();
+         itr!=_children.end();
+         ++itr)
+@@ -88,6 +244,10 @@
+ 
+ 
+     // note ref_ptr<> automatically handles incrementing child's reference count.
++    {
++#ifdef __vita__
++        VitaWriteLock lock;
++#endif
+     if (index >= _children.size())
+     {
+         index = _children.size();      // set correct index value to be passed to the "childInserted" method
+@@ -97,6 +257,7 @@
+     {
+         _children.insert(_children.begin()+index, child);
+     }
++    }
+ 
+     // register as parent of child.
+     child->addParent(this);
+@@ -195,6 +356,20 @@
+ 
+         childRemoved(pos,endOfRemoveRange-pos);
+ 
++#ifdef __vita__
++        if (osg_vita_cow_cull)
++        {
++            // Hold the removed children past the lock (dropping a last
++            // reference runs destructors) and park them while a cull may
++            // still point at them.
++            NodeList vitaRemoved(_children.begin()+pos, _children.begin()+endOfRemoveRange);
++            VitaWriteLock lock;
++            _children.erase(_children.begin()+pos,_children.begin()+endOfRemoveRange);
++            for (NodeList::iterator itr = vitaRemoved.begin(); itr != vitaRemoved.end(); ++itr)
++                lock.park(itr->get());
++        }
++        else
++#endif
+         _children.erase(_children.begin()+pos,_children.begin()+endOfRemoveRange);
+ 
+         if (updateCallbackRemoved)
+@@ -250,7 +425,13 @@
+ 
+         // note ref_ptr<> automatically handles decrementing origNode's reference count,
+         // and inccrementing newNode's reference count.
+-        _children[i] = newNode;
++        {
++#ifdef __vita__
++            VitaWriteLock lock;
++            lock.park(origNode.get());
++#endif
++            _children[i] = newNode;
++        }
+ 
+         // register as parent of child.
+         newNode->addParent(this);
+@@ -350,6 +531,10 @@
+ 
+ BoundingSphere Group::computeBound() const
+ {
++#ifdef __vita__
++    ++osg_vita_bound_calls;
++    osg_vita_bound_children += (unsigned int)_children.size();
++#endif
+     BoundingSphere bsphere;
+     if (_children.empty())
+     {
+diff -ruN '--exclude=.git' pristine-osg/src/osgUtil/SceneView.cpp b/src/osgUtil/SceneView.cpp
+--- a/src/osgUtil/SceneView.cpp
++++ b/src/osgUtil/SceneView.cpp
+@@ -768,9 +768,19 @@
+ 
+ 
+ }
++
++#ifdef __vita__
++#include <psp2/kernel/processmgr.h>
++extern "C" int osg_vita_cullprof_sample;
++extern "C" unsigned int cullprof_stage_setup_us, cullprof_stage_trav_us, cullprof_stage_sort_us;
++#define VITA_STAGE_T() (osg_vita_cullprof_sample ? (unsigned int)sceKernelGetProcessTimeWide() : 0u)
++#else
++#define VITA_STAGE_T() 0u
++#endif
+ 
+ bool SceneView::cullStage(const osg::Matrixd& projection,const osg::Matrixd& modelview,osgUtil::CullVisitor* cullVisitor, osgUtil::StateGraph* rendergraph, osgUtil::RenderStage* renderStage, osg::Viewport *viewport)
+ {
++    const unsigned int vitaStage0 = VITA_STAGE_T();
+ 
+     if (!_camera || !viewport) return false;
+ 
+@@ -887,11 +897,13 @@
+     // traverse the scene graph to generate the rendergraph.
+     // If the camera has a cullCallback execute the callback which has the
+     // requirement that it must traverse the camera's children.
++    const unsigned int vitaStage1 = VITA_STAGE_T();
+     {
+        osg::Callback* callback = _camera->getCullCallback();
+        if (callback) callback->run(_camera.get(), cullVisitor);
+        else cullVisitor->traverse(*_camera);
+     }
++    const unsigned int vitaStage2 = VITA_STAGE_T();
+ 
+ 
+     cullVisitor->popModelViewMatrix();
+@@ -914,6 +926,14 @@
+ 
+     // set the number of dynamic objects in the scene.
+     _dynamicObjectCount += renderStage->computeNumberOfDynamicRenderLeaves();
++#ifdef __vita__
++    if (osg_vita_cullprof_sample)
++    {
++        cullprof_stage_setup_us += vitaStage1 - vitaStage0;
++        cullprof_stage_trav_us += vitaStage2 - vitaStage1;
++        cullprof_stage_sort_us += (unsigned int)sceKernelGetProcessTimeWide() - vitaStage2;
++    }
++#endif
+ 
+ 
+     bool computeNearFar = (cullVisitor->getComputeNearFarMode()!=osgUtil::CullVisitor::DO_NOT_COMPUTE_NEAR_FAR) && getSceneData()!=0;

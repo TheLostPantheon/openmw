@@ -1,5 +1,14 @@
 #include "resourcesystem.hpp"
 
+#include "bulletshapemanager.hpp"
+
+#ifdef __vita__
+#include <algorithm>
+#include <cstdlib>
+#include <cxxabi.h>
+#include <typeinfo>
+#endif
+
 #include <algorithm>
 
 #include "animblendrulesmanager.hpp"
@@ -135,4 +144,44 @@ namespace Resource
             (*it)->releaseGLObjects(state);
     }
 
+
+#ifdef __vita__
+    void ResourceSystem::vitaSetFastTravelExpiry(double objectExpiry, double keyframeExpiry, double otherExpiry)
+    {
+        for (BaseResourceManager* manager : mResourceManagers)
+        {
+            if (manager == static_cast<BaseResourceManager*>(mSceneManager.get())
+                || dynamic_cast<BulletShapeManager*>(manager) != nullptr)
+                manager->setExpiryDelay(objectExpiry);
+            else if (manager == static_cast<BaseResourceManager*>(mKeyframeManager.get()))
+                manager->setExpiryDelay(keyframeExpiry);
+            else
+                manager->setExpiryDelay(otherExpiry);
+        }
+        mNifFileManager->setExpiryDelay(0.0);
+    }
+
+    std::string ResourceSystem::vitaClearCachesMeasured(const std::function<std::size_t()>& heapBytes)
+    {
+        std::vector<BaseResourceManager*> order = mResourceManagers;
+        std::stable_partition(order.begin(), order.end(),
+            [this](BaseResourceManager* m) { return m == static_cast<BaseResourceManager*>(mSceneManager.get()); });
+        std::string out;
+        for (BaseResourceManager* manager : order)
+        {
+            int status = 0;
+            char* demangled = abi::__cxa_demangle(typeid(*manager).name(), nullptr, nullptr, &status);
+            std::string name = status == 0 && demangled ? demangled : typeid(*manager).name();
+            std::free(demangled);
+            const std::size_t colon = name.rfind("::");
+            if (colon != std::string::npos)
+                name = name.substr(colon + 2);
+            const std::size_t before = heapBytes();
+            manager->clearCache();
+            const std::size_t after = heapBytes();
+            out += ' ' + name + '=' + std::to_string(((long long)before - (long long)after) / 1024) + 'K';
+        }
+        return out;
+    }
+#endif
 }

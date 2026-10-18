@@ -1,5 +1,11 @@
 #include "imagemanager.hpp"
 
+#ifdef __vita__
+#include <chrono>
+#include <cstdio>
+extern "C" void vitaBreadcrumb(const char* msg);
+#endif
+
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -14,6 +20,8 @@
 #include <ctime>
 #include <malloc.h>
 #include <components/settings/values.hpp>
+
+extern "C" unsigned int _newlib_heap_size_user;
 #endif
 
 #include "objectcache.hpp"
@@ -37,6 +45,13 @@ namespace
             s_lastSec = now;
         }
         return s_cachedMB;
+    }
+
+    // Same budget the streaming gates use (heap minus the reserve).
+    int heapBudgetMB()
+    {
+        return static_cast<int>(_newlib_heap_size_user / (1024 * 1024))
+            - Settings::general().mVitaMemoryReserveMb;
     }
 }
 #endif
@@ -377,6 +392,14 @@ namespace Resource
         return true;
     }
 
+#ifdef __vita__
+    void ImageManager::vitaInsertImage(VFS::Path::NormalizedView path, osg::ref_ptr<osg::Image> image)
+    {
+        if (image)
+            mCache->addEntryToObjectCache(path.value(), image);
+    }
+#endif
+
     osg::ref_ptr<osg::Image> ImageManager::getImage(VFS::Path::NormalizedView path, bool disableFlip)
     {
         osg::ref_ptr<osg::Object> obj = mCache->getRefFromObjectCache(path);
@@ -428,8 +451,26 @@ namespace Resource
                 stream->seekg(0);
             }
 
+#ifdef __vita__
+            const auto vitaImgT0 = std::chrono::steady_clock::now();
+#endif
             osgDB::ReaderWriter::ReadResult result
                 = reader->readImage(*stream, disableFlip ? mOptionsNoFlip : mOptions);
+#ifdef __vita__
+            {
+                // Per-image decode cost: names texture reads that dominate
+                // a model's "parse" time in [LoadSplit].
+                const int ims = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - vitaImgT0)
+                                    .count();
+                if (ims >= 15)
+                {
+                    char ib[200];
+                    snprintf(ib, sizeof(ib), "[ImgLoad] %dms %.140s", ims, std::string(path.value()).c_str());
+                    vitaBreadcrumb(ib);
+                }
+            }
+#endif
             if (!result.success())
             {
                 Log(Debug::Error) << "Error loading " << path << ": " << result.message() << " code "
@@ -452,9 +493,12 @@ namespace Resource
 
                 // Mipless DXT stays compressed too (single-level upload);
                 // GXM samples base level when no chain is present.
+                // Non-POT DXT stays compressed as well: vitaGL pads block-
+                // compressed uploads to POT itself (nearest_po2 in
+                // gpu_alloc_compressed_texture), so the POT gate here only
+                // forced a software decode of every NPOT DXT (100-500ms).
                 const bool keepCompressed = Settings::general().mVitaKeepCompressedTextures && isDXT
-                    && image->r() == 1 && isPowerOfTwo(image->s()) && isPowerOfTwo(image->t())
-                    && image->isDataContiguous();
+                    && image->r() == 1 && image->isDataContiguous();
 
                 if (!keepCompressed)
                 {
@@ -480,13 +524,11 @@ namespace Resource
             // Cap world textures; skip UI/normal/spec; atlases get a higher
             // cap so individual tiles inside stay usable.
             //
-            // Caps come from Settings::general().mVitaTextureDetail. Tuned at
-            // boot from the in-game Vita Settings tab; "off" disables the cap
-            // entirely. We deliberately re-read the setting on every image
-            // load rather than cache: the value is rarely changed mid-session
-            // (restart-required UX), the lookup is O(log n) on a string, and
-            // skipping the cache avoids any "old textures still using prior
-            // cap" surprise after a runtime change.
+            // Caps come from Settings::general().mVitaTextureDetail, read once
+            // at the first load: the Vita tab says restart, and a mid-session
+            // switch mixed full-size and capped textures in memory (a switch
+            // to "off" filled the heap and the switch back freed nothing that
+            // was already loaded). "off" disables the cap.
             {
                 std::string_view p = path.value();
                 bool isUI = p.find("menu") != std::string_view::npos
@@ -505,7 +547,7 @@ namespace Resource
 
                 int worldCap = 64, atlasCap = 512; // performance preset
                 bool downsampleEnabled = true;
-                const std::string& preset = Settings::general().mVitaTextureDetail.get();
+                static const std::string preset = Settings::general().mVitaTextureDetail.get();
                 if (preset == "balanced") { worldCap = 128; atlasCap = 768; }
                 else if (preset == "high") { worldCap = 256; atlasCap = 1024; }
                 else if (preset == "off")  { downsampleEnabled = false; }
@@ -514,25 +556,23 @@ namespace Resource
                 // texture loads below what the user selected. Existing
                 // cached textures hold their size until cache expiry; over
                 // a few seconds of high pressure the texture mix shifts
-                // toward what the heap can afford. The thresholds sit just
-                // below the MemWatchdog flush trigger (budget - 20 =
-                // 244 MB on the 320 MB heap config) so tier-down kicks in
-                // BEFORE the watchdog fires, easing pressure pre-emptively.
-                // "off" stays off — opt-in users get their full textures.
-                if (downsampleEnabled)
+                // toward what the heap can afford. Thresholds follow the
+                // streaming budget: balanced caps (the default preset, so
+                // this only touches "high") from budget - 14, performance
+                // caps from just below the urgent streaming gate
+                // (budget - 8), "off" included there: full textures that hold
+                // the heap at the gate stop streaming altogether.
                 {
                     const int heapMB = getCachedHeapUsedMB();
-                    if (heapMB > 270)
+                    const int budgetMB = heapBudgetMB();
+                    if (heapMB > budgetMB - 8)
                     {
-                        // Emergency: clamp to performance caps regardless
-                        // of preset. Same numbers as the "performance"
-                        // tier above.
+                        downsampleEnabled = true;
                         worldCap = std::min(worldCap, 64);
                         atlasCap = std::min(atlasCap, 512);
                     }
-                    else if (heapMB > 240)
+                    else if (downsampleEnabled && heapMB > budgetMB - 14)
                     {
-                        // Moderate pressure: clamp to balanced caps.
                         worldCap = std::min(worldCap, 128);
                         atlasCap = std::min(atlasCap, 768);
                     }

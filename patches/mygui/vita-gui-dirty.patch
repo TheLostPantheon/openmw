@@ -1,5 +1,5 @@
---- a/MyGUIEngine/include/MyGUI_ILayer.h
-+++ b/MyGUIEngine/include/MyGUI_ILayer.h
+--- a/MyGUIEngine/include/MyGUI_ILayer.h	2026-08-18 11:42:15.432749561 -0600
++++ b/MyGUIEngine/include/MyGUI_ILayer.h	2026-08-18 11:42:15.410749561 -0600
 @@ -60,6 +60,14 @@
  		// render layer
  		virtual void renderToTarget(IRenderTarget* _target, bool _update) = 0;
@@ -15,3 +15,773 @@
  		virtual void resizeView(const IntSize& _viewSize) = 0;
  
  	protected:
+--- a/MyGUIEngine/include/MyGUI_ISubWidget.h
++++ b/MyGUIEngine/include/MyGUI_ISubWidget.h
+@@ -15,6 +15,23 @@
+ #include "MyGUI_IStateInfo.h"
+ #include "MyGUI_IObject.h"
+ 
++#ifdef __vita__
++// Vita GUI-dirty attribution probe: every sub-widget dirty site reports
++// itself. Weak hook; absent = no-op.
++namespace MyGUI { class ISubWidget; }
++extern "C" void vitaGuiSubDirty(MyGUI::ISubWidget* sub) __attribute__((weak));
++#define VITA_GUI_DIRTY_NOTE(sub) do { if (vitaGuiSubDirty) vitaGuiSubDirty(sub); } while (0)
++// Bumped wherever a layer, layer node or render item is marked out of date,
++// so the renderer can skip its per-frame isOutOfDate walk of every layer
++// while it has not moved. An expression: usable after an unbraced if.
++// Defined in MyGUI_RenderItem.cpp.
++extern "C" volatile unsigned int vita_gui_dirty_gen;
++#define VITA_GUI_GEN_BUMP() (++vita_gui_dirty_gen)
++#else
++#define VITA_GUI_DIRTY_NOTE(sub) do { } while (0)
++#define VITA_GUI_GEN_BUMP() ((void)0)
++#endif
++
+ namespace MyGUI
+ {
+ 
+--- a/MyGUIEngine/src/MyGUI_EditText.cpp	2026-08-18 11:42:15.432749561 -0600
++++ b/MyGUIEngine/src/MyGUI_EditText.cpp	2026-08-18 11:42:15.410749561 -0600
+@@ -33,13 +33,13 @@
+ 		mVisible = _visible;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void EditText::_correctView()
+ 	{
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void EditText::_setAlign(const IntSize& _oldsize)
+@@ -114,7 +114,7 @@
+ 
+ 				// обновить перед выходом
+ 				if (nullptr != mNode)
+-					mNode->outOfDate(mRenderItem);
++					{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 				return;
+ 			}
+ 		}
+@@ -130,7 +130,7 @@
+ 		mIsMargin = margin;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void EditText::setCaption(const UString& _value)
+@@ -142,7 +142,7 @@
+ 		checkVertexSize();
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void EditText::checkVertexSize()
+@@ -185,7 +185,7 @@
+ 		mInverseColourNative = mCurrentColourNative ^ 0x00FFFFFF;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	const Colour& EditText::getTextColour() const
+@@ -204,7 +204,7 @@
+ 		mInverseColourNative = mCurrentColourNative ^ 0x00FFFFFF;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void EditText::setFontName(std::string_view _value)
+@@ -239,7 +239,7 @@
+ 		}
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	std::string_view EditText::getFontName() const
+@@ -257,7 +257,7 @@
+ 		mTextOutDate = true;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	int EditText::getFontHeight() const
+@@ -304,7 +304,7 @@
+ 		mEndSelect = _end;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	bool EditText::getSelectBackground() const
+@@ -319,7 +319,7 @@
+ 		mBackgroundNormal = _normal;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	bool EditText::isVisibleCursor() const
+@@ -334,7 +334,7 @@
+ 		mVisibleCursor = _value;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	size_t EditText::getCursorPosition() const
+@@ -349,7 +349,7 @@
+ 		mCursorPosition = _index;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void EditText::setTextAlign(Align _value)
+@@ -357,7 +357,7 @@
+ 		mTextAlign = _value;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	Align EditText::getTextAlign() const
+@@ -396,7 +396,7 @@
+ 		mViewOffset = _point;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	IntPoint EditText::getViewOffset() const
+@@ -443,7 +443,7 @@
+ 		mShiftText = _value;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void EditText::setWordWrap(bool _value)
+@@ -452,7 +452,7 @@
+ 		mTextOutDate = true;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void EditText::updateRawData() const
+@@ -604,7 +604,7 @@
+ 		mInvertSelect = _value;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	bool EditText::getInvertSelected() const
+@@ -625,7 +625,7 @@
+ 		checkVertexSize();
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void EditText::setShadowColour(const Colour& _value)
+@@ -636,7 +636,7 @@
+ 		mShadowColourNative = (mShadowColourNative & 0x00FFFFFF) | getMixedNativeAlpha(mShadowColour.alpha);
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	const Colour& EditText::getShadowColour() const
+--- a/MyGUIEngine/src/MyGUI_PolygonalSkin.cpp	2026-08-18 11:42:15.432749561 -0600
++++ b/MyGUIEngine/src/MyGUI_PolygonalSkin.cpp	2026-08-18 11:42:15.419549560 -0600
+@@ -93,7 +93,7 @@
+ 		mGeometryOutdated = true;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void PolygonalSkin::setAlpha(float _alpha)
+@@ -102,7 +102,7 @@
+ 		mCurrentColour = (mCurrentColour & 0x00FFFFFF) | (alpha & 0xFF000000);
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void PolygonalSkin::_correctView()
+@@ -110,7 +110,7 @@
+ 		mGeometryOutdated = true;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void PolygonalSkin::_setAlign(const IntSize& _oldsize)
+@@ -176,7 +176,7 @@
+ 
+ 				// обновить перед выходом
+ 				if (nullptr != mNode)
+-					mNode->outOfDate(mRenderItem);
++					{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 				return;
+ 			}
+ 		}
+@@ -192,7 +192,7 @@
+ 		mIsMargin = margin;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void PolygonalSkin::createDrawItem(ITexture* _texture, ILayerNode* _node)
+@@ -253,7 +253,7 @@
+ 		mCurrentColour = (colour & 0x00FFFFFF) | (mCurrentColour & 0xFF000000);
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void PolygonalSkin::setStateData(IStateInfo* _data)
+@@ -268,7 +268,7 @@
+ 		mGeometryOutdated = true;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void PolygonalSkin::_rebuildGeometry()
+--- a/MyGUIEngine/src/MyGUI_RenderItem.cpp
++++ b/MyGUIEngine/src/MyGUI_RenderItem.cpp
+@@ -7,11 +7,16 @@
+ #include "MyGUI_Precompiled.h"
+ #include "MyGUI_RenderItem.h"
+ #include "MyGUI_LayerNode.h"
++#include "MyGUI_ISubWidget.h"
+ #include "MyGUI_LayerManager.h"
+ #include "MyGUI_Gui.h"
+ #include "MyGUI_RenderManager.h"
+ #include "MyGUI_DataManager.h"
+ 
++#ifdef __vita__
++extern "C" volatile unsigned int vita_gui_dirty_gen = 0;
++#endif
++
+ namespace MyGUI
+ {
+ 
+@@ -92,7 +97,7 @@
+ 			{
+ 				mNeedVertexCount -= (*iter).second;
+ 				mDrawItems.erase(iter);
+-				mOutOfDate = true;
++				mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 				mVertexBuffer->setVertexCount(mNeedVertexCount);
+ 
+@@ -121,7 +126,7 @@
+ 
+ 		mDrawItems.emplace_back(_item, _count);
+ 		mNeedVertexCount += _count;
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 		mVertexBuffer->setVertexCount(mNeedVertexCount);
+ 	}
+@@ -138,7 +143,7 @@
+ 					mNeedVertexCount -= item.second;
+ 					mNeedVertexCount += _count;
+ 					item.second = _count;
+-					mOutOfDate = true;
++					mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 					mVertexBuffer->setVertexCount(mNeedVertexCount);
+ 				}
+@@ -186,12 +191,14 @@
+ 
+ 	void RenderItem::outOfDate()
+ 	{
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 	}
+ 
+ 	bool RenderItem::isOutOfDate() const
+ 	{
+-		return mOutOfDate;
++		// Vita: textureless items render nothing and renderToTarget
++		// early-outs before clearing the flag; report them clean.
++		return mOutOfDate && (mTexture != nullptr);
+ 	}
+ 
+ 	size_t RenderItem::getNeedVertexCount() const
+--- a/MyGUIEngine/src/MyGUI_RotatingSkin.cpp	2026-08-18 11:42:15.432749561 -0600
++++ b/MyGUIEngine/src/MyGUI_RotatingSkin.cpp	2026-08-18 11:42:15.415149562 -0600
+@@ -25,7 +25,7 @@
+ 		mGeometryOutdated = true;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void RotatingSkin::setCenter(const IntPoint& _center)
+@@ -34,7 +34,7 @@
+ 		mGeometryOutdated = true;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	IntPoint RotatingSkin::getCenter(bool _local) const
+@@ -51,7 +51,7 @@
+ 		mGeometryOutdated = true;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void RotatingSkin::setAlpha(float _alpha)
+@@ -60,7 +60,7 @@
+ 		mCurrentColour = (mCurrentColour & 0x00FFFFFF) | (alpha & 0xFF000000);
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void RotatingSkin::_correctView()
+@@ -68,7 +68,7 @@
+ 		mGeometryOutdated = true;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void RotatingSkin::_setAlign(const IntSize& _oldsize)
+@@ -119,7 +119,7 @@
+ 		mGeometryOutdated = true;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void RotatingSkin::createDrawItem(ITexture* _texture, ILayerNode* _node)
+@@ -189,7 +189,7 @@
+ 		mCurrentColour = (colour & 0x00FFFFFF) | (mCurrentColour & 0xFF000000);
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void RotatingSkin::setStateData(IStateInfo* _data)
+@@ -209,7 +209,7 @@
+ 		mGeometryOutdated = true;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	inline float len(float x, float y)
+--- a/MyGUIEngine/src/MyGUI_SharedLayer.cpp
++++ b/MyGUIEngine/src/MyGUI_SharedLayer.cpp
+@@ -8,6 +8,7 @@
+ #include "MyGUI_LayerItem.h"
+ #include "MyGUI_SharedLayer.h"
+ #include "MyGUI_LayerNode.h"
++#include "MyGUI_ISubWidget.h"
+ #include "MyGUI_RenderManager.h"
+ 
+ namespace MyGUI
+@@ -60,7 +61,7 @@
+ 
+ 		mChildItem->addUsing();
+ 
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 		return mChildItem;
+ 	}
+@@ -77,7 +78,7 @@
+ 				mChildItem = nullptr;
+ 			}
+ 
+-			mOutOfDate = true;
++			mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 			return;
+ 		}
+@@ -91,7 +92,7 @@
+ 		if (parent != nullptr)
+ 			parent->upChildItemNode(_item);
+ 
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 	}
+ 
+ 	ILayerItem* SharedLayer::getLayerItemByPoint(int _left, int _top) const
+@@ -167,7 +168,8 @@
+ 
+ 	bool SharedLayer::isOutOfDate() const
+ 	{
+-		if (mChildItem->isOutOfDate())
++		// Vita: mChildItem is created lazily on first attach.
++		if (mChildItem != nullptr && mChildItem->isOutOfDate())
+ 			return true;
+ 
+ 		return mOutOfDate;
+--- a/MyGUIEngine/src/MyGUI_SubSkin.cpp	2026-08-18 11:42:15.432749561 -0600
++++ b/MyGUIEngine/src/MyGUI_SubSkin.cpp	2026-08-18 11:42:15.415149562 -0600
+@@ -29,7 +29,7 @@
+ 		mVisible = _visible;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void SubSkin::setAlpha(float _alpha)
+@@ -38,13 +38,13 @@
+ 		mCurrentColour = (mCurrentColour & 0x00FFFFFF) | (alpha & 0xFF000000);
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void SubSkin::_correctView()
+ 	{
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void SubSkin::_setAlign(const IntSize& _oldsize)
+@@ -109,7 +109,7 @@
+ 
+ 				// обновить перед выходом
+ 				if (nullptr != mNode)
+-					mNode->outOfDate(mRenderItem);
++					{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 				return;
+ 			}
+ 		}
+@@ -150,7 +150,7 @@
+ 		mIsMargin = margin;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void SubSkin::createDrawItem(ITexture* _texture, ILayerNode* _node)
+@@ -202,7 +202,7 @@
+ 		}
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void SubSkin::doRender()
+@@ -250,7 +250,7 @@
+ 		mCurrentColour = (colour & 0x00FFFFFF) | (mCurrentColour & 0xFF000000);
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void SubSkin::setStateData(IStateInfo* _data)
+--- a/MyGUIEngine/src/MyGUI_TileRect.cpp	2026-08-18 11:42:15.432749561 -0600
++++ b/MyGUIEngine/src/MyGUI_TileRect.cpp	2026-08-18 11:42:15.415149562 -0600
+@@ -32,7 +32,7 @@
+ 		mVisible = _visible;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void TileRect::setAlpha(float _alpha)
+@@ -41,13 +41,13 @@
+ 		mCurrentColour = (mCurrentColour & 0x00FFFFFF) | (alpha & 0xFF000000);
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void TileRect::_correctView()
+ 	{
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void TileRect::_setAlign(const IntSize& _oldsize)
+@@ -143,7 +143,7 @@
+ 
+ 				// обновить перед выходом
+ 				if (nullptr != mNode)
+-					mNode->outOfDate(mRenderItem);
++					{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 				return;
+ 			}
+ 		}
+@@ -152,14 +152,14 @@
+ 		mIsMargin = margin;
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void TileRect::_setUVSet(const FloatRect& _rect)
+ 	{
+ 		mCurrentTexture = _rect;
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ 	void TileRect::doRender()
+@@ -353,7 +353,7 @@
+ 		mCurrentColour = (colour & 0x00FFFFFF) | (mCurrentColour & 0xFF000000);
+ 
+ 		if (nullptr != mNode)
+-			mNode->outOfDate(mRenderItem);
++			{ VITA_GUI_DIRTY_NOTE(this); mNode->outOfDate(mRenderItem); }
+ 	}
+ 
+ } // namespace MyGUI
+--- a/MyGUIEngine/src/MyGUI_LayerNode.cpp
++++ b/MyGUIEngine/src/MyGUI_LayerNode.cpp
+@@ -8,6 +8,9 @@
+ #include "MyGUI_LayerNode.h"
+ #include "MyGUI_ILayerItem.h"
+ #include "MyGUI_ITexture.h"
++#ifdef __vita__
++#include "MyGUI_Widget.h"
++#endif
+ #include "MyGUI_ISubWidget.h"
+ #include "MyGUI_ISubWidgetText.h"
+ 
+@@ -40,7 +43,7 @@
+ 		LayerNode* layer = new LayerNode(mLayer, this);
+ 		mChildItems.push_back(layer);
+ 
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 		return layer;
+ 	}
+@@ -54,7 +57,7 @@
+ 				delete _node;
+ 				mChildItems.erase(iter);
+ 
+-				mOutOfDate = true;
++				mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 				return;
+ 			}
+@@ -71,7 +74,7 @@
+ 				mChildItems.erase(iter);
+ 				mChildItems.push_back(_item);
+ 
+-				mOutOfDate = true;
++				mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 				return;
+ 			}
+@@ -101,7 +104,22 @@
+ 			childItem->renderToTarget(_target, _update);
+ 
+ 		mOutOfDate = false;
++	}
++
++#ifdef __vita__
++	bool LayerNode::vitaHasVisibleItem() const
++	{
++		if (mLayerItems.empty())
++			return true; // no known owner: keep walking
++		for (ILayerItem* item : mLayerItems)
++		{
++			const Widget* widget = dynamic_cast<const Widget*>(item);
++			if (widget == nullptr || widget->getVisible())
++				return true;
++		}
++		return false;
+ 	}
++#endif
+ 
+ 	void LayerNode::resizeView(const IntSize& _viewSize)
+ 	{
+@@ -157,7 +175,7 @@
+ 		}
+ 
+ 		mOutOfDateCompression = true;
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 		// first queue keep order
+ 
+@@ -221,7 +239,7 @@
+ 		mLayerItems.push_back(_item);
+ 		_item->attachItemToNode(mLayer, this);
+ 
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 	}
+ 
+ 	void LayerNode::detachLayerItem(ILayerItem* _item)
+@@ -232,7 +250,7 @@
+ 			{
+ 				mLayerItems.erase(iter);
+ 
+-				mOutOfDate = true;
++				mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 				return;
+ 			}
+@@ -242,7 +260,7 @@
+ 
+ 	void LayerNode::outOfDate(RenderItem* _item)
+ 	{
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 		if (_item)
+ 			_item->outOfDate();
+ 	}
+--- a/MyGUIEngine/src/MyGUI_OverlappedLayer.cpp
++++ b/MyGUIEngine/src/MyGUI_OverlappedLayer.cpp
+@@ -8,6 +8,7 @@
+ #include "MyGUI_LayerItem.h"
+ #include "MyGUI_OverlappedLayer.h"
+ #include "MyGUI_LayerNode.h"
++#include "MyGUI_ISubWidget.h"
+ #include "MyGUI_RenderManager.h"
+ 
+ namespace MyGUI
+@@ -59,7 +60,7 @@
+ 		ILayerNode* node = new LayerNode(this);
+ 		mChildItems.push_back(node);
+ 
+-		mOutOfDate = true;
++		mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 		return node;
+ 	}
+@@ -72,7 +73,7 @@
+ 		{
+ 			parent->destroyChildItemNode(_item);
+ 
+-			mOutOfDate = true;
++			mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 			return;
+ 		}
+@@ -85,7 +86,7 @@
+ 				delete _item;
+ 				mChildItems.erase(iter);
+ 
+-				mOutOfDate = true;
++				mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 				return;
+ 			}
+@@ -102,7 +103,7 @@
+ 		{
+ 			parent->upChildItemNode(_item);
+ 
+-			mOutOfDate = true;
++			mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 			return;
+ 		}
+@@ -117,7 +118,7 @@
+ 				mChildItems.erase(iter);
+ 				mChildItems.push_back(_item);
+ 
+-				mOutOfDate = true;
++				mOutOfDate = true, VITA_GUI_GEN_BUMP();
+ 
+ 				return;
+ 			}
+@@ -150,7 +151,21 @@
+ 	void OverlappedLayer::renderToTarget(IRenderTarget* _target, bool _update)
+ 	{
+ 		for (auto& childItem : mChildItems)
++		{
++#ifdef __vita__
++			// A hidden window renders nothing, yet walking its node tree
++			// (OpenMW keeps the inventory, map, stats and settings windows
++			// built while closed) was most of every GUI rebuild. Showing it
++			// marks its items out of date, so it rebuilds when it appears.
++			if (!_update)
++			{
++				const LayerNode* node = dynamic_cast<const LayerNode*>(childItem);
++				if (node != nullptr && !node->vitaHasVisibleItem())
++					continue;
++			}
++#endif
+ 			childItem->renderToTarget(_target, _update);
++		}
+ 
+ 		mOutOfDate = false;
+ 	}
+--- a/MyGUIEngine/include/MyGUI_LayerNode.h
++++ b/MyGUIEngine/include/MyGUI_LayerNode.h
+@@ -62,6 +62,12 @@
+ 		// рисует леер
+ 		void renderToTarget(IRenderTarget* _target, bool _update) override;
+ 
++#ifdef __vita__
++		// False when every widget attached to this node is hidden: the node
++		// then renders nothing, and an overlapped layer may skip walking it.
++		bool vitaHasVisibleItem() const;
++#endif
++
+ 		void resizeView(const IntSize& _viewSize) override;
+ 
+ 		float getNodeDepth() const override;

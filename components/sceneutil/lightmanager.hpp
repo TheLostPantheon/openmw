@@ -304,6 +304,17 @@ namespace SceneUtil
         };
         using LightStateSetMap = std::unordered_map<LightIdList, osg::ref_ptr<osg::StateSet>, HashLightIdList>;
         LightStateSetMap mStateSetCache[2];
+#ifdef __vita__
+        // getLightListStateSet: a light combination's state set is updated
+        // once per frame and view, not once per object that uses it.
+        struct VitaUpdateMemo
+        {
+            size_t mFrame = ~size_t(0);
+            const osg::RefMatrix* mView = nullptr;
+        };
+        std::unordered_map<const osg::StateSet*, VitaUpdateMemo> mVitaUpdated;
+        LightIdList mVitaIdScratch; // reused key: no allocation per call
+#endif
 
         std::vector<osg::ref_ptr<osg::StateAttribute>> mDummies;
 
@@ -368,9 +379,29 @@ namespace SceneUtil
 
         bool pushLightState(osg::Node* node, osgUtil::CullVisitor* nv);
 
+#ifdef __vita__
+        /// Static fast path (apps/openmw/vita/VitaStaticRenderer.cpp): as
+        /// pushLightState, for an object whose bound in the current model-view
+        /// frame (the tile, i.e. world) is cached, without pushing its matrix.
+        bool pushLightStateWorldBound(const osg::BoundingSphere& worldBound, osgUtil::CullVisitor* cv);
+        /// Verification: the selection for `worldBound` computed into `out`
+        /// without touching this frame's cached list; false without a light
+        /// manager or when the camera does not light.
+        bool computeLightListWorldBound(
+            const osg::BoundingSphere& worldBound, osgUtil::CullVisitor* cv, LightManager::LightList& out);
+        /// This frame's cached selection (after OSG's own call).
+        const LightManager::LightList& getLightList() const { return mLightList; }
+        size_t getLastFrameNumber() const { return mLastFrameNumber; }
+#endif
+
         std::set<SceneUtil::LightSource*>& getIgnoredLightSources() { return mIgnoredLightSources; }
 
     private:
+        /// Lights intersecting `nodeBound` (view space), capped and sorted as
+        /// pushLightState always did.
+        void selectLights(const osg::BoundingSphere& nodeBound, osgUtil::CullVisitor* cv,
+            const osg::RefMatrix* viewMatrix, size_t frameNumber, LightManager::LightList& out);
+
         LightManager* mLightManager;
         size_t mLastFrameNumber;
         LightManager::LightList mLightList;

@@ -1,7 +1,11 @@
 #ifdef __vita__
 
 #include "VitaInit.h"
+#include "VitaLogServer.h"
+#include "VitaCrashReport.h"
+#include "VitaGLGuard.h"
 #include "VitaGLWorker.h"
+#include "VitaBuildInfo.h"
 
 #include <cxxabi.h>
 #include <pthread.h>
@@ -10,6 +14,7 @@
 
 #include <psp2/ctrl.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/power.h>
@@ -65,6 +70,12 @@ unsigned int sceUserMainThreadStackSize = 2 * 1024 * 1024;
 // Single writer; staleness is the signal.
 volatile uint64_t vita_main_heartbeat_us = 0;
 const char* volatile vita_main_phase = "boot";
+// Worker liveness for the deadman line (report-only).
+volatile int vita_gl_busy = 0;
+volatile int vita_sim_busy = 0;
+volatile int vita_draw_inflight = 0;
+volatile unsigned long long vita_gl_job_start_us = 0;
+const char* volatile vita_gl_phase = "idle";
 
 void vitaMainPhase(const char* phase)
 {
@@ -190,6 +201,17 @@ namespace
     std::atomic<bool> s_logThreadStarted{ false };
     char s_logFlushBuf[kLogRingSize];
 
+    // Spin briefly, then sleep between tries. A pure spin could starve the
+    // lock holder: the flusher runs at priority 191 on any core, and a
+    // higher-priority thread pinned to that core spinning on the lock would
+    // keep it from ever running again (no time slicing between priorities).
+    void logLockAcquire(std::atomic_flag& lock)
+    {
+        for (unsigned spins = 0; lock.test_and_set(std::memory_order_acquire); ++spins)
+            if (spins >= 64)
+                sceKernelDelayThread(50);
+    }
+
     int logFlushThread(SceSize, void*)
     {
         for (;;)
@@ -205,9 +227,17 @@ namespace
                 {
                     sLastReport = now;
                     const char* ph = vita_main_phase;
-                    char db[112];
-                    int n = snprintf(db, sizeof(db), "[Deadman] main silent %us phase=%s\n",
-                        (unsigned)((now - hb) / 1000000ULL), ph ? ph : "?");
+                    const char* glp = vita_gl_phase;
+                    const unsigned glAgeS = vita_gl_busy
+                        ? (unsigned)((now - vita_gl_job_start_us) / 1000000ULL)
+                        : 0u;
+                    char db[160];
+                    int n = snprintf(db, sizeof(db),
+                        "[Deadman] main silent %us phase=%s gl=%d(%us,%s) sim=%d draw=%d\n",
+                        (unsigned)((now - hb) / 1000000ULL), ph ? ph : "?", vita_gl_busy, glAgeS,
+                        glp ? glp : "?", vita_sim_busy, vita_draw_inflight);
+                    if (n >= (int)sizeof(db))
+                        n = (int)sizeof(db) - 1;
                     if (n > 0)
                         logAppend(db, (size_t)n);
                 }
@@ -231,9 +261,7 @@ namespace
     void logAppend(const char* data, size_t len)
     {
         logStartFlusherOnce();
-        while (s_logLock.test_and_set(std::memory_order_acquire))
-        {
-        }
+        logLockAcquire(s_logLock);
         if (s_logHead + len <= kLogRingSize)
         {
             memcpy(s_logRing + s_logHead, data, len);
@@ -245,18 +273,48 @@ namespace
     }
 }
 
+extern "C" int vitaLogFlushTry(void)
+{
+    // Bounded spins on both locks; the crashing thread may hold one.
+    for (int i = 0; s_logIoLock.test_and_set(std::memory_order_acquire); ++i)
+        if (i > 200000)
+            return 0;
+    bool haveData = false;
+    for (int i = 0; s_logLock.test_and_set(std::memory_order_acquire); ++i)
+        if (i > 200000)
+        {
+            s_logIoLock.clear(std::memory_order_release);
+            return 0;
+        }
+    const size_t len = s_logHead;
+    if (len > 0)
+    {
+        memcpy(s_logFlushBuf, s_logRing, len);
+        haveData = true;
+    }
+    s_logHead = 0;
+    s_logLock.clear(std::memory_order_release);
+    if (haveData)
+    {
+        SceUID fd = sceIoOpen("ux0:data/openmw/boot.log", SCE_O_WRONLY | SCE_O_APPEND | SCE_O_CREAT, 0777);
+        if (fd >= 0)
+        {
+            sceIoWrite(fd, s_logFlushBuf, len);
+            sceIoClose(fd);
+        }
+    }
+    s_logIoLock.clear(std::memory_order_release);
+    return 1;
+}
+
 extern "C" void vitaLogFlushNow(void)
 {
     // Copy out under data lock; SD write outside it.
-    while (s_logIoLock.test_and_set(std::memory_order_acquire))
-    {
-    }
+    logLockAcquire(s_logIoLock);
     size_t len;
     unsigned dropped;
     {
-        while (s_logLock.test_and_set(std::memory_order_acquire))
-        {
-        }
+        logLockAcquire(s_logLock);
         len = s_logHead;
         dropped = s_logDropped;
         if (len > 0)
@@ -317,8 +375,15 @@ void vitaMemBreadcrumb(const char* msg)
         s_freeKB = (unsigned int)(mi.fordblks / 1024);
         s_miAt = now;
     }
-    char buf[300];
+    char buf[640];
     int len = snprintf(buf, sizeof(buf), "[VitaMem] %s | used: %uKB | free: %uKB\n", msg, s_usedKB, s_freeKB);
+    // snprintf returns the untruncated length: appending that much read past
+    // the buffer and put stack bytes into boot.log on long audit lines.
+    if (len >= (int)sizeof(buf))
+    {
+        len = (int)sizeof(buf) - 1;
+        buf[len - 1] = '\n';
+    }
     if (len > 0)
         logAppend(buf, (size_t)len);
 }
@@ -1297,6 +1362,12 @@ namespace Vita
     // restores room; resize if it recurs.
     extern "C" const char g_vitaSegmentPad[8192] = { 1 };
 
+    bool vitaRes640Chosen()
+    {
+        SceIoStat st;
+        return sceIoGetstat("ux0:data/openmw/config/res640.txt", &st) >= 0;
+    }
+
     void initialize()
     {
         // Force the linker to keep sceUserMainThreadStackSize — it lives in its
@@ -1306,6 +1377,7 @@ namespace Vita
         // makes the linker treat the section as reachable.
         asm volatile("" :: "m"(sceUserMainThreadStackSize));
         asm volatile("" :: "m"(g_vitaSegmentPad));
+        Vita::glGuardNameThread("main");
 
         // Environment setup (must be after main, not in constructors)
         setenv("TMPDIR", "ux0:data/openmw/cache", 1);
@@ -1340,6 +1412,9 @@ namespace Vita
         sceIoRename("ux0:data/openmw/debug.log", "ux0:data/openmw/debug.log.prev");
 
         breadcrumb("BOOT: Vita::initialize() start");
+        installCrashReporter();
+        pinCurrentThread(0, "main");
+        startLogServerIfEnabled();
 
         // Latch SELECT early so holding it from launch is never missed.
         pollSelectHeld();
@@ -1385,6 +1460,23 @@ namespace Vita
         else
             breadcrumb("BOOT: WARNING - emergency reserve allocation failed");
 
+        // Debug ballast: simulate late-save heap pressure on demand. Drop
+        // ux0:data/openmw/ballast.txt containing an MB count; held for the
+        // whole session.
+        if (FILE* bf = fopen("ux0:data/openmw/ballast.txt", "rb"))
+        {
+            int ballastMB = 0;
+            if (fscanf(bf, "%d", &ballastMB) == 1 && ballastMB > 0 && ballastMB <= 200)
+            {
+                static void* sBallast = malloc((size_t)ballastMB * 1024u * 1024u);
+                char bb[64];
+                snprintf(bb, sizeof(bb), "BOOT: ballast %dMB %s", ballastMB,
+                    sBallast ? "held" : "ALLOC FAILED");
+                breadcrumb(bb);
+            }
+            fclose(bf);
+        }
+
         initClocks();
 
         // Settings load later; peek the raw cfg for the GL-thread flag.
@@ -1419,19 +1511,59 @@ namespace Vita
         // Observed crash in dense interior cells (Shulk Egg Mine repro). Bumping the
         // vertex/fragment/VDM rings 2× each. Param buffer left at default 16 MB.
         const auto vitaInitGL = [&] {
+        // vitaGL's owner is whichever thread runs vglInit (no per-thread
+        // contexts): record it for the GL guard before the first GL call.
+        Vita::glGuardSetOwner();
         vglSetParamBufferSize(16 * 1024 * 1024);
         vglSetVDMBufferSize(256 * 1024);                  // 128 KB → 256 KB
         vglSetVertexBufferSize(8 * 1024 * 1024);          //  2 MB → 8 MB (4 MB still crashed; bumped further)
         vglSetFragmentBufferSize(2 * 1024 * 1024);        // 512 KB → 2 MB
         vglUseTripleBuffering(GL_TRUE);
         vglWaitVblankStart(GL_FALSE);
-        // Display backbuffer at 640x368. vitaGL only guards against
-        // exceeding the max framebuf resolution (960x544); it does NOT
-        // catch widths the Vita display controller refuses to scale.
-        // 768x432 was tried and produced a black screen — keep the
-        // proven-good 640x368 and cap the Render Resolution combo on
-        // the Vita Settings tab at 640x368 (no 720/768 presets).
-        vglInitWithCustomSizes(0x100000, 640, 368,
+        // Display backbuffer: the render resolution from the user's
+        // settings.cfg (read here directly: settings load after this),
+        // when it is a geometry the display controller scales — 480x272,
+        // 640x368, 720x408 or native 960x544. vitaGL only guards against
+        // exceeding 960x544, not unsupported sizes (768x432 was a black
+        // screen). Anything else (512x288) keeps 640x368 as before.
+        int fbW = 640, fbH = 368;
+        {
+            int resX = 0, resY = 0;
+            if (FILE* f = fopen("ux0:data/openmw/config/settings.cfg", "r"))
+            {
+                char line[256];
+                while (fgets(line, sizeof(line), f))
+                {
+                    int v = 0;
+                    if (sscanf(line, " resolution x = %d", &v) == 1)
+                        resX = v;
+                    else if (sscanf(line, " resolution y = %d", &v) == 1)
+                        resY = v;
+                }
+                fclose(f);
+            }
+            // Native 960x544 is the default since 2026-10. A 640x368 left
+            // over from the old default is upgraded, unless the player has
+            // picked 640x368 in the Vita settings tab since (it writes
+            // config/res640.txt). applySettingsOverrides() applies the same
+            // rule to the setting, so window, GUI and backbuffer agree.
+            if (resX == 640 && resY == 368 && !vitaRes640Chosen())
+            {
+                resX = 960;
+                resY = 544;
+            }
+            static constexpr int kModes[][2] = { { 480, 272 }, { 640, 368 }, { 720, 408 }, { 960, 544 } };
+            for (const auto& m : kModes)
+                if (resX == m[0] && resY == m[1])
+                {
+                    fbW = resX;
+                    fbH = resY;
+                }
+            char db[96];
+            snprintf(db, sizeof(db), "[Display] backbuffer %dx%d (settings %dx%d)", fbW, fbH, resX, resY);
+            breadcrumb(db);
+        }
+        vglInitWithCustomSizes(0x100000, fbW, fbH,
             36 * 1024 * 1024,
             88 * 1024 * 1024,
             0,
@@ -1453,7 +1585,11 @@ namespace Vita
             vitaInitGL();
         {
             char bstamp[96];
-            snprintf(bstamp, sizeof(bstamp), "BOOT: build %s %s", __DATE__, __TIME__);
+            snprintf(bstamp, sizeof(bstamp), "BOOT: build %s", buildStamp());
+            breadcrumb(bstamp);
+            // Matches the ELF archived by scripts/vita/archive-build.sh;
+            // scripts/vita/vita_crash.py finds symbols by this line.
+            snprintf(bstamp, sizeof(bstamp), "[Build] id=%s", buildId());
             breadcrumb(bstamp);
         }
         breadcrumb("BOOT: vitaGL initialized");
@@ -1474,6 +1610,27 @@ namespace Vita
     void breadcrumb(const char* msg)
     {
         vitaBreadcrumb(msg);
+    }
+
+    void pinCurrentThread(int core, const char* name)
+    {
+        static const bool sDisabled = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/nopin.txt", &st) >= 0;
+        }();
+        char buf[96];
+        if (sDisabled)
+        {
+            snprintf(buf, sizeof(buf), "[Thread] %s: pinning disabled (nopin.txt)", name);
+            breadcrumb(buf);
+            return;
+        }
+        static const int kMasks[3] = { SCE_KERNEL_CPU_MASK_USER_0, SCE_KERNEL_CPU_MASK_USER_1,
+            SCE_KERNEL_CPU_MASK_USER_2 };
+        const int rc = sceKernelChangeThreadCpuAffinityMask(0, kMasks[core % 3]);
+        snprintf(buf, sizeof(buf), "[Thread] %s pinned to core %d (rc=0x%x, prio %d)", name, core % 3, (unsigned)rc,
+            sceKernelGetThreadCurrentPriority());
+        breadcrumb(buf);
     }
 
     int getHeapUsedMBFresh()
@@ -1538,14 +1695,44 @@ namespace Vita
     {
         debugLog("Applying Vita platform defaults...");
 
+        // Native resolution default (see the backbuffer choice in initialize()).
+        if (Settings::video().mResolutionX.get() == 640 && Settings::video().mResolutionY.get() == 368
+            && !vitaRes640Chosen())
+        {
+            Settings::video().mResolutionX.set(960);
+            Settings::video().mResolutionY.set(544);
+            breadcrumb("[Display] 640x368 (old default) upgraded to 960x544");
+        }
+
         // --- Video: resolution X/Y are NOT forced — bundled settings.cfg
         // supplies 640x368 as the default (matches the vglInit backbuffer
         // 1:1), and the Vita Settings tab exposes 480x272 / 512x288 /
         // 640x368. See vglInitWithCustomSizes in initialize() for why
-        // higher widths aren't offered. Antialiasing and framerate cap
-        // stay forced.
+        // higher widths aren't offered. Antialiasing stays forced.
         Settings::video().mAntialiasing.set(0);
-        Settings::video().mFramerateLimit.set(30.0f);
+        // Frame cap: locked 30 or uncapped (0), chosen in the Vita settings
+        // tab. Any other value (the desktop default is 300) means locked 30.
+        if (Settings::video().mFramerateLimit != 0.f)
+            Settings::video().mFramerateLimit.set(30.0f);
+
+        // Small-feature culling: the old default (8 px at 640x368) hid too
+        // much; move it once to Balanced (5). Strong (8) chosen in the Vita
+        // settings tab afterwards stays.
+        if (FILE* mark = fopen("ux0:data/openmw/config/cull-v2.txt", "rb"))
+            fclose(mark);
+        else
+        {
+            if (Settings::camera().mSmallFeatureCullingPixelSize == 8.f)
+            {
+                Settings::camera().mSmallFeatureCullingPixelSize.set(5.f);
+                breadcrumb("[Display] small feature culling 8 (old default) moved to 5");
+            }
+            if (FILE* f = fopen("ux0:data/openmw/config/cull-v2.txt", "w"))
+            {
+                fputs("small feature culling default moved to 5\n", f);
+                fclose(f);
+            }
+        }
 
         // --- Shaders: FFP only (vitaGL cannot compile OpenMW GLSL shaders) ---
         Settings::shaders().mLightingMethod.set(SceneUtil::LightingMethod::FFP);

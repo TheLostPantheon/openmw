@@ -91,12 +91,43 @@
 
 #ifdef __vita__
 #include <components/vita/VitaShader.h>
+#include "../vita/VitaCullTimer.h"
 #include "../vita/VitaInit.h"
+#ifdef __vita__
+#include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
+namespace MWPhysics
+{
+    extern uint64_t gVitaQueryLockUs, gVitaQueryUs;
+    extern unsigned gVitaQueryCalls;
+    extern uint32_t gVitaSimQueryLockUs, gVitaSimQueryUs, gVitaSimQueryCalls;
+    extern uint32_t gVitaPhysStepUs, gVitaPhysSteps, gVitaPhysLosUs;
+    extern uint32_t gVitaPhysActorSolves, gVitaPhysIdleSkips;
+    extern uint32_t gVitaSweeps, gVitaSweepUs;
+    extern int gVitaPhysThreadUid;
+}
+#endif
+#include "../vita/VitaSimWorker.h"
 #include <osg/GL>
 #endif
 
 namespace MWRender
 {
+    namespace
+    {
+        // The cutoff is in screen pixels. On Vita it is tuned at 640x368;
+        // scale it to the render width so native 960x544 culls the same
+        // small objects (each still costs cull and a draw call there).
+        float smallFeatureCullingPixelSize()
+        {
+            float px = Settings::camera().mSmallFeatureCullingPixelSize;
+#ifdef __vita__
+            px *= std::max(1.f, static_cast<float>(Settings::video().mResolutionX.get()) / 640.f);
+#endif
+            return px;
+        }
+    }
+
     class PerViewUniformStateUpdater final : public SceneUtil::StateSetUpdater
     {
     public:
@@ -422,6 +453,10 @@ namespace MWRender
         sceneRoot->setStartLight(1);
         sceneRoot->setNodeMask(Mask_Scene);
         sceneRoot->setName("Scene Root");
+#ifdef __vita__
+        Vita::addCullTimer(mRootNode, Vita::CullTotal);
+        Vita::addCullTimer(sceneRoot, Vita::CullScene);
+#endif
 
         int shadowCastingTraversalMask = Mask_Scene;
         if (Settings::shadows().mActorShadows)
@@ -625,7 +660,7 @@ namespace MWRender
             cullingMode &= ~(osg::CullStack::SMALL_FEATURE_CULLING);
         else
         {
-            mViewer->getCamera()->setSmallFeatureCullingPixelSize(Settings::camera().mSmallFeatureCullingPixelSize);
+            mViewer->getCamera()->setSmallFeatureCullingPixelSize(smallFeatureCullingPixelSize());
             cullingMode |= osg::CullStack::SMALL_FEATURE_CULLING;
         }
 
@@ -967,17 +1002,38 @@ namespace MWRender
 
     void RenderingManager::update(float dt, bool paused)
     {
+#ifdef __vita__
+        // [RendUpd]: where the main thread's rendering update goes (4.4 ms a
+        // frame in a dense town). Steps: stats, shaders, water, effects,
+        // sky, nav, camera, fog + scene uniforms.
+        static uint64_t sRuUs[8] = {};
+        static unsigned sRuFrames = 0;
+        uint64_t ruT = sceKernelGetProcessTimeWide();
+        const auto ruLap = [&ruT](int step) {
+            const uint64_t now = sceKernelGetProcessTimeWide();
+            sRuUs[step] += now - ruT;
+            ruT = now;
+        };
+#define VITA_RU_LAP(step) ruLap(step)
+#else
+#define VITA_RU_LAP(step)
+#endif
         reportStats();
+        VITA_RU_LAP(0);
 
         mResourceSystem->getSceneManager()->getShaderManager().update(*mViewer);
+        VITA_RU_LAP(1);
 
         mWater->setRainIntensity(mSky->getRainRipplesEnabled() ? mSky->getPrecipitationAlpha() : 0.f);
 
         mWater->update(dt, paused);
+        VITA_RU_LAP(2);
         if (!paused)
         {
             mEffectManager->update(dt);
+            VITA_RU_LAP(3);
             mSky->update(dt);
+            VITA_RU_LAP(4);
 
             const MWWorld::Ptr& player = mPlayerAnimation->getPtr();
             osg::Vec3f playerPos(player.getRefData().getPosition().asVec3());
@@ -989,6 +1045,7 @@ namespace MWRender
 
         updateNavMesh();
         updateRecastMesh();
+        VITA_RU_LAP(5);
 
         if (mUpdateProjectionMatrix)
         {
@@ -996,6 +1053,7 @@ namespace MWRender
             updateProjectionMatrix();
         }
         mCamera->update(dt, paused);
+        VITA_RU_LAP(6);
 
         bool isUnderwater = mWater->isUnderwater(mCamera->getPosition());
 
@@ -1044,6 +1102,75 @@ namespace MWRender
 
         Vita::updateSceneUniforms(mSceneRoot->getOrCreateStateSet(), sunDirView, sunColor, ambient,
             fogStart, fogEnd, fogColor);
+        VITA_RU_LAP(7);
+        if (++sRuFrames >= 150)
+        {
+            char rb[320];
+            snprintf(rb, sizeof(rb),
+                "[RendUpd] stats=%.2f shaders=%.2f water=%.2f fx=%.2f sky=%.2f nav=%.2f camera=%.2f fog+unif=%.2f "
+                "ms/frame",
+                sRuUs[0] / 1000.0 / sRuFrames, sRuUs[1] / 1000.0 / sRuFrames, sRuUs[2] / 1000.0 / sRuFrames,
+                sRuUs[3] / 1000.0 / sRuFrames, sRuUs[4] / 1000.0 / sRuFrames, sRuUs[5] / 1000.0 / sRuFrames,
+                sRuUs[6] / 1000.0 / sRuFrames, sRuUs[7] / 1000.0 / sRuFrames);
+            Vita::breadcrumb(rb);
+            if (MWPhysics::gVitaQueryCalls > 0)
+            {
+                snprintf(rb, sizeof(rb), "[PhysQuery] main thread: %.1f calls, lock wait %.2f ms, query %.2f ms /frame",
+                    (double)MWPhysics::gVitaQueryCalls / sRuFrames, MWPhysics::gVitaQueryLockUs / 1000.0 / sRuFrames,
+                    MWPhysics::gVitaQueryUs / 1000.0 / sRuFrames);
+                Vita::breadcrumb(rb);
+                MWPhysics::gVitaQueryLockUs = MWPhysics::gVitaQueryUs = 0;
+                MWPhysics::gVitaQueryCalls = 0;
+            }
+            if (MWPhysics::gVitaSimQueryCalls > 0)
+            {
+                snprintf(rb, sizeof(rb), "[PhysQuery] sim thread: %.1f calls, lock wait %.2f ms, query %.2f ms /frame",
+                    (double)MWPhysics::gVitaSimQueryCalls / sRuFrames,
+                    MWPhysics::gVitaSimQueryLockUs / 1000.0 / sRuFrames,
+                    MWPhysics::gVitaSimQueryUs / 1000.0 / sRuFrames);
+                Vita::breadcrumb(rb);
+                MWPhysics::gVitaSimQueryLockUs = MWPhysics::gVitaSimQueryUs = MWPhysics::gVitaSimQueryCalls = 0;
+            }
+            // [PhysThread]: the async physics thread's step (wall vs CPU
+            // time: the gap is time it was runnable but not running, or
+            // waiting) and how the scheduler treats it.
+            if (MWPhysics::gVitaPhysThreadUid > 0)
+            {
+                SceKernelThreadInfo ti;
+                ti.size = sizeof(ti);
+                if (sceKernelGetThreadInfo(MWPhysics::gVitaPhysThreadUid, &ti) >= 0)
+                {
+                    static uint64_t sRun = 0;
+                    static uint32_t sPre = 0, sMig = 0;
+                    const uint64_t run = ti.runClocks;
+                    if (sRun != 0)
+                    {
+                        snprintf(rb, sizeof(rb),
+                            "[PhysThread] %.2f steps, wall %.2f ms (los %.2f), cpu %.2f ms /frame; actor solves %.1f, "
+                            "idle skips %.1f, sweeps %.1f (%.0f us each) /frame; core %d mask 0x%x prio %d; %u preempts, %u migrations",
+                            (double)MWPhysics::gVitaPhysSteps / sRuFrames,
+                            MWPhysics::gVitaPhysStepUs / 1000.0 / sRuFrames,
+                            MWPhysics::gVitaPhysLosUs / 1000.0 / sRuFrames, (run - sRun) / 1000.0 / sRuFrames,
+                            (double)MWPhysics::gVitaPhysActorSolves / sRuFrames,
+                            (double)MWPhysics::gVitaPhysIdleSkips / sRuFrames,
+                            (double)MWPhysics::gVitaSweeps / sRuFrames,
+                            MWPhysics::gVitaSweeps ? (double)MWPhysics::gVitaSweepUs / MWPhysics::gVitaSweeps : 0.0,
+                            (int)ti.lastExecutedCpuId, (unsigned)ti.currentCpuAffinityMask, (int)ti.currentPriority,
+                            ti.threadPreemptCount - sPre, (unsigned)ti.changeCpuCount - sMig);
+                        Vita::breadcrumb(rb);
+                    }
+                    sRun = run;
+                    sPre = ti.threadPreemptCount;
+                    sMig = (uint32_t)ti.changeCpuCount;
+                }
+                MWPhysics::gVitaPhysStepUs = MWPhysics::gVitaPhysSteps = MWPhysics::gVitaPhysLosUs = 0;
+                MWPhysics::gVitaPhysActorSolves = MWPhysics::gVitaPhysIdleSkips = 0;
+                MWPhysics::gVitaSweeps = MWPhysics::gVitaSweepUs = 0;
+            }
+            std::fill(std::begin(sRuUs), std::end(sRuUs), 0);
+            sRuFrames = 0;
+        }
+#undef VITA_RU_LAP
 
         // Periodic lighting diagnostics (every ~5 seconds at 30fps)
         {
@@ -1088,21 +1215,80 @@ namespace MWRender
             mCamera->rotateCameraToTrackingPtr();
         }
 
+#ifdef __vita__
+        if (vitaDeferTransform())
+        {
+            mVitaDeferred.push_back(
+                { VitaDeferredTransform::Attitude, false, ptr.getRefData().getBaseNode(), {}, rot });
+            return;
+        }
+#endif
         ptr.getRefData().getBaseNode()->setAttitude(rot);
     }
 
     void RenderingManager::moveObject(const MWWorld::Ptr& ptr, const osg::Vec3f& pos)
     {
+#ifdef __vita__
+        if (vitaDeferTransform())
+        {
+            mVitaDeferred.push_back(
+                { VitaDeferredTransform::Position, false, ptr.getRefData().getBaseNode(), pos, {} });
+            return;
+        }
+#endif
         ptr.getRefData().getBaseNode()->setPosition(pos);
     }
 
     void RenderingManager::scaleObject(const MWWorld::Ptr& ptr, const osg::Vec3f& scale)
     {
+#ifdef __vita__
+        if (vitaDeferTransform())
+        {
+            // The camera height follows the node's scale: refresh it once
+            // the scale lands.
+            mVitaDeferred.push_back({ VitaDeferredTransform::Scale, ptr == mCamera->getTrackingPtr(),
+                ptr.getRefData().getBaseNode(), scale, {} });
+            return;
+        }
+#endif
         ptr.getRefData().getBaseNode()->setScale(scale);
 
         if (ptr == mCamera->getTrackingPtr()) // update height of camera
             mCamera->processViewChange();
     }
+
+#ifdef __vita__
+    bool RenderingManager::vitaDeferTransform() const
+    {
+        return mVitaDeferSimTransforms && Vita::isSimThread();
+    }
+
+    void RenderingManager::vitaApplyDeferredTransforms()
+    {
+        // In queue order: a node moved twice in one frame ends where the
+        // last write put it.
+        bool trackingScaled = false;
+        for (const VitaDeferredTransform& t : mVitaDeferred)
+        {
+            switch (t.mKind)
+            {
+                case VitaDeferredTransform::Position:
+                    t.mNode->setPosition(t.mVec);
+                    break;
+                case VitaDeferredTransform::Attitude:
+                    t.mNode->setAttitude(t.mQuat);
+                    break;
+                case VitaDeferredTransform::Scale:
+                    t.mNode->setScale(t.mVec);
+                    trackingScaled |= t.mTracking;
+                    break;
+            }
+        }
+        mVitaDeferred.clear();
+        if (trackingScaled)
+            mCamera->processViewChange();
+    }
+#endif
 
     void RenderingManager::removeObject(const MWWorld::Ptr& ptr)
     {
@@ -1697,8 +1883,7 @@ namespace MWRender
                     cullingMode &= ~(osg::CullStack::SMALL_FEATURE_CULLING);
                 else
                 {
-                    mViewer->getCamera()->setSmallFeatureCullingPixelSize(
-                        Settings::camera().mSmallFeatureCullingPixelSize);
+                    mViewer->getCamera()->setSmallFeatureCullingPixelSize(smallFeatureCullingPixelSize());
                     cullingMode |= osg::CullStack::SMALL_FEATURE_CULLING;
                 }
                 mViewer->getCamera()->setCullingMode(cullingMode);
@@ -1778,6 +1963,15 @@ namespace MWRender
             updateProjectionMatrix();
         }
     }
+
+#ifdef __vita__
+    float RenderingManager::vitaGetFogEnd() const
+    {
+        // Land fog only: the streamer is exterior; underwater fog is short
+        // and would collapse residency while swimming.
+        return mFog ? mFog->getFogEnd(false) : mViewDistance;
+    }
+#endif
 
     void RenderingManager::setViewDistance(float distance, bool delay)
     {

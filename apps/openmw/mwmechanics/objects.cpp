@@ -9,6 +9,14 @@
 
 #include "character.hpp"
 
+#ifdef __vita__
+#include <unordered_set>
+
+// [ScriptHist] pgmiss: PlayGroup calls on objects with no animation controller
+// (apps/openmw/vita/VitaMemAudit.cpp).
+extern "C" unsigned int vita_playgroup_missing;
+#endif
+
 namespace MWMechanics
 {
 
@@ -108,6 +116,17 @@ namespace MWMechanics
         }
         else
         {
+#ifdef __vita__
+            // Deferred (beyond-fog) cells run scripts for objects whose
+            // animation is not built yet, and vanilla OutsideBanner calls
+            // PlayGroup on every banner several times a second: one warning
+            // per object, not a formatted, flushed log line per call.
+            // Script opcodes run on the sim thread only.
+            ++vita_playgroup_missing;
+            static std::unordered_set<const void*> sWarned;
+            if (!sWarned.insert(ptr.mRef).second)
+                return false;
+#endif
             Log(Debug::Warning) << "Warning: Objects::playAnimationGroup: Unable to find "
                                 << ptr.getCellRef().getRefId();
             return false;

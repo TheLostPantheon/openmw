@@ -1,5 +1,10 @@
 #include "aisequence.hpp"
 
+#ifdef __vita__
+#include <psp2/io/stat.h>
+#include <psp2/kernel/processmgr.h>
+#endif
+
 #include <algorithm>
 #include <limits>
 
@@ -242,6 +247,13 @@ namespace MWMechanics
         }
     }
 
+#ifdef __vita__
+    // [AiSplit] (printed with [MechSplit]): combat target rating and package
+    // execution by type, us summed over the report window.
+    uint64_t gVitaAiRateUs = 0, gVitaAiPkgUs[2] = {}; // [0] combat, [1] other packages
+    uint32_t gVitaAiRateCalls = 0;
+#endif
+
     void AiSequence::execute(
         const MWWorld::Ptr& actor, CharacterController& characterController, float duration, bool outOfRange)
     {
@@ -280,6 +292,19 @@ namespace MWMechanics
             osg::Vec3f vActorPos = actor.getRefData().getPosition().asVec3();
 
             float bestRating = 0.f;
+#ifdef __vita__
+            // The rating only decides between combat targets: with one, it
+            // cannot change the pick, and it rates every item and spell the
+            // actor has, every frame. ux0:data/openmw/airatingall.txt rates
+            // anyway (A/B).
+            static const bool sRateAll = [] {
+                SceIoStat st;
+                return sceIoGetstat("ux0:data/openmw/airatingall.txt", &st) >= 0;
+            }();
+            const bool vitaRate = sRateAll
+                || (mPackages.size() > 1 && mPackages[1]->getTypeId() == AiPackageTypeId::Combat);
+            const uint64_t vitaRateT0 = sceKernelGetProcessTimeWide();
+#endif
 
             for (auto it = mPackages.begin(); it != mPackages.end();)
             {
@@ -296,8 +321,16 @@ namespace MWMechanics
                 else
                 {
                     float rating = 0.f;
+#ifdef __vita__
+                    if (vitaRate && MWMechanics::canFight(actor, target))
+                    {
+                        rating = MWMechanics::getBestActionRating(actor, target);
+                        ++gVitaAiRateCalls;
+                    }
+#else
                     if (MWMechanics::canFight(actor, target))
                         rating = MWMechanics::getBestActionRating(actor, target);
+#endif
 
                     const ESM::Position& targetPos = target.getRefData().getPosition();
 
@@ -318,6 +351,9 @@ namespace MWMechanics
                 }
             }
 
+#ifdef __vita__
+            gVitaAiRateUs += sceKernelGetProcessTimeWide() - vitaRateT0;
+#endif
             if (mPackages.empty())
                 return;
 
@@ -334,7 +370,15 @@ namespace MWMechanics
 
         try
         {
+#ifdef __vita__
+            const uint64_t vitaPkgT0 = sceKernelGetProcessTimeWide();
+            const bool vitaDone = package->execute(actor, characterController, mAiState, duration);
+            gVitaAiPkgUs[packageTypeId == AiPackageTypeId::Combat ? 0 : 1]
+                += sceKernelGetProcessTimeWide() - vitaPkgT0;
+            if (vitaDone)
+#else
             if (package->execute(actor, characterController, mAiState, duration))
+#endif
             {
                 // Put repeating non-combat AI packages on the end of the stack so they can be used again
                 if (isActualAiPackage(packageTypeId) && package->getRepeat())

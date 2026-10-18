@@ -4,12 +4,14 @@
 #include <list>
 #include <map>
 #ifdef __vita__
+#include <chrono>
 #include <functional>
 #include <set>
 #endif
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <components/esm/exteriorcelllocation.hpp>
 #include <components/misc/algorithm.hpp>
@@ -109,10 +111,48 @@ namespace MWWorld
         /// (door states, projectile casters) can drop Ptrs into it.
         std::size_t evictInactiveLoadedCellStores(
             const std::set<CellStore*, std::less<>>& activeCells, const std::function<void(CellStore&)>& onEvict);
-        bool vitaEvictOneDistant(const std::set<CellStore*, std::less<>>& protectedCells, int centerX, int centerY,
-            int minDist, const std::function<void(CellStore&)>& onEvict);
+        /// keepNearUnits: player-distance floor (world units to the cell's
+        /// nearest edge) below which stores are never victims.
+        bool vitaEvictOneDistant(const std::set<CellStore*, std::less<>>& protectedCells, float playerX, float playerY,
+            float keepNearUnits, const std::function<void(CellStore&)>& onEvict);
         bool vitaApplyEvictedState(const ESM::RefId& id);
         std::size_t vitaCellStoreCount() const { return mCells.size(); }
+        /// The Ptr cache is a lookup accelerator, not a lifetime pin:
+        /// evictors clear entries instead of being blocked by them.
+        void vitaInvalidateIdCache(const CellStore* store)
+        {
+            for (auto& entry : mIdCache)
+                if (entry.second == store)
+                    entry = { ESM::RefId(), nullptr };
+        }
+#ifdef __vita__
+        /// Stores a reference lookup by id (scripts: `"agronian guy"->OnDeath`)
+        /// found its target in recently. Scene keeps them out of eviction:
+        /// a script asking every frame about an actor in an inactive cell had
+        /// the cell evicted and reloaded about once a second (~43 ms each).
+        void vitaCollectRecentLookups(std::set<CellStore*, std::less<>>& out, std::chrono::seconds window)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            for (auto it = mVitaLookupStamp.begin(); it != mVitaLookupStamp.end();)
+            {
+                if (now - it->second > window)
+                    it = mVitaLookupStamp.erase(it);
+                else
+                {
+                    out.insert(const_cast<CellStore*>(it->first));
+                    ++it;
+                }
+            }
+        }
+#endif
+        std::size_t vitaIdCachePinnedCount() const
+        {
+            std::set<const CellStore*> distinct;
+            for (const auto& [id, cell] : mIdCache)
+                if (cell != nullptr)
+                    distinct.insert(cell);
+            return distinct.size();
+        }
         void vitaEvictedStats(std::size_t& ramBytes, int& count) const
         {
             // At-rest state lives in the session ledger file, not RAM.
@@ -164,6 +204,9 @@ namespace MWWorld
         ESM::Cell mDraftCell;
         std::vector<std::pair<ESM::RefId, CellStore*>> mIdCache;
 #ifdef __vita__
+        std::unordered_map<const CellStore*, std::chrono::steady_clock::time_point> mVitaLookupStamp;
+#endif
+#ifdef __vita__
         // Session ledger: one append-only file of headerless cell records.
         struct VitaLedgerSpan
         {
@@ -187,6 +230,9 @@ namespace MWWorld
         bool vitaLedgerReadSpan(const VitaLedgerSpan& span, std::string& out) const;
         /// Serialize store state into the ledger; false = store untouched.
         bool vitaSerializeToLedger(CellStore& store);
+        /// [Dangling]: after `gone` were freed, drop and log lookup entries
+        /// still pointing at them. `path` names the eviction.
+        void vitaCheckDanglingCells(const std::unordered_set<const CellStore*>& gone, const char* path);
         void vitaApplyBuffer(const std::string& data);
 #endif
         std::size_t mIdCacheIndex = 0;

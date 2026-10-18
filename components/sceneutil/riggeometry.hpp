@@ -84,6 +84,10 @@ namespace SceneUtil
             osg::BoundingSphere computeBound(const osg::Node&) const override { return boundingSphere; }
         };
 
+#ifdef __vita__
+        // Scratch for cull-time skinning (bone matrices), reused per frame.
+        std::vector<osg::Matrixf> mVitaBoneMatrices;
+#endif
     private:
         void cull(osg::NodeVisitor* nv);
         void updateBounds(osg::NodeVisitor* nv);

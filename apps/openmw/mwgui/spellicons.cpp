@@ -1,6 +1,7 @@
 #include "spellicons.hpp"
 
 #include <iomanip>
+#include <set>
 #include <sstream>
 
 #include <MyGUI_ImageBox.h>
@@ -86,12 +87,12 @@ namespace MWGui
 
     void SpellIcons::updateWidgets(MyGUI::Widget* parent, bool adjustSize)
     {
+        // Compare-before-set throughout: a hide-all/re-show sweep dirtied
+        // the HUD layer every frame and defeated the GUI render-skip.
         for (auto& [effectId, widget] : mWidgetMap)
-        {
-            widget->setVisible(false);
-            widget->setAlpha(1.f);
             widget->getUserData<ToolTipInfo>()->text.clear();
-        }
+
+        std::set<ESM::RefId> shown;
 
         int horizontalOffset = 2;
         constexpr int verticalOffset = 2;
@@ -119,12 +120,16 @@ namespace MWGui
                     mWidgetMap[effectId] = createIcon(*parent, effect.mName, effect.mIcon, size);
 
                 MyGUI::ImageBox& widget = *mWidgetMap[effectId];
-                if (!widget.getVisible())
+                if (shown.insert(effectId).second)
                 {
-                    widget.setPosition(horizontalOffset, verticalOffset);
-                    widget.setVisible(true);
+                    if (widget.getLeft() != horizontalOffset || widget.getTop() != verticalOffset)
+                        widget.setPosition(horizontalOffset, verticalOffset);
+                    if (!widget.getVisible())
+                        widget.setVisible(true);
+                    float alpha = 1.f;
                     if (source.mDuration >= fadeTime && fadeTime > 0.f)
-                        widget.setAlpha(std::min(source.mTimeLeft / fadeTime, 1.f));
+                        alpha = std::min(source.mTimeLeft / fadeTime, 1.f);
+                    widget.setAlpha(alpha); // early-outs on same value
                     horizontalOffset += size;
                 }
 
@@ -150,12 +155,19 @@ namespace MWGui
             }
         }
 
+        for (auto& [effectId, widget] : mWidgetMap)
+            if (widget->getVisible() && shown.count(effectId) == 0)
+                widget->setVisible(false);
+
         if (adjustSize)
         {
             const int newWidth = horizontalOffset > 2 ? horizontalOffset + 2 : 0;
             const int diff = parent->getWidth() - newWidth;
-            parent->setSize(newWidth, parent->getHeight());
-            parent->setPosition(parent->getLeft() + diff, parent->getTop());
+            if (diff != 0)
+            {
+                parent->setSize(newWidth, parent->getHeight());
+                parent->setPosition(parent->getLeft() + diff, parent->getTop());
+            }
         }
     }
 }

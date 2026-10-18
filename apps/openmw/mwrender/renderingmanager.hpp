@@ -18,6 +18,13 @@
 #include <span>
 #include <unordered_map>
 
+#ifdef __vita__
+#include <components/sceneutil/positionattitudetransform.hpp>
+#include <osg/Quat>
+#include <osg/Vec3f>
+#include <vector>
+#endif
+
 namespace osg
 {
     class Group;
@@ -173,6 +180,18 @@ namespace MWRender
         void moveObject(const MWWorld::Ptr& ptr, const osg::Vec3f& pos);
         void scaleObject(const MWWorld::Ptr& ptr, const osg::Vec3f& scale);
 
+#ifdef __vita__
+        /// Cull on GL: cull N runs while the sim thread simulates N+1, so a
+        /// base-node transform written by the sim thread would show in cull
+        /// N early (the player's body and arms ahead of a camera computed
+        /// for N). While deferring, the sim thread queues those writes and
+        /// main applies them after the cull fence, before frame N+1 reads
+        /// them (camera update included).
+        void vitaSetDeferSimTransforms(bool defer) { mVitaDeferSimTransforms = defer; }
+        /// Main thread, sim job joined and no cull in flight.
+        void vitaApplyDeferredTransforms();
+#endif
+
         void removeObject(const MWWorld::Ptr& ptr);
 
         void setWaterEnabled(bool enabled);
@@ -254,6 +273,10 @@ namespace MWRender
 
         float getNearClipDistance() const { return mNearClip; }
         float getViewDistance() const { return mViewDistance; }
+#ifdef __vita__
+        // Live land-fog end (weather-driven); streaming reach tracks it.
+        float vitaGetFogEnd() const;
+#endif
 
         void setViewDistance(float distance, bool delay = false);
 
@@ -304,6 +327,28 @@ namespace MWRender
         void setNavMeshMode(Settings::NavMeshRenderMode value);
 
     private:
+#ifdef __vita__
+        struct VitaDeferredTransform
+        {
+            enum Kind : unsigned char
+            {
+                Position,
+                Attitude,
+                Scale
+            };
+            Kind mKind;
+            bool mTracking; // scale of the camera's tracking ptr
+            osg::ref_ptr<SceneUtil::PositionAttitudeTransform> mNode;
+            osg::Vec3f mVec;
+            osg::Quat mQuat;
+        };
+        /// True when the caller should queue instead of writing the node.
+        bool vitaDeferTransform() const;
+        bool mVitaDeferSimTransforms = false;
+        // Written by the sim thread during its job, drained by main after
+        // joining it: never touched by both at once.
+        std::vector<VitaDeferredTransform> mVitaDeferred;
+#endif
         void updateTextureFiltering();
         void updateAmbient();
         void setFogColor(const osg::Vec4f& color);

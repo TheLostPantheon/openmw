@@ -1,7 +1,10 @@
 #ifndef GAME_MWWORLD_WORLDIMP_H
 #define GAME_MWWORLD_WORLDIMP_H
 
+#include <map>
+
 #include <osg/Timer>
+#include <osg/Vec3f>
 #include <osg/ref_ptr>
 
 #include <components/debug/debuglog.hpp>
@@ -115,6 +118,12 @@ namespace MWWorld
         std::vector<std::string> mContentFiles;
 
         std::filesystem::path mUserDataPath;
+#ifdef __vita__
+        // Static intervention/prison marker positions (boot scan + disk
+        // cache); getClosestMarker resolves against these instead of
+        // materialising every exterior cell store.
+        std::map<ESM::RefId, std::vector<osg::Vec3f>> mVitaMarkerTable;
+#endif
 
         int mActivationDistanceOverride;
 
@@ -123,6 +132,15 @@ namespace MWWorld
         float mSwimHeightScale;
 
         float mDistanceToFocusObject;
+#ifdef __vita__
+        // The GUI focus refresh casts its physics ray without waiting for
+        // the collision world lock (2.5-5 ms waits behind the physics thread
+        // with NPCs about). Busy: the GUI keeps the last focus and the
+        // engine retries next frame; after 3 busy frames it waits.
+        bool mVitaFocusTry = false;
+        bool mVitaFocusBusy = false;
+        unsigned mVitaFocusBusyFrames = 0;
+#endif
 
         bool mTeleportEnabled;
         bool mLevitationEnabled;
@@ -427,6 +445,11 @@ namespace MWWorld
             float duration, bool paused, osg::Timer_t frameStart, unsigned int frameNumber, osg::Stats& stats);
 
         void updateFocusObject();
+#ifdef __vita__
+        /// The last updateFocusObject() found the physics lock busy and
+        /// changed nothing: call it again next frame.
+        bool vitaFocusDeferred() const { return mVitaFocusBusy; }
+#endif
 
         MWWorld::Ptr placeObject(
             const MWWorld::Ptr& object, float cursorX, float cursorY, int amount, bool copy = true) override;
@@ -592,6 +615,9 @@ namespace MWWorld
         float getSunPercentage() const override;
 
         float getPhysicsFrameRateDt() const override;
+#ifdef __vita__
+        void vitaWaitPhysics() override;
+#endif
 
         bool findInteriorPositionInWorldSpace(const MWWorld::CellStore* cell, osg::Vec3f& result) override;
 

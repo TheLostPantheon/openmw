@@ -1,7 +1,9 @@
 #ifndef OPENMW_COMPONENTS_RESOURCE_RESOURCESYSTEM_H
 #define OPENMW_COMPONENTS_RESOURCE_RESOURCESYSTEM_H
 
+#include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace VFS
@@ -60,6 +62,21 @@ namespace Resource
         /// Add this ResourceManager to be handled by the ResourceSystem.
         /// @note Does not transfer ownership.
         void addResourceManager(BaseResourceManager* resourceMgr);
+
+#ifdef __vita__
+        /// Memory audit: clears each manager's unreferenced entries in turn and
+        /// returns the heap each freed, " Name=-NNNK ...". Templates go first:
+        /// they hold images, model files and shapes, so a later cache is
+        /// charged only for what it alone kept alive.
+        std::string vitaClearCachesMeasured(const std::function<std::size_t()>& heapBytes);
+
+        /// Fast travel: model templates and collision shapes expire after
+        /// objectExpiry and keyframes after keyframeExpiry; everything else
+        /// (images, which terrain layers load through too, terrain chunks,
+        /// land) after otherExpiry. NIF files keep no expiry, as in
+        /// setExpiryDelay.
+        void vitaSetFastTravelExpiry(double objectExpiry, double keyframeExpiry, double otherExpiry);
+#endif
         /// @note Do nothing if resourceMgr does not exist.
         /// @note Does not delete resourceMgr.
         void removeResourceManager(BaseResourceManager* resourceMgr);

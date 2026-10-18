@@ -182,6 +182,20 @@ namespace MWWorld
         };
         std::vector<PendingCellLoad> mPendingCellLoads;
         std::chrono::steady_clock::time_point mVitaLastCrossing{};
+        // Player moving at fast-travel speed (>1200 u/s) until then; the
+        // memory governor shortens cache expiry meanwhile.
+        std::chrono::steady_clock::time_point mVitaFastTravelUntil{};
+        // The cell being changed into, protected from store eviction for the
+        // whole change (vitaProtectedCells). The eviction passes inside a
+        // change only protect active cells and measure distance from the
+        // player's pre-teleport position, so a teleport's destination store
+        // could be freed under the change's reference to it.
+        CellStore* mVitaCellChangeTarget = nullptr;
+        // [Land] cells that got the flat fallback heightfield because their
+        // heights failed to load; retried once a second (vitaRetryLand).
+        std::vector<std::pair<ESM::ExteriorCellLocation, int>> mVitaLandRetry;
+        void vitaQueueLandRetry(const ESM::ExteriorCellLocation& at);
+        void vitaRetryLand();
         void vitaScreenHousekeeping();
         void vitaStoreEvictPass(bool pressure);
         void finishPendingCellLoad(PendingCellLoad& pending);
@@ -310,8 +324,8 @@ namespace MWWorld
         ///< Move to interior cell.
         /// @param changeEvent Set cellChanged flag?
 
-        void changeToExteriorCell(
-            const ESM::RefId& extCellId, const ESM::Position& position, bool adjustPlayerPos, bool changeEvent = true);
+        void changeToExteriorCell(const ESM::RefId& extCellId, const ESM::Position& position, bool adjustPlayerPos,
+            bool changeEvent = true, bool vitaSeamlessCrossing = false, bool vitaTeleport = false);
         ///< Move to exterior cell.
         /// @param changeEvent Set cellChanged flag?
 

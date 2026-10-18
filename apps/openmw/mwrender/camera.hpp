@@ -7,6 +7,8 @@
 #include <osg/Matrix>
 #include <osg/Vec3>
 #include <osg/Vec3d>
+
+#include <limits>
 #include <osg/ref_ptr>
 
 #include "../mwworld/ptr.hpp"
@@ -171,6 +173,18 @@ namespace MWRender
         // Used to rotate player to the direction of view after exiting preview or vanity mode.
         osg::Vec3f mDeferredRotation;
         bool mDeferredRotationDisabled;
+#ifdef __vita__
+        // Last third-person sweep inputs and result (updatePosition).
+        bool mVitaSweepValid = false;
+        int mVitaSweepAge = 0;
+        osg::Vec3d mVitaSweepTracked, mVitaSweepOffset, mVitaSweepPosition;
+        float mVitaSweepPitch = 0.f, mVitaSweepYaw = 0.f, mVitaSweepPreferred = 0.f;
+        float mVitaSweepDistance = 0.f;
+        // Last real sweeps' results, used while the physics lock is busy.
+        int mVitaSweepBusyFrames = 0;
+        double mVitaFocalFactor = 0.0;
+        float mVitaClampDistance = std::numeric_limits<float>::max();
+#endif
     };
 }
 

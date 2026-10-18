@@ -168,6 +168,10 @@ namespace MWSound
         ///< Stop the given object from playing given sound buffer.
 
     public:
+#ifdef __vita__
+        /// Decoded sound data held by the buffer pool (memory audit).
+        std::size_t vitaSoundBufferBytes() const { return mSoundBuffers.vitaCacheBytes(); }
+#endif
         SoundManager(const VFS::Manager* vfs, bool useSound);
         ~SoundManager() override;
 

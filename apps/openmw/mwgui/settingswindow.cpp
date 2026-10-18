@@ -267,8 +267,8 @@ namespace MWGui
         try
         {
             // Render resolution dropdown: maps the (X, Y) cfg pair to the
-            // nearest preset. Width is the distinguishing axis. Capped at
-            // 640x368 — see comment in onVitaResolutionChanged.
+            // nearest preset. Width is the distinguishing axis. See
+            // onVitaResolutionChanged for the supported geometries.
             getWidget(mVitaResolutionList, "VitaResolutionList");
             if (mVitaResolutionList)
             {
@@ -276,7 +276,10 @@ namespace MWGui
                 size_t idx = 1; // 512x288 default
                 if (curX <= 480) idx = 0;
                 else if (curX <= 512) idx = 1;
-                else idx = 2;
+                else if (curX <= 640) idx = 2;
+                else if (curX <= 720) idx = 3;
+                else idx = 4;
+                idx = std::min(idx, mVitaResolutionList->getItemCount() - 1);
                 mVitaResolutionList->setIndexSelected(idx);
                 mVitaResolutionList->eventComboChangePosition
                     += MyGUI::newDelegate(this, &SettingsWindow::onVitaResolutionChanged);
@@ -294,6 +297,52 @@ namespace MWGui
                 mVitaTextureDetailList->setIndexSelected(idx);
                 mVitaTextureDetailList->eventComboChangePosition
                     += MyGUI::newDelegate(this, &SettingsWindow::onVitaTextureDetailChanged);
+                // Optional: an older layout without them must not stop the
+                // rows below from being set up.
+                const MyGUI::Colour warn = MyGUI::Colour::parse(
+                    MyGUI::LanguageManager::getInstance().replaceTags("#{fontcolour=negative}"));
+                try
+                {
+                    getWidget(mVitaTextureDetailWarning, "VitaTextureDetailWarning");
+                    mVitaTextureDetailWarning->setTextColour(warn);
+                    updateVitaTextureDetailWarning(idx);
+                }
+                catch (...)
+                {
+                    mVitaTextureDetailWarning = nullptr;
+                }
+                try
+                {
+                    MyGUI::TextBox* note = nullptr;
+                    getWidget(note, "VitaStreamingNote");
+                    note->setTextColour(warn);
+                }
+                catch (...)
+                {
+                }
+            }
+
+            // Small object culling: nearest preset to the current pixel size
+            getWidget(mVitaCullingList, "VitaCullingList");
+            if (mVitaCullingList)
+            {
+                const float px = Settings::camera().mSmallFeatureCullingPixelSize;
+                size_t idx = 3; // strong
+                if (!Settings::camera().mSmallFeatureCulling) idx = 0;
+                else if (px < 4.f) idx = 1;
+                else if (px < 6.5f) idx = 2;
+                mVitaCullingList->setIndexSelected(idx);
+                mVitaCullingList->eventComboChangePosition
+                    += MyGUI::newDelegate(this, &SettingsWindow::onVitaCullingChanged);
+            }
+
+            // Frame rate: locked 30 / uncapped
+            getWidget(mVitaFrameRateList, "VitaFrameRateList");
+            if (mVitaFrameRateList)
+            {
+                mVitaFrameRateList->setIndexSelected(Settings::video().mFramerateLimit > 0.f ? 0 : 1);
+                mVitaFrameRateList->eventComboChangePosition
+                    += MyGUI::newDelegate(this, &SettingsWindow::onVitaFrameRateChanged);
             }
         }
         catch (...)
@@ -738,16 +787,29 @@ namespace MWGui
 #ifdef __vita__
     void SettingsWindow::onVitaResolutionChanged(MyGUI::ComboBox* /*sender*/, size_t pos)
     {
-        // Indices aligned with layout AddItem order. Capped at 640x368 to
-        // match the vglInitWithCustomSizes display backbuffer in
-        // VitaInit.cpp — higher widths produced a black screen in testing
-        // (Vita display controller refuses certain backbuffer geometries).
-        static constexpr int kWidths[]  = { 480, 512, 640 };
-        static constexpr int kHeights[] = { 272, 288, 368 };
+        // Indices aligned with layout AddItem order. The display backbuffer
+        // (VitaInit.cpp) follows this at boot for the geometries the Vita
+        // display controller scales (480x272, 640x368, 720x408, 960x544);
+        // other sizes (768x432) were a black screen, and 512x288 renders
+        // inside a 640x368 backbuffer.
+        static constexpr int kWidths[]  = { 480, 512, 640, 720, 960 };
+        static constexpr int kHeights[] = { 272, 288, 368, 408, 544 };
         if (pos >= std::size(kWidths))
             return;
         Settings::video().mResolutionX.set(kWidths[pos]);
         Settings::video().mResolutionY.set(kHeights[pos]);
+        // 640x368 was the old default, upgraded to native at boot unless
+        // chosen here (VitaInit.cpp): record the choice.
+        if (kWidths[pos] == 640)
+        {
+            if (FILE* f = fopen("ux0:data/openmw/config/res640.txt", "w"))
+            {
+                fputs("chosen in the Vita settings tab\n", f);
+                fclose(f);
+            }
+        }
+        else
+            remove("ux0:data/openmw/config/res640.txt");
         // No apply() — render resolution requires a restart (engine creates
         // its render FBO once at startup; resizing mid-session is not safe
         // on vitaGL). The new value persists to user cfg and takes effect
@@ -761,9 +823,39 @@ namespace MWGui
         if (pos >= std::size(kValues))
             return;
         Settings::general().mVitaTextureDetail.set(kValues[pos]);
-        // No apply() — texture downsample happens at image-load time
-        // inside ImageManager::getImage. Already-cached textures retain
-        // their old caps. The new preset takes effect on next boot.
+        updateVitaTextureDetailWarning(pos);
+        // No apply() — ImageManager reads the preset once, at the first
+        // image load; the new preset takes effect on next boot.
+    }
+
+    void SettingsWindow::updateVitaTextureDetailWarning(size_t pos)
+    {
+        // High keeps world textures up to 256 px (4x the area of Balanced),
+        // Off at full size. Streaming loads nothing while the heap sits at
+        // its gate, so these trade pop-in in dense towns for detail.
+        if (mVitaTextureDetailWarning == nullptr)
+            return;
+        mVitaTextureDetailWarning->setCaption(pos == 3 ? "Heavy on memory" : "More memory");
+        mVitaTextureDetailWarning->setVisible(pos == 2 || pos == 3);
+    }
+
+    void SettingsWindow::onVitaCullingChanged(MyGUI::ComboBox* /*sender*/, size_t pos)
+    {
+        // Indices aligned with layout AddItem order. Sizes are at 640x368;
+        // the renderer scales them to the render width.
+        static constexpr float kPixels[] = { 0.f, 3.f, 5.f, 8.f };
+        if (pos >= std::size(kPixels))
+            return;
+        Settings::camera().mSmallFeatureCulling.set(pos != 0);
+        if (pos != 0)
+            Settings::camera().mSmallFeatureCullingPixelSize.set(kPixels[pos]);
+        apply();
+    }
+
+    void SettingsWindow::onVitaFrameRateChanged(MyGUI::ComboBox* /*sender*/, size_t pos)
+    {
+        // The engine loop picks the new cap up on its next frame.
+        Settings::video().mFramerateLimit.set(pos == 0 ? 30.f : 0.f);
     }
 #endif
 

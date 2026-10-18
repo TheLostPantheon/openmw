@@ -10,6 +10,11 @@
 #include "gl4esinit.h"
 #endif
 
+#ifdef __vita__
+// vitaGL globals (gxm.c): the display backbuffer size set by vglInit*.
+extern "C" int DISPLAY_WIDTH, DISPLAY_HEIGHT;
+#endif
+
 namespace SDLUtil
 {
 
@@ -117,8 +122,11 @@ namespace SDLUtil
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         vglSwapBuffers(GL_FALSE);
 
-        _traits->width = 640;
-        _traits->height = 368;
+        // The backbuffer vitaGL was initialized with (Vita::initialize picks
+        // it from the render resolution): the 3D viewport and the GUI's view
+        // size follow it, or a 960x544 buffer is drawn in its 640x368 corner.
+        _traits->width = DISPLAY_WIDTH;
+        _traits->height = DISPLAY_HEIGHT;
         _traits->red = 8;
         _traits->green = 8;
         _traits->blue = 8;

@@ -4,6 +4,12 @@
 
 #include <numeric>
 
+#ifdef __vita__
+#include <algorithm>
+#include <psp2/io/stat.h>
+#include <psp2/kernel/threadmgr.h>
+#endif
+
 namespace SceneUtil
 {
 
@@ -125,6 +131,20 @@ namespace SceneUtil
 
     void WorkThread::run()
     {
+#ifdef __vita__
+        // Asset loading must only use time the pinned pipeline threads (main,
+        // sim, GL) leave idle: drop below their priority, any core.
+        // ux0:data/openmw/nopin.txt disables (A/B), as for core pinning.
+        {
+            SceIoStat st;
+            if (sceIoGetstat("ux0:data/openmw/nopin.txt", &st) < 0)
+            {
+                const int prio = sceKernelGetThreadCurrentPriority();
+                if (prio > 0)
+                    sceKernelChangeThreadPriority(0, std::min(prio + 16, 191));
+            }
+        }
+#endif
         while (true)
         {
             osg::ref_ptr<WorkItem> item = mWorkQueue->removeWorkItem();

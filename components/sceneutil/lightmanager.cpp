@@ -1104,7 +1104,12 @@ namespace SceneUtil
         for (int i = 0; i < 2; ++i)
         {
             if (mStateSetCache[i].size() > 5000)
+            {
                 mStateSetCache[i].clear();
+#ifdef __vita__
+                mVitaUpdated.clear();
+#endif
+            }
         }
     }
 
@@ -1168,19 +1173,37 @@ namespace SceneUtil
 
         auto& stateSetCache = mStateSetCache[frameNum % 2];
 
+#ifdef __vita__
+        LightIdList& lightIdList = mVitaIdScratch;
+        lightIdList.clear();
+#else
         LightIdList lightIdList;
         lightIdList.reserve(lightList.size());
+#endif
         std::transform(lightList.begin(), lightList.end(), std::back_inserter(lightIdList),
             [](const LightSourceViewBound* l) { return l->mLightSource->getId(); });
 
         auto found = stateSetCache.find(lightIdList);
         if (found != stateSetCache.end())
         {
+#ifdef __vita__
+            // Every object lit by this combination this frame, from this view,
+            // gets identical data: dozens of objects share a combination, and
+            // the update rewrites its packed light uniform each time.
+            VitaUpdateMemo& memo = mVitaUpdated[found->second.get()];
+            if (memo.mFrame == frameNum && memo.mView == viewMatrix)
+                return found->second;
+            memo.mFrame = frameNum;
+            memo.mView = viewMatrix;
+#endif
             mStateSetGenerator->update(found->second, lightList, frameNum);
             return found->second;
         }
 
         auto stateset = mStateSetGenerator->generate(lightList, frameNum);
+#ifdef __vita__
+        mVitaUpdated[stateset.get()] = VitaUpdateMemo{ frameNum, viewMatrix };
+#endif
         stateSetCache.emplace(lightIdList, stateset);
         return stateset;
     }
@@ -1376,36 +1399,7 @@ namespace SceneUtil
                 nodeBound = node->getBound();
 
             transformBoundingSphere(*cv->getModelViewMatrix(), nodeBound);
-
-            const std::vector<LightManager::LightSourceViewBound>& lights
-                = mLightManager->getLightsInViewSpace(cv, viewMatrix, mLastFrameNumber);
-
-            mLightList.clear();
-            for (const LightManager::LightSourceViewBound& light : lights)
-            {
-                if (mIgnoredLightSources.contains(light.mLightSource))
-                    continue;
-
-                if (light.mViewBound.intersects(nodeBound))
-                    mLightList.push_back(&light);
-            }
-
-            const size_t maxLights = mLightManager->getMaxLights() - mLightManager->getStartLight();
-
-            if (mLightList.size() > maxLights)
-            {
-                // Sort by proximity to object: prefer closer lights with larger radius
-                std::sort(mLightList.begin(), mLightList.end(),
-                    [&](const SceneUtil::LightManager::LightSourceViewBound* left,
-                        const SceneUtil::LightManager::LightSourceViewBound* right) {
-                        const float leftDist = (nodeBound.center() - left->mViewBound.center()).length2();
-                        const float rightDist = (nodeBound.center() - right->mViewBound.center()).length2();
-                        // A tricky way to compare normalized distance. This avoids division by near zero
-                        return left->mViewBound.radius() * rightDist > right->mViewBound.radius() * leftDist;
-                    });
-
-                mLightList.resize(maxLights);
-            }
+            selectLights(nodeBound, cv, viewMatrix, mLastFrameNumber, mLightList);
         }
 
         if (!mLightList.empty())
@@ -1415,5 +1409,88 @@ namespace SceneUtil
         }
         return false;
     }
+
+    void LightListCallback::selectLights(const osg::BoundingSphere& nodeBound, osgUtil::CullVisitor* cv,
+        const osg::RefMatrix* viewMatrix, size_t frameNumber, LightManager::LightList& out)
+    {
+        const std::vector<LightManager::LightSourceViewBound>& lights
+            = mLightManager->getLightsInViewSpace(cv, viewMatrix, frameNumber);
+
+        out.clear();
+        for (const LightManager::LightSourceViewBound& light : lights)
+        {
+            if (mIgnoredLightSources.contains(light.mLightSource))
+                continue;
+
+            if (light.mViewBound.intersects(nodeBound))
+                out.push_back(&light);
+        }
+
+        const size_t maxLights = mLightManager->getMaxLights() - mLightManager->getStartLight();
+
+        if (out.size() > maxLights)
+        {
+            // Sort by proximity to object: prefer closer lights with larger radius
+            std::sort(out.begin(), out.end(),
+                [&](const SceneUtil::LightManager::LightSourceViewBound* left,
+                    const SceneUtil::LightManager::LightSourceViewBound* right) {
+                    const float leftDist = (nodeBound.center() - left->mViewBound.center()).length2();
+                    const float rightDist = (nodeBound.center() - right->mViewBound.center()).length2();
+                    // A tricky way to compare normalized distance. This avoids division by near zero
+                    return left->mViewBound.radius() * rightDist > right->mViewBound.radius() * leftDist;
+                });
+
+            out.resize(maxLights);
+        }
+    }
+
+#ifdef __vita__
+    bool LightListCallback::pushLightStateWorldBound(const osg::BoundingSphere& worldBound, osgUtil::CullVisitor* cv)
+    {
+        if (!mLightManager)
+        {
+            mLightManager = findLightManager(cv->getNodePath());
+            if (!mLightManager)
+                return false;
+        }
+
+        if (!(cv->getTraversalMask() & mLightManager->getLightingMask()))
+            return false;
+
+        const osg::RefMatrix* viewMatrix = cv->getCurrentRenderStage()->getInitialViewMatrix();
+        if (mLastFrameNumber != cv->getTraversalNumber())
+        {
+            mLastFrameNumber = cv->getTraversalNumber();
+            osg::BoundingSphere nodeBound = worldBound;
+            transformBoundingSphere(*cv->getModelViewMatrix(), nodeBound);
+            selectLights(nodeBound, cv, viewMatrix, mLastFrameNumber, mLightList);
+        }
+
+        if (!mLightList.empty())
+        {
+            cv->pushStateSet(mLightManager->getLightListStateSet(mLightList, mLastFrameNumber, viewMatrix));
+            return true;
+        }
+        return false;
+    }
+
+    bool LightListCallback::computeLightListWorldBound(
+        const osg::BoundingSphere& worldBound, osgUtil::CullVisitor* cv, LightManager::LightList& out)
+    {
+        out.clear();
+        if (!mLightManager)
+        {
+            mLightManager = findLightManager(cv->getNodePath());
+            if (!mLightManager)
+                return false;
+        }
+        if (!(cv->getTraversalMask() & mLightManager->getLightingMask()))
+            return false;
+        osg::BoundingSphere nodeBound = worldBound;
+        transformBoundingSphere(*cv->getModelViewMatrix(), nodeBound);
+        selectLights(nodeBound, cv, cv->getCurrentRenderStage()->getInitialViewMatrix(), cv->getTraversalNumber(), out);
+        return true;
+    }
+#endif
 
 }

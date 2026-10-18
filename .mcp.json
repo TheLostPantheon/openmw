@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "vita-device": {
+      "command": "python3",
+      "args": ["scripts/vita/vita_device_mcp.py"],
+      "env": {
+        "VITA_FTP_HOST": "192.168.0.50",
+        "VITA_FTP_PORT": "1337"
+      }
+    }
+  }
+}

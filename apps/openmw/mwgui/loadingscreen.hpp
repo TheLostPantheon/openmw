@@ -25,6 +25,11 @@ namespace Resource
     class ResourceSystem;
 }
 
+namespace SceneUtil
+{
+    class WorkItem;
+}
+
 namespace MWGui
 {
     class BackgroundImage;
@@ -84,6 +89,9 @@ namespace MWGui
         std::vector<std::string> mSplashScreens;
 #ifdef __vita__
         std::string mVitaCurSplash;
+        std::string mVitaNextSplash; // prefetched at loadingOff
+        osg::ref_ptr<SceneUtil::WorkItem> mVitaSplashItem;
+        void vitaPrefetchNextSplash();
 #endif
 
         osg::ref_ptr<osg::Texture2D> mTexture;

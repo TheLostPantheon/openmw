@@ -1,5 +1,11 @@
 #include "camera.hpp"
 
+#include "../mwphysics/physicssystem.hpp"
+
+#include <optional>
+
+#include <limits>
+
 #include <osg/Camera>
 
 #include <components/misc/mathutil.hpp>
@@ -174,6 +180,55 @@ namespace MWRender
 
         const auto* rayCasting = MWBase::Environment::get().getWorld()->getRayCasting();
 
+#ifdef __vita__
+        // The two sphere sweeps below cost ~3 ms a frame on the main thread
+        // in a dense town. With the same inputs as last frame (standing
+        // still, camera not turning) reuse their result; refresh every 15
+        // frames regardless for obstacles that move.
+        {
+            const osg::Vec3d offsetNow = getFocalPointOffset();
+            const bool same = mVitaSweepValid && mVitaSweepAge < 15 && mTrackedPosition == mVitaSweepTracked
+                && offsetNow == mVitaSweepOffset && mPitch + mExtraPitch == mVitaSweepPitch
+                && mYaw + mExtraYaw == mVitaSweepYaw && mPreferredCameraDistance == mVitaSweepPreferred;
+            if (same)
+            {
+                ++mVitaSweepAge;
+                mCameraDistance = mVitaSweepDistance;
+                mPosition = mVitaSweepPosition;
+                return;
+            }
+            mVitaSweepTracked = mTrackedPosition;
+            mVitaSweepOffset = offsetNow;
+            mVitaSweepPitch = mPitch + mExtraPitch;
+            mVitaSweepYaw = mYaw + mExtraYaw;
+            mVitaSweepPreferred = mPreferredCameraDistance;
+            mVitaSweepAge = 0;
+        }
+#endif
+
+#ifdef __vita__
+        // The sweeps share the collision world lock with the physics thread,
+        // which holds it while it moves each actor: waiting cost the main
+        // thread 1.5-1.8 ms a frame. When it is busy, apply the last sweep's
+        // focal adjustment and distance clamp to this frame's position and
+        // angles; after 3 busy frames in a row, wait as before.
+        const auto* vitaPhysics = dynamic_cast<const MWPhysics::PhysicsSystem*>(rayCasting);
+        const bool vitaMayDefer = vitaPhysics != nullptr && mVitaSweepValid && mVitaSweepBusyFrames < 3;
+        bool vitaDeferred = false;
+        const auto sweep = [&](const osg::Vec3d& from, const osg::Vec3d& to,
+                               float radius) -> std::optional<MWPhysics::RayCastingResult> {
+            if (vitaMayDefer)
+            {
+                std::optional<MWPhysics::RayCastingResult> res
+                    = vitaPhysics->vitaTryCastSphere(from, to, radius, mCollisionType);
+                if (!res)
+                    vitaDeferred = true;
+                return res;
+            }
+            return rayCasting->castSphere(from, to, radius, mCollisionType);
+        };
+#endif
+
         // Adjust focal point to prevent clipping.
         osg::Vec3d focalOffset = getFocalPointOffset();
         osg::Vec3d focal = mTrackedPosition + focalOffset;
@@ -182,6 +237,23 @@ namespace MWRender
         double offsetLen = focalOffset.length();
         if (offsetLen > 0)
         {
+#ifdef __vita__
+            const std::optional<MWPhysics::RayCastingResult> res
+                = sweep(focal - focalOffset, focal, focalObstacleLimit);
+            if (!res)
+                focal += focalOffset * mVitaFocalFactor;
+            else
+            {
+                mVitaFocalFactor = 0.0;
+                if (res->mHit)
+                {
+                    const double adjustmentCoef
+                        = -(res->mHitPos + res->mHitNormal * focalObstacleLimit - focal).length() / offsetLen;
+                    mVitaFocalFactor = std::max(-1.0, adjustmentCoef);
+                    focal += focalOffset * mVitaFocalFactor;
+                }
+            }
+#else
             MWPhysics::RayCastingResult result
                 = rayCasting->castSphere(focal - focalOffset, focal, focalObstacleLimit, mCollisionType);
             if (result.mHit)
@@ -190,6 +262,7 @@ namespace MWRender
                     = -(result.mHitPos + result.mHitNormal * focalObstacleLimit - focal).length() / offsetLen;
                 focal += focalOffset * std::max(-1.0, adjustmentCoef);
             }
+#endif
         }
 
         // Adjust camera distance.
@@ -197,6 +270,21 @@ namespace MWRender
         osg::Quat orient
             = osg::Quat(mPitch + mExtraPitch, osg::Vec3d(1, 0, 0)) * osg::Quat(mYaw + mExtraYaw, osg::Vec3d(0, 0, 1));
         osg::Vec3d offset = orient * osg::Vec3d(0.f, -mCameraDistance, 0.f);
+#ifdef __vita__
+        const std::optional<MWPhysics::RayCastingResult> res = sweep(focal, focal + offset, cameraObstacleLimit);
+        if (!res)
+            mCameraDistance = std::min(mCameraDistance, mVitaClampDistance);
+        else
+        {
+            mVitaClampDistance = std::numeric_limits<float>::max();
+            if (res->mHit)
+            {
+                mCameraDistance = (res->mHitPos + res->mHitNormal * cameraObstacleLimit - focal).length();
+                mVitaClampDistance = mCameraDistance;
+            }
+        }
+        offset = orient * osg::Vec3d(0.f, -mCameraDistance, 0.f);
+#else
         MWPhysics::RayCastingResult result
             = rayCasting->castSphere(focal, focal + offset, cameraObstacleLimit, mCollisionType);
         if (result.mHit)
@@ -204,8 +292,21 @@ namespace MWRender
             mCameraDistance = (result.mHitPos + result.mHitNormal * cameraObstacleLimit - focal).length();
             offset = orient * osg::Vec3d(0.f, -mCameraDistance, 0.f);
         }
+#endif
 
         mPosition = focal + offset;
+#ifdef __vita__
+        if (vitaDeferred)
+        {
+            ++mVitaSweepBusyFrames;
+            mVitaSweepAge = 15; // not a real sweep: no reuse next frame
+        }
+        else
+            mVitaSweepBusyFrames = 0;
+        mVitaSweepValid = true;
+        mVitaSweepDistance = mCameraDistance;
+        mVitaSweepPosition = mPosition;
+#endif
     }
 
     osg::Quat Camera::getOrient() const

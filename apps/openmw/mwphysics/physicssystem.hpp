@@ -104,6 +104,14 @@ namespace MWPhysics
         const bool mWaterCollision;
         const bool mSkipCollisionDetection;
         const bool mIsPlayer;
+#ifdef __vita__
+        // Set when a step solved this actor (mtphysics.cpp skips some steps
+        // for actors standing still); Sync keeps the actor's ground state
+        // when no step did.
+        bool mVitaSolved = false;
+        // Movement solve time this frame, physics thread ([PhysTop]).
+        uint32_t mVitaSolveUs = 0;
+#endif
     };
 
     struct ProjectileFrameData
@@ -207,6 +215,10 @@ namespace MWPhysics
         /// Apply new positions to actors
         void moveActors();
         void debugDraw();
+#ifdef __vita__
+        /// Block until the async physics step in flight (if any) is done.
+        void vitaWaitForWorkers();
+#endif
 
         std::vector<MWWorld::Ptr> getCollisions(const MWWorld::ConstPtr& ptr, int collisionGroup,
             int collisionMask) const; ///< get handles this object collides with
@@ -221,6 +233,16 @@ namespace MWPhysics
             int mask = CollisionType_Default, int group = 0xff) const override;
         using RayCastingInterface::castRay;
 
+#ifdef __vita__
+        /// castRay (no target filter) without waiting for the collision world
+        /// lock: nullopt when the physics thread holds it.
+        std::optional<RayCastingResult> vitaTryCastRay(const osg::Vec3f& from, const osg::Vec3f& to,
+            const std::vector<MWWorld::ConstPtr>& ignore, int mask, int group = 0xff) const;
+        /// castSphere without waiting for the collision world lock: nullopt
+        /// when the physics thread holds it.
+        std::optional<RayCastingResult> vitaTryCastSphere(const osg::Vec3f& from, const osg::Vec3f& to,
+            float radius, int mask, int group = 0xff) const;
+#endif
         RayCastingResult castSphere(const osg::Vec3f& from, const osg::Vec3f& to, float radius,
             int mask = CollisionType_Default, int group = 0xff) const override;
 

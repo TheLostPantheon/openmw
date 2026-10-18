@@ -2,7 +2,9 @@
 
 #ifdef __vita__
 #include "../vita/VitaInit.h"
+#include "../vita/VitaGLWorker.h"
 #include "../vita/VitaSimWorker.h"
+#include <psp2/kernel/processmgr.h>
 #endif
 
 #include <algorithm>
@@ -832,7 +834,11 @@ namespace MWGui
                 {
                     mViewer->eventTraversal();
                     mViewer->updateTraversal();
+#ifdef __vita__
+                    Vita::renderingTraversalsOnGL(*mViewer);
+#else
                     mViewer->renderingTraversals();
+#endif
                 }
                 // at the time this function is called we are in the middle of a frame,
                 // so out of order calls are necessary to get a correct frameNumber for the next frame.
@@ -902,6 +908,19 @@ namespace MWGui
         if (!mLocalMapRender)
             return;
 
+#ifdef __vita__
+        // 15Hz is plenty for compass/minimap scroll; per-frame updates
+        // dirtied the HUD layer every moving frame and defeated the GUI
+        // render-skip (~3.3ms on the sim-worker chain).
+        {
+            static uint64_t sLastMapUs = 0;
+            const uint64_t nowUs = sceKernelGetProcessTimeWide();
+            if (nowUs - sLastMapUs < 66000ULL)
+                return;
+            sLastMapUs = nowUs;
+        }
+#endif
+
         MWWorld::ConstPtr player = MWMechanics::getPlayer();
 
         osg::Vec3f playerPosition = player.getRefData().getPosition().asVec3();
@@ -918,10 +937,44 @@ namespace MWGui
         }
         // else: need to know the current grid center, call setActiveMap from changeCell
 
+#ifdef __vita__
+        // Hidden widgets still dirty their layer on setPosition/setAngle:
+        // writing the map window's arrow while it is closed dirtied the
+        // Windows layer every tick and defeated the GUI render-skip. The
+        // window re-syncs on its next tick after opening.
+        if (mMap->isVisible())
+        {
+            mMap->setPlayerDir(playerdirection.x(), playerdirection.y());
+            mMap->setPlayerPos(x, y, u, v);
+        }
+        // Experiment (ux0:data/openmw/minimaphz.txt holding N): move the HUD
+        // minimap and compass at most N times a second. Each move re-lays
+        // out every map tile and door marker and rebuilds the whole GUI
+        // (~2.2 ms in cull).
+        static const float sMinimapPeriod = [] {
+            float hz = 0.f;
+            if (FILE* f = fopen("ux0:data/openmw/minimaphz.txt", "r"))
+            {
+                if (fscanf(f, "%f", &hz) != 1)
+                    hz = 0.f;
+                fclose(f);
+            }
+            return hz > 0.f ? 1.f / hz : 0.f;
+        }();
+        static float sMinimapAccum = 0.f;
+        sMinimapAccum += MWBase::Environment::get().getFrameDuration();
+        if (mHud->isVisible() && sMinimapAccum >= sMinimapPeriod)
+        {
+            sMinimapAccum = 0.f;
+            mHud->setPlayerDir(playerdirection.x(), playerdirection.y());
+            mHud->setPlayerPos(x, y, u, v);
+        }
+#else
         mMap->setPlayerDir(playerdirection.x(), playerdirection.y());
         mMap->setPlayerPos(x, y, u, v);
         mHud->setPlayerDir(playerdirection.x(), playerdirection.y());
         mHud->setPlayerPos(x, y, u, v);
+#endif
     }
 
     WindowBase* WindowManager::getActiveControllerWindow()
@@ -2192,7 +2245,11 @@ namespace MWGui
 
                 mViewer->eventTraversal();
                 mViewer->updateTraversal();
+#ifdef __vita__
+                Vita::renderingTraversalsOnGL(*mViewer);
+#else
                 mViewer->renderingTraversals();
+#endif
             }
             // at the time this function is called we are in the middle of a frame,
             // so out of order calls are necessary to get a correct frameNumber for the next frame.

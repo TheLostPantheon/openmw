@@ -1,5 +1,8 @@
 #include "myguirendermanager.hpp"
 
+#include <cstdio>
+#include <cstring>
+
 #include <MyGUI_Timer.h>
 #ifdef __vita__
 #include <MyGUI_LayerManager.h>
@@ -18,6 +21,13 @@
 #include <components/shader/shadermanager.hpp>
 
 #include "myguitexture.hpp"
+#ifdef __vita__
+#include <MyGUI_ISubWidget.h>
+#include <MyGUI_Widget.h>
+#include <psp2/kernel/processmgr.h>
+#include <psp2/io/stat.h>
+namespace Vita { bool isSimThread(); }
+#endif
 
 #define MYGUI_PLATFORM_LOG_SECTION "Platform"
 #define MYGUI_PLATFORM_LOG(level, text) MYGUI_LOGGING(MYGUI_PLATFORM_LOG_SECTION, level, text)
@@ -464,6 +474,10 @@ namespace MyGUIPlatform
         delete buffer;
     }
 
+#ifdef __vita__
+    static uint32_t sVitaBatchCount = 0; // [GuiLayers]: batches per layer walk
+#endif
+
     void RenderManager::begin()
     {
         mDrawable->clear();
@@ -491,6 +505,9 @@ namespace MyGUIPlatform
             batch.mStateSet = mInjectState;
 
         mDrawable->addBatch(batch);
+#ifdef __vita__
+        ++sVitaBatchCount;
+#endif
     }
 
     void RenderManager::setInjectState(osg::StateSet* stateSet)
@@ -515,6 +532,106 @@ namespace MyGUIPlatform
 #ifdef __vita__
     uint32_t g_vitaGuiWalks = 0;
     uint32_t g_vitaGuiSkips = 0;
+    // Time spent in full walks (batch rebuilds), for [Scene] guiwalk; in the
+    // per-frame dirty check across layers, and in clean-frame batch replays.
+    uint32_t g_vitaGuiWalkUs = 0, g_vitaGuiCheckUs = 0, g_vitaGuiRepeatUs = 0;
+    // [GuiLayers] (guiprof.txt): walk time and batches per layer.
+    char g_vitaGuiLayerNames[32][24] = {};
+    uint32_t g_vitaGuiLayerUs[32] = {}, g_vitaGuiLayerBatches[32] = {};
+    static bool vitaGuiProf()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/guiprof.txt", &st) >= 0;
+        }();
+        return sOn;
+    }
+    // Dirty attribution: every sub-widget dirty site reports (via the
+    // MyGUI probe macro). Keyed by owning widget name/type + parent chain
+    // + thread; top rows printed per audit window.
+    struct VitaDirtyRow
+    {
+        char key[72];
+        uint32_t n;
+    };
+    VitaDirtyRow g_vitaGuiDirtyRows[12] = {};
+    // Attribution table is opt-in: ux0:data/openmw/guidirty.txt. The probe
+    // macro's weak-hook check is the only per-dirty cost when off.
+    bool g_vitaGuiDirtyEnabled = false;
+    extern "C" void vitaGuiSubDirty(MyGUI::ISubWidget* sub)
+    {
+        if (!sub || !g_vitaGuiDirtyEnabled)
+            return;
+        char key[72];
+        MyGUI::Widget* w = nullptr;
+        if (MyGUI::ICroppedRectangle* cp = sub->getCroppedParent())
+            w = dynamic_cast<MyGUI::Widget*>(cp);
+        // Label = name if set, else type (type is a string_view).
+        const auto label = [](const MyGUI::Widget* x, char* out, size_t cap) {
+            if (!x)
+            {
+                out[0] = 0;
+                return;
+            }
+            const std::string& nm = x->getName();
+            if (!nm.empty())
+                snprintf(out, cap, "%s", nm.c_str());
+            else
+            {
+                const std::string_view tn = x->getTypeName();
+                snprintf(out, cap, "%.*s", (int)tn.size(), tn.data());
+            }
+        };
+        if (w)
+        {
+            char l0[28], l1[20], l2[20];
+            label(w, l0, sizeof(l0));
+            label(w->getParent(), l1, sizeof(l1));
+            label(w->getParent() ? w->getParent()->getParent() : nullptr, l2, sizeof(l2));
+            const std::string_view tn = w->getTypeName();
+            snprintf(key, sizeof(key), "%s<%.*s>^%s^%s%s", l0, (int)tn.size(), tn.data(), l1, l2,
+                Vita::isSimThread() ? "@sim" : "");
+        }
+        else
+        {
+            const std::string_view tn = sub->getTypeName();
+            snprintf(key, sizeof(key), "?<%.*s>%s", (int)tn.size(), tn.data(), Vita::isSimThread() ? "@sim" : "");
+        }
+        for (auto& row : g_vitaGuiDirtyRows)
+        {
+            if (row.key[0] == 0)
+            {
+                snprintf(row.key, sizeof(row.key), "%s", key);
+                row.n = 1;
+                return;
+            }
+            if (strcmp(row.key, key) == 0)
+            {
+                ++row.n;
+                return;
+            }
+        }
+    }
+    // Per-layer dirty attribution: which layer forced each walk.
+    char g_vitaGuiDirtyLayers[8][24] = {};
+    uint32_t g_vitaGuiDirtyCounts[8] = {};
+    static void vitaNoteDirtyLayer(const std::string& name)
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            if (g_vitaGuiDirtyLayers[i][0] == 0)
+            {
+                snprintf(g_vitaGuiDirtyLayers[i], sizeof(g_vitaGuiDirtyLayers[i]), "%s", name.c_str());
+                g_vitaGuiDirtyCounts[i] = 1;
+                return;
+            }
+            if (name == g_vitaGuiDirtyLayers[i])
+            {
+                ++g_vitaGuiDirtyCounts[i];
+                return;
+            }
+        }
+    }
 #endif
 
     void RenderManager::collectDrawCalls()
@@ -524,33 +641,86 @@ namespace MyGUIPlatform
         // (main joins it: this is critical-path). MyGUI tracks widget
         // dirtiness per layer node; when nothing changed, re-emit last
         // frame's batches instead of rebuilding them. mUpdate (resize/theme)
-        // still forces a walk, as does any layer type without dirty tracking
-        // (ILayer::isOutOfDate defaults true).
+        // still forces a walk. Every OpenMW layer (files/data/mygui/
+        // openmw_layers.xml) is a shared or overlapped layer, both tracked.
+        // What changed is known from MyGUI's own out-of-date marks: a dirty
+        // generation (MyGUI patch, vita_gui_dirty_gen) moves whenever a
+        // layer, layer node or render item is marked. Comparing it replaces
+        // walking every layer each frame to ask (1.3 ms/frame in the city,
+        // as much as the rebuilds). noguigen.txt restores the walk for A/B;
+        // guidirty.txt attribution needs the walk to name the layer.
+        static const bool sUseGen = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/noguigen.txt", &st) < 0;
+        }();
+        static unsigned int sWalkedGen = ~0u;
+        const unsigned int gen = vita_gui_dirty_gen;
         if (!mUpdate)
         {
+            const uint64_t checkT0 = sceKernelGetProcessTimeWide();
             bool anyDirty = false;
-            MyGUI::LayerManager::EnumeratorLayer layers
-                = MyGUI::LayerManager::getInstance().getEnumerator();
-            while (layers.next())
+            if (sUseGen && !g_vitaGuiDirtyEnabled)
+                anyDirty = gen != sWalkedGen;
+            else
             {
-                if (layers.current()->isOutOfDate())
+                MyGUI::LayerManager::EnumeratorLayer layers = MyGUI::LayerManager::getInstance().getEnumerator();
+                while (layers.next())
                 {
-                    anyDirty = true;
-                    break;
+                    if (layers.current()->isOutOfDate())
+                    {
+                        if (!anyDirty)
+                            vitaNoteDirtyLayer(layers.current()->getName());
+                        anyDirty = true;
+                        break;
+                    }
                 }
             }
+            const uint64_t checkT1 = sceKernelGetProcessTimeWide();
+            g_vitaGuiCheckUs += (uint32_t)(checkT1 - checkT0);
             if (!anyDirty)
             {
                 mDrawable->repeatLastBatches();
+                g_vitaGuiRepeatUs += (uint32_t)(sceKernelGetProcessTimeWide() - checkT1);
                 ++g_vitaGuiSkips;
                 return;
             }
         }
+        // Marks made during the walk show up as a newer generation: one
+        // extra walk next frame, never a missed change.
+        sWalkedGen = gen;
         ++g_vitaGuiWalks;
+        const uint64_t walkT0 = sceKernelGetProcessTimeWide();
 #endif
         begin();
+#ifdef __vita__
+        if (vitaGuiProf())
+        {
+            // Same order as LayerManager::renderToTarget, one layer at a time.
+            MyGUI::LayerManager::EnumeratorLayer layers = MyGUI::LayerManager::getInstance().getEnumerator();
+            for (int i = 0; layers.next(); ++i)
+            {
+                const uint64_t l0 = sceKernelGetProcessTimeWide();
+                const uint32_t b0 = sVitaBatchCount;
+                layers.current()->renderToTarget(this, mUpdate);
+                if (i < 32)
+                {
+                    if (g_vitaGuiLayerNames[i][0] == 0)
+                        snprintf(g_vitaGuiLayerNames[i], sizeof(g_vitaGuiLayerNames[i]), "%s",
+                            layers.current()->getName().c_str());
+                    g_vitaGuiLayerUs[i] += (uint32_t)(sceKernelGetProcessTimeWide() - l0);
+                    g_vitaGuiLayerBatches[i] += sVitaBatchCount - b0;
+                }
+            }
+        }
+        else
+            onRenderToTarget(this, mUpdate);
+#else
         onRenderToTarget(this, mUpdate);
+#endif
         end();
+#ifdef __vita__
+        g_vitaGuiWalkUs += (uint32_t)(sceKernelGetProcessTimeWide() - walkT0);
+#endif
 
         mUpdate = false;
     }

@@ -19,6 +19,7 @@
 #include <osg/Timer>
 
 #include "components/misc/budgetmeasurement.hpp"
+#include "components/misc/sharedmutex.hpp"
 #include "physicssystem.hpp"
 #include "ptrholder.hpp"
 
@@ -62,6 +63,16 @@ namespace MWPhysics
             btCollisionWorld::RayResultCallback& resultCallback) const;
         void convexSweepTest(const btConvexShape* castShape, const btTransform& from, const btTransform& to,
             btCollisionWorld::ConvexResultCallback& resultCallback) const;
+#ifdef __vita__
+        /// As rayTest, but returns false instead of waiting when the
+        /// collision world is locked (the physics thread moving actors).
+        bool tryRayTest(const btVector3& rayFromWorld, const btVector3& rayToWorld,
+            btCollisionWorld::RayResultCallback& resultCallback) const;
+        /// As convexSweepTest, but returns false instead of waiting when the
+        /// collision world is locked (the physics thread moving actors).
+        bool tryConvexSweepTest(const btConvexShape* castShape, const btTransform& from, const btTransform& to,
+            btCollisionWorld::ConvexResultCallback& resultCallback) const;
+#endif
         void contactTest(btCollisionObject* colObj, btCollisionWorld::ContactResultCallback& resultCallback);
         std::optional<btVector3> getHitPoint(const btTransform& from, btCollisionObject* target);
         void aabbTest(const btVector3& aabbMin, const btVector3& aabbMax, btBroadphaseAabbCallback& callback);
@@ -136,9 +147,9 @@ namespace MWPhysics
         std::vector<std::thread> mThreads;
 #endif
 
-        mutable std::shared_mutex mSimulationMutex;
-        mutable std::shared_mutex mCollisionWorldMutex;
-        mutable std::shared_mutex mLOSCacheMutex;
+        mutable Misc::SharedMutex mSimulationMutex;
+        mutable Misc::SharedMutex mCollisionWorldMutex;
+        mutable Misc::SharedMutex mLOSCacheMutex;
         mutable std::mutex mUpdateAabbMutex;
 
         unsigned int mFrameNumber;

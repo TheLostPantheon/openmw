@@ -14,6 +14,17 @@
 
 namespace LuaUtil
 {
+#ifdef __vita__
+    // [LuaHist] (ux0:data/openmw/luaprof.txt): time per engine handler and
+    // script, e.g. onFrame of the camera script. Off: one bool check.
+    bool vitaLuaProfOn();
+    unsigned long long vitaLuaNowUs();
+    void vitaLuaHistAdd(std::string_view handler, int scriptId, const VFS::Path::Normalized& path,
+        unsigned long long us);
+    /// Top handlers by time over \a frames frames, then reset. 0 when off.
+    int vitaLuaHistReport(char* buf, std::size_t len, unsigned frames);
+#endif
+
     class ScriptTracker;
 
     // ScriptsContainer is a base class for all scripts containers (LocalScripts,
@@ -215,6 +226,16 @@ namespace LuaUtil
             {
                 try
                 {
+#ifdef __vita__
+                    if (vitaLuaProfOn())
+                    {
+                        const unsigned long long t0 = vitaLuaNowUs();
+                        LuaUtil::call({ this, handler.mScriptId }, handler.mFn, args...);
+                        vitaLuaHistAdd(handlers.mName, handler.mScriptId, scriptPath(handler.mScriptId),
+                            vitaLuaNowUs() - t0);
+                        continue;
+                    }
+#endif
                     LuaUtil::call({ this, handler.mScriptId }, handler.mFn, args...);
                 }
                 catch (std::exception& e)

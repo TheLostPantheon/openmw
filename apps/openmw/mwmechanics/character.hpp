@@ -184,6 +184,14 @@ namespace MWMechanics
         float mSecondsOfRunning{ 0.f };
 
         MWWorld::ConstPtr mHeadTrackTarget;
+#ifdef __vita__
+        // Head tracking's target angles (two scene-graph path walks to find
+        // both heads, ~0.15 ms per actor) are recomputed every 3rd frame for
+        // NPCs; the head still eases towards them every frame.
+        MWWorld::ConstPtr mVitaHeadTarget;
+        unsigned mVitaHeadFrame = 0;
+        float mVitaHeadZ = 0.f, mVitaHeadX = 0.f;
+#endif
 
         float mTurnAnimationThreshold{
             0.f

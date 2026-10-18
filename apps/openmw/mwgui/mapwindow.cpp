@@ -2,6 +2,10 @@
 
 #include <algorithm>
 
+#ifdef __vita__
+#include <psp2/io/stat.h>
+#endif
+
 #include <osg/Texture2D>
 
 #include <MyGUI_Button.h>
@@ -26,9 +30,19 @@
 #include "../mwbase/world.hpp"
 
 #include "../mwworld/cellstore.hpp"
+
+
 #include "../mwworld/esmstore.hpp"
 #include "../mwworld/player.hpp"
 #include "../mwworld/worldmodel.hpp"
+#ifdef __vita__
+#include <components/esm3/loadmgef.hpp>
+
+#include "../mwmechanics/actorutil.hpp"
+#include "../mwmechanics/creaturestats.hpp"
+#include "../mwmechanics/magiceffects.hpp"
+#include "../mwworld/class.hpp"
+#endif
 
 #include "../mwrender/globalmap.hpp"
 #include "../mwrender/localmap.hpp"
@@ -323,6 +337,19 @@ namespace MWGui
         MyGUI::IntPoint pos = mCompass->getPosition() + MyGUI::IntPoint{ 16, 16 };
         MyGUI::IntSize viewsize = mLocalMap->getSize();
         MyGUI::IntPoint viewOffset((viewsize.width / 2) - pos.left, (viewsize.height / 2) - pos.top);
+#ifdef __vita__
+        // ScrollView::setViewOffset repositions every child unconditionally:
+        // each frame the player moved, every map tile and door marker was
+        // re-laid out and the whole GUI rebuilt (MarkerWidget/ImageBox top
+        // the [GuiDirtyW] table), though the offset only changes per pixel.
+        // ux0:data/openmw/noguiskip.txt turns the skip off for A/B.
+        static const bool sSkipSame = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/noguiskip.txt", &st) < 0;
+        }();
+        if (sSkipSame && viewOffset == mLocalMap->getViewOffset())
+            return;
+#endif
         mLocalMap->setViewOffset(viewOffset);
     }
 
@@ -456,6 +483,12 @@ namespace MWGui
         }
 
         mActiveCell = &cell;
+#ifdef __vita__
+        // Hold map captures ~24 frames after a cell change so the expensive
+        // RTT (a full overhead scene render) lands after the crossing frame
+        // settles, not stacked on it.
+        mVitaMapDeferFrames = 24;
+#endif
 
         constexpr auto resetEntry = [](MapEntry& entry, bool visible, const MyGUI::IntPoint* position) {
             entry.mMapWidget->setVisible(visible);
@@ -598,12 +631,24 @@ namespace MWGui
 
     void LocalMapBase::onFrame(float dt)
     {
+#ifdef __vita__
+        // Door-marker rebuild: gather once (cheap now — no interior force-
+        // load), then create widgets on a per-frame budget. Held off the
+        // crossing frame via the settle window.
+        if (mNeedDoorMarkersUpdate && mVitaMapDeferFrames <= 0)
+        {
+            vitaGatherPendingDoors();
+            mNeedDoorMarkersUpdate = false;
+        }
+        if (mVitaDoorProcessing)
+            vitaDrainPendingDoors();
+#else
         if (mNeedDoorMarkersUpdate)
         {
             updateDoorMarkers();
             mNeedDoorMarkersUpdate = false;
         }
-
+#endif
         mMarkerUpdateTimer += dt;
 
         if (mMarkerUpdateTimer >= 0.25)
@@ -611,7 +656,6 @@ namespace MWGui
             mMarkerUpdateTimer = 0;
             updateMagicMarkers();
         }
-
         updateRequiredMaps();
     }
 
@@ -630,6 +674,11 @@ namespace MWGui
         // segments in one wm frame (160-200ms hitch). Deferred entries stay
         // textureless and retry next frame.
         int mapRenderBudget = 1;
+        if (mVitaMapDeferFrames > 0)
+        {
+            --mVitaMapDeferFrames;
+            mapRenderBudget = 0; // defer captures until the crossing settles
+        }
 #endif
         for (MapEntry& entry : mMaps)
         {
@@ -686,6 +735,86 @@ namespace MWGui
         if (needRedraw)
             redraw();
     }
+
+#ifdef __vita__
+    void LocalMapBase::vitaGatherPendingDoors()
+    {
+        // Cheap: typed Door scans over already-loaded cells only. Fills the
+        // pending list; vitaDrainPendingDoors creates the widgets budgeted.
+        mVitaPendingDoors.clear();
+        mVitaPendingDoorIdx = 0;
+        MWBase::World* world = MWBase::Environment::get().getWorld();
+        MWWorld::WorldModel* worldModel = MWBase::Environment::get().getWorldModel();
+        if (!mActiveCell->isExterior())
+        {
+            MWWorld::CellStore& cell = worldModel->getInterior(mActiveCell->getNameId());
+            world->getDoorMarkers(cell, mVitaPendingDoors);
+        }
+        else
+        {
+            for (MapEntry& entry : mMaps)
+            {
+                if (!entry.mMapWidget->getVisible() || widgetCropped(entry.mMapWidget, mLocalMap))
+                    continue;
+                if (mExteriorDoorsByCell.contains({ entry.mCellX, entry.mCellY }))
+                    continue;
+                ESM::ExteriorCellLocation id(entry.mCellX, entry.mCellY, ESM::Cell::sDefaultWorldspaceId);
+                MWWorld::CellStore& dcell = worldModel->getExterior(id, /*forceLoad*/ false);
+                if (dcell.getState() != MWWorld::CellStore::State_Loaded)
+                    continue;
+                world->getDoorMarkers(dcell, mVitaPendingDoors);
+            }
+        }
+        mVitaDoorProcessing = true;
+    }
+
+    void LocalMapBase::vitaDrainPendingDoors()
+    {
+        constexpr std::size_t kDoorBudget = 12; // widgets per frame
+        std::size_t done = 0;
+        for (; mVitaPendingDoorIdx < mVitaPendingDoors.size() && done < kDoorBudget;
+             ++mVitaPendingDoorIdx, ++done)
+        {
+            MWBase::World::DoorMarker& marker = mVitaPendingDoors[mVitaPendingDoorIdx];
+            std::vector<std::string> destNotes;
+            CustomMarkerCollection::RangeType markers = mCustomMarkers.getMarkers(marker.dest);
+            for (auto iter = markers.first; iter != markers.second; ++iter)
+                destNotes.push_back(iter->second.mNote);
+
+            MarkerWidget* markerWidget = nullptr;
+            MarkerUserData* data;
+            if (mDoorMarkersToRecycle.empty())
+            {
+                markerWidget = createDoorMarker(marker.name, marker.x, marker.y);
+                data = markerWidget->getUserData<MarkerUserData>();
+                data->notes = std::move(destNotes);
+                doorMarkerCreated(markerWidget);
+            }
+            else
+            {
+                markerWidget = mDoorMarkersToRecycle.back();
+                mDoorMarkersToRecycle.pop_back();
+                data = markerWidget->getUserData<MarkerUserData>();
+                data->notes = std::move(destNotes);
+                data->caption = marker.name;
+                markerWidget->setCoord(getMarkerCoordinates(marker.x, marker.y, *data, 8));
+                markerWidget->setVisible(true);
+            }
+            currentDoorMarkersWidgets().push_back(markerWidget);
+            if (mActiveCell->isExterior())
+                mExteriorDoorsByCell[{ data->cellX, data->cellY }].push_back(markerWidget);
+        }
+        if (mVitaPendingDoorIdx >= mVitaPendingDoors.size())
+        {
+            // Finished: reposition all door widgets once, then release.
+            for (MyGUI::Widget* widget : currentDoorMarkersWidgets())
+                updateMarkerCoordinates(widget, 8);
+            mVitaPendingDoors.clear();
+            mVitaPendingDoorIdx = 0;
+            mVitaDoorProcessing = false;
+        }
+    }
+#endif
 
     void LocalMapBase::updateDoorMarkers()
     {
@@ -751,6 +880,24 @@ namespace MWGui
 
     void LocalMapBase::updateMagicMarkers()
     {
+#ifdef __vita__
+        // 4Hz rebuild + forced redraw even with zero markers dirtied the HUD
+        // (minimap shares this path). Skip when nothing to show and nothing
+        // was shown.
+        {
+            const MWWorld::Ptr player = MWMechanics::getPlayer();
+            const MWMechanics::MagicEffects& effects = player.getClass().getCreatureStats(player).getMagicEffects();
+            const bool anyDetect = effects.getOrDefault(ESM::MagicEffect::DetectAnimal).getMagnitude() > 0
+                || effects.getOrDefault(ESM::MagicEffect::DetectKey).getMagnitude() > 0
+                || effects.getOrDefault(ESM::MagicEffect::DetectEnchantment).getMagnitude() > 0;
+            MWWorld::CellStore* mkCell = nullptr;
+            ESM::Position mkPos;
+            MWBase::Environment::get().getWorld()->getPlayer().getMarkedPosition(mkCell, mkPos);
+            const bool anyMark = mkCell != nullptr;
+            if (!anyDetect && !anyMark && mMagicMarkerWidgets.empty())
+                return;
+        }
+#endif
         // clear all previous markers
         for (MyGUI::Widget* widget : mMagicMarkerWidgets)
             MyGUI::Gui::getInstance().destroyWidget(widget);

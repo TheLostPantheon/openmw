@@ -34,6 +34,7 @@
 #include <components/resource/scenemanager.hpp>
 #include <components/terrain/view.hpp>
 #include <components/terrain/world.hpp>
+#include <components/settings/values.hpp>
 #include <components/vfs/manager.hpp>
 
 #include "../mwrender/landmanager.hpp"
@@ -937,10 +938,35 @@ namespace MWWorld
         {
             ++mVitaWantedCount;
             it->second.requested = std::chrono::steady_clock::now();
-            // Hard cap: the ledger must respect the budget. Evict the
-            // farthest Wanted; refuse if nothing is evictable.
-            constexpr std::size_t kMaxDemand = 128;
-            if (mVitaDemand.size() > kMaxDemand)
+            // Cap bounds IN-FLIGHT loading (Wanted+Loading). Ready entries
+            // are delivered stock awaiting an add — bounded by GC, not here.
+            // Counting them here let a full Ready pool refuse every new far
+            // request for up to a GC interval (whole sections never queued).
+            constexpr std::size_t kMaxInFlight = 128;
+            constexpr std::size_t kMaxReadyInline = 80;
+            std::size_t inFlight = 0, ready = 0;
+            for (const auto& [dp, de] : mVitaDemand)
+            {
+                if (de.state == VitaDemandState::Ready)
+                    ++ready;
+                else
+                    ++inFlight;
+            }
+            // Ready overflow: drop the stalest delivered entry now rather
+            // than waiting for the 2s GC (its ref reloads on demand).
+            while (ready > kMaxReadyInline)
+            {
+                auto oldest = mVitaDemand.end();
+                for (auto o = mVitaDemand.begin(); o != mVitaDemand.end(); ++o)
+                    if (o->second.state == VitaDemandState::Ready
+                        && (oldest == mVitaDemand.end() || o->second.touch < oldest->second.touch))
+                        oldest = o;
+                if (oldest == mVitaDemand.end())
+                    break;
+                mVitaDemand.erase(oldest);
+                --ready;
+            }
+            if (inFlight > kMaxInFlight)
             {
                 auto worst = mVitaDemand.end();
                 for (auto w = mVitaDemand.begin(); w != mVitaDemand.end(); ++w)
@@ -1043,7 +1069,7 @@ namespace MWWorld
         using Clock = std::chrono::steady_clock;
         static Clock::time_point sLast{};
         const auto now = Clock::now();
-        if (sLast.time_since_epoch().count() != 0 && now - sLast < std::chrono::seconds(2))
+        if (sLast.time_since_epoch().count() != 0 && now - sLast < std::chrono::seconds(1))
             return;
         sLast = now;
         const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
@@ -1082,10 +1108,16 @@ namespace MWWorld
                 }
                 ++it;
             }
-            else if (it->second.state == VitaDemandState::Wanted && age > std::chrono::seconds(30))
+            else if (it->second.state == VitaDemandState::Wanted && age > std::chrono::seconds(4))
             {
+                // Untouched for 4s = no live needer scanned it (the hydrator
+                // touches every in-reach candidate each tick). Drop it: it
+                // was for an object the player has passed, and it holds an
+                // in-flight cap slot that blocks fresh nearby requests. 30s
+                // let a whole walk of stale requests jam the queue under a
+                // wedge. Bounds stay learned; it reloads if re-approached.
                 --mVitaWantedCount;
-                it = mVitaDemand.erase(it); // nobody re-asked
+                it = mVitaDemand.erase(it);
             }
             else
                 ++it;
@@ -1098,14 +1130,36 @@ namespace MWWorld
         constexpr std::size_t kVitaWarmPoolBudget = 32u << 20;
     }
 
-    void CellPreloader::vitaPumpWarm(bool idle)
+    void CellPreloader::vitaPumpWarm(bool idle, bool starved)
     {
         // Always-on: the hydrator's cold requests need the worker MOST
         // while the player moves. Idle gets full batches; movement small.
         if (!mWorkQueue)
             return;
+        // Re-armed every tick under urgent demand: when the worker is still
+        // busy this must be a cheap no-op, so pool enforcement (evicts up to
+        // 3/call) only runs when a batch can actually be issued.
+        const bool workerBusy = (mVitaDemandItem && !mVitaDemandItem->isDone())
+            && (mVitaDemandItem2 && !mVitaDemandItem2->isDone())
+            && (mVitaCommonItem && !mVitaCommonItem->isDone());
+        if (workerBusy)
+            return;
         // Persistence writes moved behind screens: 362ms SD write on main.
-        vitaEnforcePoolBudget(kVitaWarmPoolBudget, 3);
+        // FLOATING pool budget: pools own the full budget when demand is
+        // quiet and yield toward the floor in proportion to unserviced
+        // urgent demand. Demand ("player will see this soon") outranks
+        // stock ("someone might need this later"). Yielded bytes are the
+        // headroom that lets the pump run at the heap gate; pools re-warm
+        // when demand clears.
+        {
+            constexpr std::size_t kFloor = 12u << 20;
+            const int urgent = vitaDemandUrgentCount();
+            // 0 urgent -> full budget; 32+ urgent -> floor. Linear between.
+            const float yield = std::min(1.f, urgent / 32.f);
+            const std::size_t target
+                = kFloor + (std::size_t)((1.f - yield) * (float)(kVitaWarmPoolBudget - kFloor));
+            vitaEnforcePoolBudget(target, urgent > 0 ? 6 : 3);
+        }
         // Worker paces to frame health like every other subsystem.
         using PumpClock = std::chrono::steady_clock;
         static PumpClock::time_point sLastPumpT{};
@@ -1115,10 +1169,24 @@ namespace MWWorld
             : (int)std::chrono::duration_cast<std::chrono::milliseconds>(pumpNow - sLastPumpT).count();
         sLastPumpT = pumpNow;
         const bool grace = pumpNow < mVitaPumpGraceUntil;
+        // Anticipatory warming paces to frame health; URGENT DEMAND does
+        // not. Demand loads run on the worker — main-thread frame time is
+        // the wrong governor for them, and gating them at 5/batch under
+        // load starved delivery exactly when busy scenes needed it most
+        // ("guaranteed" queueing with no throughput behind it). Demand
+        // batches are governed by memory headroom instead.
         const std::size_t kBatch = grace ? 5 : (idle ? 25 : (pumpDt > 37 ? 5 : 12));
+        const std::size_t kDemandBatch = starved ? 4 : (grace ? 8 : 24);
         vitaDemandGC();
         // Demand first: these models block eligible hydrations right now.
+        // Two demand lanes keep both preload threads fed; each lane takes
+        // its own batch, so two batches load concurrently.
+        osg::ref_ptr<SceneUtil::WorkItem>* lane = nullptr;
         if (!mVitaDemandItem || mVitaDemandItem->isDone())
+            lane = &mVitaDemandItem;
+        else if (!mVitaDemandItem2 || mVitaDemandItem2->isDone())
+            lane = &mVitaDemandItem2;
+        if (lane != nullptr)
         {
             std::vector<std::pair<std::string, unsigned>> want;
             {
@@ -1128,7 +1196,7 @@ namespace MWWorld
                 for (auto& [path, e] : mVitaDemand)
                     if (e.state == VitaDemandState::Wanted)
                         ranked.push_back({ e.prio, &path });
-                const std::size_t take = std::min(kBatch, ranked.size());
+                const std::size_t take = std::min(kDemandBatch, ranked.size());
                 std::partial_sort(ranked.begin(), ranked.begin() + take, ranked.end());
                 for (std::size_t i = 0; i < take; ++i)
                 {
@@ -1140,12 +1208,15 @@ namespace MWWorld
             }
             if (!want.empty())
             {
-                mVitaDemandItem = new VitaCommonWarmItem(this, mResourceSystem->getSceneManager(),
+                mVitaDemandIssued += want.size(); // before the move
+                *lane = new VitaCommonWarmItem(this, mResourceSystem->getSceneManager(),
                     mBulletShapeManager, std::move(want), false, true);
-                mWorkQueue->addWorkItem(mVitaDemandItem);
+                mWorkQueue->addWorkItem(*lane);
                 return;
             }
         }
+        if (starved)
+            return;
         if (!mVitaRegionBacklog.empty())
         {
             if (mVitaRegionItem && !mVitaRegionItem->isDone())
@@ -1354,9 +1425,59 @@ namespace MWWorld
         vitaEnforceBudgetLocked(kVitaWarmPoolBudget, 2);
     }
 
+    int CellPreloader::vitaPinPermanent(const std::vector<std::string>& paths)
+    {
+        int added = 0;
+        for (const std::string& path : paths)
+        {
+            {
+                const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
+                if (mVitaPinnedSet.count(path) > 0)
+                    continue;
+            }
+            VitaCommonRef ref;
+            try
+            {
+                // Load outside the lock: workers contend on it.
+                vitaLoadWarmResource(path, ref.tmpl, ref.shape);
+            }
+            catch (const std::exception& e)
+            {
+                Log(Debug::Warning) << "Permanent pin failed '" << path << "': " << e.what();
+                continue;
+            }
+            if (!ref.tmpl)
+                continue;
+            const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
+            if (mVitaPinnedSet.emplace(path, std::move(ref)).second)
+                ++added;
+        }
+        return added;
+    }
+
+    osg::ref_ptr<const osg::Referenced> CellPreloader::vitaHoldWarm(const std::string& path) const
+    {
+        const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
+        auto it = mVitaPinnedSet.find(path);
+        if (it != mVitaPinnedSet.end())
+            return it->second.tmpl;
+        it = mVitaCommonSet.find(path);
+        if (it != mVitaCommonSet.end() && it->second.tmpl)
+            return it->second.tmpl;
+        it = mVitaRegionSet.find(path);
+        if (it != mVitaRegionSet.end() && it->second.tmpl)
+            return it->second.tmpl;
+        auto d = mVitaDemand.find(path);
+        if (d != mVitaDemand.end() && d->second.state == VitaDemandState::Ready && d->second.tmpl)
+            return d->second.tmpl;
+        return nullptr;
+    }
+
     bool CellPreloader::vitaIsCommonWarm(const std::string& path) const
     {
         const std::lock_guard<std::mutex> lock(mVitaCommonMutex);
+        if (mVitaPinnedSet.count(path) > 0)
+            return true;
         auto it = mVitaCommonSet.find(path);
         if (it != mVitaCommonSet.end() && it->second.tmpl)
             return true;
@@ -1462,6 +1583,12 @@ namespace MWWorld
     void CellPreloader::clear()
     {
 #ifdef __vita__
+        if (mVitaDemandItem2)
+        {
+            mVitaDemandItem2->abort();
+            mVitaDemandItem2->waitTillDone();
+            mVitaDemandItem2 = nullptr;
+        }
         if (mVitaDemandItem)
         {
             mVitaDemandItem->abort();
@@ -1544,10 +1671,50 @@ namespace MWWorld
         mPreloadInstances = preload;
     }
 
+#ifdef __vita__
+    namespace
+    {
+        // Opens the archive handle pool on the worker that runs it: the
+        // first BSA access per thread pays fopen + a deep FAT seek (350-
+        // 420ms measured); paying it at boot moves that stall off the
+        // first streamed asset. One item per preload thread.
+        class VitaHandleWarmItem : public SceneUtil::WorkItem
+        {
+        public:
+            explicit VitaHandleWarmItem(const VFS::Manager* vfs)
+                : mVFS(vfs)
+            {
+            }
+            void doWork() override
+            {
+                try
+                {
+                    // Any BSA member; base_anim always lives in Morrowind.bsa.
+                    Files::IStreamPtr st = mVFS->get(VFS::Path::NormalizedView("meshes/base_anim.nif"));
+                    char c;
+                    st->read(&c, 1);
+                }
+                catch (...)
+                {
+                }
+            }
+
+        private:
+            const VFS::Manager* mVFS;
+        };
+    }
+#endif
+
     void CellPreloader::setWorkQueue(osg::ref_ptr<SceneUtil::WorkQueue> workQueue)
     {
         mWorkQueue = workQueue;
 #ifdef __vita__
+        // Handle pool is per thread: one warm item per preload thread. The
+        // queue hands items to idle threads, so posting N items with N
+        // threads reaches each once the first blocks on I/O.
+        if (mWorkQueue)
+            for (int i = 0; i < Settings::cells().mPreloadNumThreads; ++i)
+                mWorkQueue->addWorkItem(new VitaHandleWarmItem(mResourceSystem->getVFS()));
         vitaLoadModelFreq();
         vitaLoadModelBounds();
         vitaLoadRegionPackages();
@@ -1635,7 +1802,16 @@ namespace MWWorld
 
     bool CellPreloader::isTerrainLoaded(const PositionCellGrid& position, double referenceTime) const
     {
-        return mLoadedTerrainTimestamp + mResourceSystem->getSceneManager()->getExpiryDelay() > referenceTime
+#ifdef __vita__
+        // Terrain stays cached for the land/terrain expiry, not the model
+        // template one: fast travel shortens the latter to 0.5 s, which made
+        // every crossing think its terrain had expired and build it
+        // synchronously.
+        const double expiry = mLandManager->getExpiryDelay();
+#else
+        const double expiry = mResourceSystem->getSceneManager()->getExpiryDelay();
+#endif
+        return mLoadedTerrainTimestamp + expiry > referenceTime
             && contains(mLoadedTerrainPositions, position, Constants::CellSizeInUnits);
     }
 
@@ -1664,7 +1840,8 @@ namespace MWWorld
         }
 
 #ifdef __vita__
-        for (osg::ref_ptr<SceneUtil::WorkItem>* item : { &mVitaCommonItem, &mVitaRegionItem, &mVitaDemandItem })
+        for (osg::ref_ptr<SceneUtil::WorkItem>* item :
+            { &mVitaCommonItem, &mVitaRegionItem, &mVitaDemandItem, &mVitaDemandItem2 })
         {
             if (*item)
             {

@@ -9,6 +9,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 
+#include "VitaGLGuard.h"
 #include "VitaInit.h"
 
 namespace Vita
@@ -27,6 +28,7 @@ namespace Vita
     void setDrawInFlight(bool inFlight)
     {
         sDrawInFlight.store(inFlight, std::memory_order_release);
+        vita_draw_inflight = inFlight ? 1 : 0;
     }
 
     void simFence()
@@ -95,7 +97,13 @@ namespace Vita
     void SimWorker::loop() noexcept
     {
         tIsSimThread = true;
-        breadcrumb("[SimWorker] alive");
+        glGuardNameThread("sim");
+        pinCurrentThread(1, "sim");
+        {
+            char buf[48];
+            std::snprintf(buf, sizeof(buf), "[SimWorker] alive tid=0x%x", (unsigned)sceKernelGetThreadId());
+            breadcrumb(buf);
+        }
 
         while (!mJoinRequest.load(std::memory_order_acquire))
         {
@@ -105,6 +113,7 @@ namespace Vita
                 continue;
             }
 
+            vita_sim_busy = 1;
             try
             {
                 mWork();
@@ -122,6 +131,7 @@ namespace Vita
             }
 
             mWork = nullptr;
+            vita_sim_busy = 0;
             mHasWork.store(false, std::memory_order_release);
         }
     }

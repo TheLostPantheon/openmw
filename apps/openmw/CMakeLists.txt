@@ -10,6 +10,12 @@ if(VITA)
         vita/VitaMemAudit.cpp
         vita/VitaSimWorker.cpp
         vita/VitaGLWorker.cpp
+        vita/VitaCrashReport.cpp
+        vita/VitaBuildInfo.cpp
+        vita/VitaCullTimer.cpp
+        vita/VitaLogServer.cpp
+        vita/VitaBench.cpp
+        vita/VitaStaticRenderer.cpp
     )
 endif()
 
@@ -280,6 +286,33 @@ endif (ANDROID)
 if (VITA)
     # Attr-less pthreads get 256KB stacks (default 32KB; Bullet EPA needs ~30KB).
     target_link_options(openmw PRIVATE "-Wl,--wrap=pthread_create")
+    # Crash reporter (vita/VitaCrashReport.cpp): weak stub, so the app still
+    # loads on consoles without kubridge (the reporter just stays unarmed).
+    target_link_libraries(openmw-lib kubridge_stub_weak)
+    # Log server (vita/VitaLogServer.cpp): loads the net module on demand.
+    target_link_libraries(openmw-lib SceNet_stub)
+
+    # GL guard (vita/VitaGLGuard.h): wraps every vitaGL entry point listed in
+    # vita/VitaGLGuardList.h with an owner-thread check that logs off-thread
+    # calls. ~8 instructions per GL call when on the owner thread.
+    option(OPENMW_VITA_GL_GUARD "Log vitaGL calls made off the GL owner thread" ON)
+    target_sources(openmw PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vita/VitaGLGuard.cpp)
+    if (OPENMW_VITA_GL_GUARD)
+        set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/vita/VitaGLGuard.cpp
+            PROPERTIES COMPILE_DEFINITIONS OPENMW_VITA_GL_GUARD)
+        set(_vglGuardList "${CMAKE_CURRENT_SOURCE_DIR}/vita/VitaGLGuardList.h")
+        set(_vglGuardWrap "${CMAKE_CURRENT_BINARY_DIR}/vglguard.wrap")
+        file(STRINGS "${_vglGuardList}" _vglGuardLines REGEX "^VGL_GUARD\\(")
+        set(_vglGuardFlags "")
+        foreach(_line ${_vglGuardLines})
+            string(REGEX REPLACE "^VGL_GUARD\\(([A-Za-z0-9_]+)\\).*" "--wrap=\\1" _flag "${_line}")
+            string(APPEND _vglGuardFlags "${_flag}\n")
+        endforeach()
+        file(WRITE "${_vglGuardWrap}" "${_vglGuardFlags}")
+        target_link_options(openmw PRIVATE "-Wl,@${_vglGuardWrap}")
+        set_property(TARGET openmw APPEND PROPERTY LINK_DEPENDS "${_vglGuardWrap}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_vglGuardList}")
+    endif()
     # OSG libs excluded from USED_OSG_COMPONENTS but still needed for linking.
     foreach(_osgextra osgParticle osgShadow)
         if(NOT TARGET ${_osgextra})
@@ -399,7 +432,11 @@ if (VITA AND BUILD_OPENMW)
             ${CMAKE_CURRENT_BINARY_DIR}/openmw
         COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/vita/fix-veneers.py
             ${CMAKE_CURRENT_BINARY_DIR}/openmw
-        COMMENT "Fixing ARM relocations and veneer literal pools"
+        # A call at the edge of branch range can be mis-linked (veneer made
+        # but not used): route it through the veneer, or fail the build.
+        COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/vita/check-branches.py --fix --remove-on-fail
+            ${CMAKE_CURRENT_BINARY_DIR}/openmw
+        COMMENT "Fixing ARM relocations and veneer literal pools; checking branch targets"
         VERBATIM
     )
 
@@ -426,7 +463,7 @@ if (VITA AND BUILD_OPENMW)
 
     # Create VPK package
     vita_create_vpk(openmw.vpk ${VITA_TITLEID} eboot.bin
-        VERSION 02.20
+        VERSION 02.30
         NAME ${VITA_APP_NAME}
         FILE ${CMAKE_SOURCE_DIR}/apps/openmw/vita/openmw.cfg openmw.cfg
         FILE ${CMAKE_BINARY_DIR}/defaults.bin defaults.bin

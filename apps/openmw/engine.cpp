@@ -24,6 +24,9 @@
 #include <components/debug/gldebug.hpp>
 
 #ifdef __vita__
+#include "vita/VitaBench.h"
+#include "vita/VitaCullTimer.h"
+#include "vita/VitaStaticRenderer.h"
 #include "vita/VitaInit.h"
 #include "vita/VitaMemAudit.h"
 #include "vita/VitaSimWorker.h"
@@ -31,15 +34,27 @@
 #include <components/vita/VitaDialogueText.h>
 #include <components/vita/VitaEsmPrefetch.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/display.h>
 // Pin API; vitasdk's stock vitaGL.h lacks it.
 extern "C" void vglSetStaticVboRam(unsigned char enable);
+extern "C" int osgapply_unif_hist_report(char* buf, unsigned int buflen);
 extern "C" uint32_t phase_evt_us, phase_upd_us, phase_focus_us, phase_lua_us, phase_pre_us, phase_pace_us;
 extern "C" uint32_t phase_fin_us, phase_inp_us, phase_unref_us, phase_stats_us;
+extern "C" uint32_t vita_simjob_us, vita_simjob_upd_us, vita_simjob_cull_us;
+extern "C" uint32_t vita_lua_overlap_start_us, vita_lua_overlap_us, vita_lua_overlap_wait_us,
+    vita_lua_overlap_frames;
 extern "C" uint32_t phase_snd_us, phase_lsync_us, phase_state_us;
 extern "C" uint32_t phase_world_us, phase_wm_us;
 extern "C" unsigned int vita_bin2_graphs, vita_bin2_leaves;
 extern "C" uint32_t gl_draw_us, gl_swap_us, gl_draw_max, gl_swap_max;
+extern "C" uint32_t vita_cullfence_us, vita_gl_cull_us, vita_cullongl_frames;
+// OSG patch (Group.cpp): cull-thread child-list snapshots.
+extern "C" void osg_vita_cow_enable(int on);
+extern "C" void osg_vita_cow_set_writer(void);
+// OSG patch (CullVisitor.cpp): cull timers run on frames with this set.
+extern "C" int osg_vita_cullprof_sample;
+extern "C" void osg_vita_cow_drain(void);
 
 namespace
 {
@@ -143,6 +158,7 @@ extern int vita_state_replay;
 #include "mwworld/datetimemanager.hpp"
 #include "mwworld/worldimp.hpp"
 
+#include "mwrender/renderingmanager.hpp"
 #include "mwrender/vismask.hpp"
 
 #include "mwclass/classes.hpp"
@@ -250,25 +266,56 @@ namespace
 namespace
 {
     std::mutex sVitaScriptHistMutex;
-    std::map<ESM::RefId, uint32_t> sVitaScriptHist;
+    struct VitaScriptCost
+    {
+        uint32_t mUs = 0;
+        uint32_t mRuns = 0;
+    };
+    std::map<ESM::RefId, VitaScriptCost> sVitaScriptHist;
+
+    // Ambient tier: cosmetic scripts vetted to run every 4th frame near the
+    // player too (the far tier's phase spreading and dt scaling). Vanilla
+    // OutsideBanner rolls a random animation for every banner in every loaded
+    // cell each frame (6-7 ms/frame in Balmora). Its PlayGroup calls (mode 0)
+    // only queue what plays when the current loop ends, it has no OnActivate
+    // and reads no elapsed time, so a 4th-frame rate changes nothing visible.
+    // Only add scripts that meet the same bar: a script that reacts to
+    // activation or input must see every frame.
+    // ux0:data/openmw/noambient.txt turns the tier off for A/B.
+    bool vitaAmbientScript(const ESM::RefId& script)
+    {
+        static const bool sEnabled = [] {
+            SceIoStat st;
+            const bool on = sceIoGetstat("ux0:data/openmw/noambient.txt", &st) < 0;
+            Vita::breadcrumb(on ? "[Scripts] ambient tier on" : "[Scripts] ambient tier off (noambient.txt)");
+            return on;
+        }();
+        static const ESM::RefId sAmbient[] = { ESM::RefId::stringRefId("OutsideBanner") };
+        if (!sEnabled)
+            return false;
+        for (const ESM::RefId& id : sAmbient)
+            if (script == id)
+                return true;
+        return false;
+    }
 }
 
 extern "C" int vita_script_hist_report(char* buf, unsigned int buflen)
 {
-    // Top 6 by time this window, then reset.
+    // Top 6 by time this window as name=ms/runs, then reset.
     const std::lock_guard<std::mutex> lock(sVitaScriptHistMutex);
     int written = 0;
     for (int rank = 0; rank < 6; ++rank)
     {
         auto best = sVitaScriptHist.end();
         for (auto it = sVitaScriptHist.begin(); it != sVitaScriptHist.end(); ++it)
-            if (it->second > 0 && (best == sVitaScriptHist.end() || it->second > best->second))
+            if (it->second.mUs > 0 && (best == sVitaScriptHist.end() || it->second.mUs > best->second.mUs))
                 best = it;
         if (best == sVitaScriptHist.end())
             break;
-        int n = snprintf(buf + written, buflen - written, "%s%s=%ums", written ? " " : "",
-            best->first.toDebugString().c_str(), best->second / 1000);
-        best->second = 0;
+        int n = snprintf(buf + written, buflen - written, "%s%s=%ums/%u", written ? " " : "",
+            best->first.toDebugString().c_str(), best->second.mUs / 1000, best->second.mRuns);
+        best->second.mUs = 0;
         if (n < 0 || (unsigned)n >= buflen - written)
             break;
         written += n;
@@ -285,8 +332,9 @@ void OMW::Engine::executeLocalScripts()
     localScripts.startIteration();
     std::pair<ESM::RefId, MWWorld::Ptr> script;
 #ifdef __vita__
-    // Far-tier scheduling: scripted objects beyond kNearR tick every 4th
-    // frame with dt scaled 4x (thread-local, opcodes see correct elapsed).
+    // Far-tier scheduling: scripted objects beyond kNearR, and ambient
+    // scripts anywhere (vitaAmbientScript), tick every 4th frame with dt
+    // scaled 4x (thread-local, opcodes see correct elapsed).
     static unsigned sScriptFrame = 0;
     ++sScriptFrame;
     constexpr float kNearR = 2048.f;
@@ -301,6 +349,7 @@ void OMW::Engine::executeLocalScripts()
             const osg::Vec3f op = script.second.getRefData().getPosition().asVec3();
             farTier = (op - playerPos).length2() > kNearR * kNearR;
         }
+        farTier = farTier || vitaAmbientScript(script.first);
         if (farTier)
         {
             const unsigned phase = (unsigned)((uintptr_t)script.second.mRef >> 4);
@@ -317,7 +366,9 @@ void OMW::Engine::executeLocalScripts()
         const uint32_t sus = (uint32_t)stimer->delta_u(st0, stimer->tick());
         {
             const std::lock_guard<std::mutex> lock(sVitaScriptHistMutex);
-            sVitaScriptHist[script.first] += sus;
+            VitaScriptCost& cost = sVitaScriptHist[script.first];
+            cost.mUs += sus;
+            ++cost.mRuns;
         }
 #else
         MWScript::InterpreterContext interpreterContext(&script.second.getRefData().getLocals(), script.second);
@@ -342,6 +393,9 @@ void OMW::Engine::runSimPhases(osg::Timer_t frameStart, unsigned frameNumber, fl
 {
     const osg::Timer* const timer = osg::Timer::instance();
     osg::Stats* const stats = mViewer->getViewerStats();
+#ifdef __vita__
+    Vita::benchApplyMove(); // no-op unless replaying a benchmark route
+#endif
 
         {
             ScopedProfile<UserStatsType::Script> profile(frameStart, frameNumber, *timer, *stats);
@@ -439,6 +493,215 @@ void OMW::Engine::runSimPhases(osg::Timer_t frameStart, unsigned frameNumber, fl
 
 }
 
+#ifdef __vita__
+namespace
+{
+    // With an incremental compile operation installed, OSG frees deleted GL
+    // objects only when that operation runs, which the viewer's
+    // renderingTraversals() does after the draw. The Vita draw paths call
+    // Renderer::draw() directly, so it ran only behind loading screens: in
+    // seamless play deleted framebuffers were never freed (each local map
+    // render kept a GXM render target until 47 were live and every
+    // off-screen render failed). Flush them here, within 1 ms. Running the
+    // whole operation instead cost ~13 ms a frame in uploads.
+    // ux0:data/openmw/noicorun.txt restores the old behaviour (A/B).
+    bool vitaIcoFixOff()
+    {
+        static const bool sOff = [] {
+            SceIoStat st;
+            return sceIoGetstat("ux0:data/openmw/noicorun.txt", &st) >= 0;
+        }();
+        return sOff;
+    }
+
+    void vitaRunCompileOperation(osgUtil::IncrementalCompileOperation* /*ico*/, osg::GraphicsContext* gc)
+    {
+        if (gc == nullptr || gc->getState() == nullptr || vitaIcoFixOff())
+            return;
+        double budget = 0.001;
+        osg::flushDeletedGLObjects(gc->getState()->getContextID(), osg::Timer::instance()->time_s(), budget);
+    }
+
+    // Compile sets queued in play (each loaded cell root and model) are
+    // compiled only behind loading screens; between them the queue grew
+    // without bound (0 -> 826 sets on a flight route) and kept the scene
+    // graphs of cells long left behind alive. Objects upload on first draw
+    // in play, so the queue is dropped each frame outside loading screens.
+    void vitaDropPlayCompileQueue(osgUtil::IncrementalCompileOperation* ico)
+    {
+        if (ico == nullptr || vitaIcoFixOff())
+            return;
+        std::lock_guard<OpenThreads::Mutex> lock(*ico->getToCompiledMutex());
+        ico->getToCompile().clear();
+    }
+
+    // Draw + swap one culled frame on the GL thread, with spike anatomy and
+    // [GlJob] timings. Ends the draw-in-flight window.
+    void vitaDrawAndSwap(osgViewer::Renderer* renderer, osg::GraphicsContext* gc,
+        osgUtil::IncrementalCompileOperation* icoProbe)
+    {
+        const uint64_t t0 = sceKernelGetProcessTimeWide();
+        // Spike anatomy: is a long draw compiling new GL objects
+        // (ICO), or is it dispatch/vitaGL itself?
+        // The to-compile list is changed under its mutex by main (the
+        // per-frame play-queue drop) and loaders; reading it here without
+        // the lock crashed the GL thread on a freed compile set.
+        unsigned int icoSets = 0;
+        if (icoProbe)
+        {
+            std::lock_guard<OpenThreads::Mutex> lock(*icoProbe->getToCompiledMutex());
+            icoSets = (unsigned int)icoProbe->getToCompile().size();
+        }
+        vita_gl_phase = "draw";
+        renderer->draw();
+        vitaRunCompileOperation(icoProbe, gc);
+        const uint64_t t1 = sceKernelGetProcessTimeWide();
+        vita_gl_phase = "swap";
+        gc->swapBuffers();
+        const uint64_t t2 = sceKernelGetProcessTimeWide();
+        if ((uint32_t)(t1 - t0) > 25000)
+        {
+            // Name what compiled: a budget can only be checked
+            // BETWEEN objects, so one huge texture blows through it.
+            unsigned tex = 0, drw = 0, prog = 0;
+            unsigned biggestKB = 0;
+            char biggest[48] = "";
+            std::unique_lock<OpenThreads::Mutex> icoLock;
+            if (icoProbe)
+                icoLock = std::unique_lock<OpenThreads::Mutex>(*icoProbe->getToCompiledMutex());
+            if (icoProbe)
+                for (const auto& cs : icoProbe->getToCompile())
+                    for (const auto& cm : cs->_compileMap)
+                        for (const auto& opIt : cm.second._compileOps)
+                        {
+                            if (auto* t
+                                = dynamic_cast<osgUtil::IncrementalCompileOperation::CompileTextureOp*>(opIt.get()))
+                            {
+                                ++tex;
+                                if (osg::Image* im = t->_texture->getImage(0))
+                                {
+                                    const unsigned kb = (unsigned)(im->getTotalSizeInBytes() / 1024);
+                                    if (kb > biggestKB)
+                                    {
+                                        biggestKB = kb;
+                                        snprintf(biggest, sizeof(biggest), "%s", im->getFileName().c_str());
+                                    }
+                                }
+                            }
+                            else if (dynamic_cast<osgUtil::IncrementalCompileOperation::CompileProgramOp*>(
+                                         opIt.get()))
+                                ++prog;
+                            else
+                                ++drw;
+                        }
+            if (icoLock.owns_lock())
+                icoLock.unlock();
+            char db[224];
+            snprintf(db, sizeof(db), "[DrawSpike] draw=%ums sets=%u tex=%u drw=%u prog=%u big=%uKB %s",
+                (unsigned)((t1 - t0) / 1000), icoSets, tex, drw, prog, biggestKB, biggest);
+            Vita::breadcrumb(db);
+        }
+        gl_draw_us += (uint32_t)(t1 - t0);
+        gl_swap_us += (uint32_t)(t2 - t1);
+        if ((uint32_t)(t1 - t0) > gl_draw_max)
+            gl_draw_max = (uint32_t)(t1 - t0);
+        if ((uint32_t)(t2 - t1) > gl_swap_max)
+            gl_swap_max = (uint32_t)(t2 - t1);
+        Vita::noteRenderTime(t2 - t0);
+        // [UnifHist]: the uniform table grows during draw on this thread
+        // (a resize under main's walk could crash), so report it here.
+        static unsigned sUnifFrames = 0;
+        if (++sUnifFrames >= 150)
+        {
+            sUnifFrames = 0;
+            char hb[224];
+            if (osgapply_unif_hist_report(hb, sizeof(hb)) > 0)
+            {
+                char line[240];
+                snprintf(line, sizeof(line), "[UnifHist] %s", hb);
+                Vita::breadcrumb(line);
+            }
+        }
+        Vita::setDrawInFlight(false);
+    }
+
+    // Sets a flag on scope exit, so a throwing phase cannot strand a waiter.
+    struct VitaSignalOnExit
+    {
+        std::atomic<bool>& mFlag;
+        ~VitaSignalOnExit() { mFlag.store(true, std::memory_order_release); }
+    };
+
+    // Waits for a hand-off flag; returns the microseconds spent waiting.
+    uint32_t vitaWaitFlag(const std::atomic<bool>& flag)
+    {
+        if (flag.load(std::memory_order_acquire))
+            return 0;
+        const uint64_t t0 = sceKernelGetProcessTimeWide();
+        while (!flag.load(std::memory_order_acquire))
+            sceKernelDelayThread(10);
+        return (uint32_t)(sceKernelGetProcessTimeWide() - t0);
+    }
+
+    // Lua update overlapped with cull. With inline Lua (lua num threads = 0)
+    // the update ran on main before the worker was kicked, on the critical
+    // path. Its world changes are queued for the next synchronizedUpdate
+    // (the property upstream's Lua thread relies on to overlap rendering),
+    // so main now runs it while the worker culls: after the worker's update
+    // traversal, and before the worker's sim phases, which mutate the
+    // state Lua reads. ux0:data/openmw/noluaoverlap.txt turns it off.
+    bool vitaLuaOverlapEnabled()
+    {
+        static const bool sOn = [] {
+            SceIoStat st;
+            const bool on = sceIoGetstat("ux0:data/openmw/noluaoverlap.txt", &st) < 0;
+            Vita::breadcrumb(on ? "[LuaOverlap] on: Lua update runs during cull"
+                                : "[LuaOverlap] off (noluaoverlap.txt)");
+            return on;
+        }();
+        return sOn;
+    }
+}
+
+void OMW::Engine::vitaWorkerUpdate()
+{
+    if (!mVitaWorkerUpdatePending)
+        return;
+    // Non-hazard update callbacks; must precede cull.
+    if (!mVitaWorkerUpdateVisitor)
+        mVitaWorkerUpdateVisitor = new osgUtil::UpdateVisitor;
+    mVitaWorkerUpdateVisitor->reset();
+    mVitaWorkerUpdateVisitor->setFrameStamp(mViewer->getFrameStamp());
+    // Frame-guarded callbacks skip forever on a stuck number.
+    mVitaWorkerUpdateVisitor->setTraversalNumber(mViewer->getFrameStamp()->getFrameNumber());
+    mVitaWorkerUpdateVisitor->setTraversalMask(mVitaWorkerUpdateMask);
+    mViewer->getSceneData()->accept(*mVitaWorkerUpdateVisitor);
+    mVitaWorkerUpdatePending = false;
+}
+
+void OMW::Engine::vitaJoinFrame()
+{
+    if (mSimWorker && mSimOverlap && mSimPrimed)
+        mSimWorker->finish();
+    if (!mCullOnGL)
+        return;
+    // The sim job has kicked the GL job by now; wait for its cull only
+    // (its draw keeps overlapping main, as before).
+    if (!mVitaCullDone.load(std::memory_order_acquire))
+    {
+        const uint64_t t0 = sceKernelGetProcessTimeWide();
+        while (!mVitaCullDone.load(std::memory_order_acquire))
+            sceKernelDelayThread(10);
+        vita_cullfence_us += (uint32_t)(sceKernelGetProcessTimeWide() - t0);
+    }
+    // No cull in flight: release children the sim thread removed under it,
+    // and land the transforms it queued so frame N+1 (camera included)
+    // starts from them.
+    osg_vita_cow_drain();
+    mWorld->getRenderingManager()->vitaApplyDeferredTransforms();
+}
+#endif
+
 bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 {
     const osg::Timer_t frameStart = mViewer->getStartTick();
@@ -459,9 +722,15 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         phase_world_us = phase_wm_us = 0;
         vitaFrameT0 = sceKernelGetProcessTimeWide();
         vitaMainPhase("simjoin");
-        // Finish overlapped sim before touching game state.
-        if (mSimWorker && mSimOverlap && mSimPrimed)
-            mSimWorker->finish();
+        // Finish overlapped sim (and cull, when it runs on GL) before
+        // touching game state.
+        vitaJoinFrame();
+        // Benchmark record/replay (VitaBench.h): no-op unless toggled.
+        Vita::benchTick(frametime);
+        // [Subtrees] timers go on new scene-root children here, where no
+        // cull or update traversal is running (the audit runs mid-job).
+        if ((frameNumber & 127u) == 0 && mViewer->getSceneData())
+            Vita::attachSubtreeTimers(mViewer->getSceneData()->asGroup());
         phase_fin_us = (uint32_t)(sceKernelGetProcessTimeWide() - vitaFrameT0);
         vitaMainPhase("input");
 #endif
@@ -638,6 +907,7 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 #ifdef __vita__
     phase_evt_us = (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
     vitaPhaseT0 = sceKernelGetProcessTimeWide();
+    vitaMainPhase("upd");
     if (mUpdateOverlap && mSimWorker && mSimOverlap && mCullOverlap && mViewer->getSceneData())
     {
         // Hazard classes update on main; the rest on the worker pre-cull.
@@ -672,7 +942,10 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         {
             s_focusAccum = 0.f;
             vitaPhaseT0 = sceKernelGetProcessTimeWide();
+            vitaMainPhase("focus");
             mWorld->updateFocusObject();
+            if (mWorld->vitaFocusDeferred())
+                s_focusAccum = 0.1f; // physics lock was busy: retry next frame
             phase_focus_us = (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
         }
 #else
@@ -682,16 +955,71 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 
     // if there is a separate Lua thread, it starts the update now
 #ifdef __vita__
-    vitaPhaseT0 = sceKernelGetProcessTimeWide();
-    mLuaWorker->allowUpdate(frameStart, frameNumber, *stats);
-    phase_lua_us += (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
+    // Stage C with inline Lua: the update moves after the kick (see
+    // vitaLuaOverlapEnabled); every other path runs it here as before.
+    mVitaLuaOverlap = vitaLuaOverlapEnabled() && Settings::lua().mLuaNumThreads == 0 && mSimWorker && mSimOverlap
+        && mCullOverlap && !mCullOnGL;
+    if (!mVitaLuaOverlap)
+    {
+        vitaPhaseT0 = sceKernelGetProcessTimeWide();
+        vitaMainPhase("lua");
+        mLuaWorker->allowUpdate(frameStart, frameNumber, *stats);
+        phase_lua_us += (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
+    }
 #else
     mLuaWorker->allowUpdate(frameStart, frameNumber, *stats);
 #endif
 
 #ifdef __vita__
+    vitaMainPhase("render");
     const uint64_t renderStartUs = sceKernelGetProcessTimeWide();
-    if (mSimWorker && mSimOverlap && mCullOverlap)
+    vitaDropPlayCompileQueue(mViewer->getIncrementalCompileOperation());
+    // Sampled cull profiling ([CullProf] times, [CullStage]): one frame in
+    // eight pays the per-node clock reads; set before cull is kicked.
+    osg_vita_cullprof_sample = (frameNumber & 7u) == 0;
+    if (mSimWorker && mSimOverlap && mCullOverlap && mCullOnGL)
+    {
+        // Cull on GL (docs/vita/frame-pipeline-redesign.md): the worker runs
+        // update traversal N, kicks the GL job, then sims N+1 while the GL
+        // thread culls N (Group child lists snapshot under the OSG patch)
+        // and draws N. Main's next frame joins the sim job and the cull.
+        auto* renderer = static_cast<osgViewer::Renderer*>(mViewer->getCamera()->getRenderer());
+        if (renderer->getGraphicsThreadDoesCull())
+            renderer->setGraphicsThreadDoesCull(false);
+        const bool nextPaused = mWorld->getTimeManager()->isPaused();
+        const float nextDt = frametime; // estimate; corrected next frame
+        const unsigned nextFrame = frameNumber + 1;
+        osg::GraphicsContext* gc = mViewer->getCamera()->getGraphicsContext();
+        auto* icoProbe = mViewer->getIncrementalCompileOperation();
+        mVitaCullDone.store(false, std::memory_order_release);
+        ++vita_cullongl_frames;
+        mSimWorker->run([this, renderer, gc, icoProbe, frameStart, nextFrame, nextDt, nextPaused] {
+            const uint64_t jobT0 = sceKernelGetProcessTimeWide();
+            vitaWorkerUpdate();
+            Vita::GLWorker* glw = Vita::getGLWorker();
+            // The previous job's draw may still run; it ends the draw-in-
+            // flight window, so open this one only once it has landed.
+            glw->finish();
+            Vita::setDrawInFlight(true);
+            glw->run(
+                [this, renderer, gc, icoProbe] {
+                    const uint64_t c0 = sceKernelGetProcessTimeWide();
+                    {
+                        VitaSignalOnExit cullDone{ mVitaCullDone };
+                        renderer->cull();
+                    }
+                    vita_gl_cull_us += (uint32_t)(sceKernelGetProcessTimeWide() - c0);
+                    vitaDrawAndSwap(renderer, gc, icoProbe);
+                },
+                "cull");
+            const uint64_t simT0 = sceKernelGetProcessTimeWide();
+            vita_simjob_upd_us += (uint32_t)(simT0 - jobT0);
+            runSimPhases(frameStart, nextFrame, nextDt, nextPaused);
+            vita_simjob_us += (uint32_t)(sceKernelGetProcessTimeWide() - jobT0);
+        });
+        mSimPrimed = true;
+    }
+    else if (mSimWorker && mSimOverlap && mCullOverlap)
     {
         // Stage C: worker culls N then sims N+1; main draws N-1 meanwhile.
         // Draw lags cull by one frame (adds one frame of latency).
@@ -702,23 +1030,32 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
         const float nextDt = frametime; // estimate; corrected next frame
         const unsigned nextFrame = frameNumber + 1;
         const bool havePrev = mCullPrimed;
+        const bool luaOverlap = mVitaLuaOverlap;
+        if (luaOverlap)
+        {
+            mVitaWorkerUpdDone.store(false, std::memory_order_release);
+            mVitaLuaUpdDone.store(false, std::memory_order_release);
+        }
         Vita::setDrawInFlight(true);
-        mSimWorker->run([this, renderer, frameStart, nextFrame, nextDt, nextPaused] {
-            if (mVitaWorkerUpdatePending)
+        mSimWorker->run([this, renderer, frameStart, nextFrame, nextDt, nextPaused, luaOverlap] {
+            // Sim-job split for [SimSplit]: the main thread's join waits on
+            // this whole job (update traversal + cull + sim phases).
+            const uint64_t jobT0 = sceKernelGetProcessTimeWide();
             {
-                // Non-hazard update callbacks; must precede cull.
-                if (!mVitaWorkerUpdateVisitor)
-                    mVitaWorkerUpdateVisitor = new osgUtil::UpdateVisitor;
-                mVitaWorkerUpdateVisitor->reset();
-                mVitaWorkerUpdateVisitor->setFrameStamp(mViewer->getFrameStamp());
-                // Frame-guarded callbacks skip forever on a stuck number.
-                mVitaWorkerUpdateVisitor->setTraversalNumber(mViewer->getFrameStamp()->getFrameNumber());
-                mVitaWorkerUpdateVisitor->setTraversalMask(mVitaWorkerUpdateMask);
-                mViewer->getSceneData()->accept(*mVitaWorkerUpdateVisitor);
-                mVitaWorkerUpdatePending = false;
+                VitaSignalOnExit updDone{ mVitaWorkerUpdDone }; // main's Lua update may start
+                vitaWorkerUpdate();
             }
+            const uint64_t cullT0 = sceKernelGetProcessTimeWide();
+            vita_simjob_upd_us += (uint32_t)(cullT0 - jobT0);
             renderer->cull();
+            Vita::staticVerifyAfterCull(); // no-op unless staticverify.txt
+            const uint64_t simT0 = sceKernelGetProcessTimeWide();
+            vita_simjob_cull_us += (uint32_t)(simT0 - cullT0);
+            // Sim phases mutate what Lua's update reads: wait it out.
+            if (luaOverlap)
+                vita_lua_overlap_wait_us += vitaWaitFlag(mVitaLuaUpdDone);
             runSimPhases(frameStart, nextFrame, nextDt, nextPaused);
+            vita_simjob_us += (uint32_t)(sceKernelGetProcessTimeWide() - jobT0);
         });
         mSimPrimed = true;
         mCullPrimed = true;
@@ -728,67 +1065,12 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             {
                 osg::GraphicsContext* gc = mViewer->getCamera()->getGraphicsContext();
                 auto* icoProbe = mViewer->getIncrementalCompileOperation();
-                glw->run([renderer, gc, icoProbe] {
-                    const uint64_t t0 = sceKernelGetProcessTimeWide();
-                    // Spike anatomy: is a long draw compiling new GL objects
-                    // (ICO), or is it dispatch/vitaGL itself?
-                    const unsigned int icoSets
-                        = icoProbe ? (unsigned int)icoProbe->getToCompile().size() : 0u;
-                    const bool icoBefore = icoSets > 0;
-                    renderer->draw();
-                    const uint64_t t1 = sceKernelGetProcessTimeWide();
-                    gc->swapBuffers();
-                    const uint64_t t2 = sceKernelGetProcessTimeWide();
-                    if ((uint32_t)(t1 - t0) > 25000)
-                    {
-                        // Name what compiled: a budget can only be checked
-                        // BETWEEN objects, so one huge texture blows through it.
-                        unsigned tex = 0, drw = 0, prog = 0;
-                        unsigned biggestKB = 0;
-                        char biggest[48] = "";
-                        if (icoProbe)
-                            for (const auto& cs : icoProbe->getToCompile())
-                                for (const auto& cm : cs->_compileMap)
-                                    for (const auto& opIt : cm.second._compileOps)
-                                    {
-                                        if (auto* t = dynamic_cast<osgUtil::IncrementalCompileOperation::
-                                                    CompileTextureOp*>(opIt.get()))
-                                        {
-                                            ++tex;
-                                            if (osg::Image* im = t->_texture->getImage(0))
-                                            {
-                                                const unsigned kb = (unsigned)(im->getTotalSizeInBytes() / 1024);
-                                                if (kb > biggestKB)
-                                                {
-                                                    biggestKB = kb;
-                                                    snprintf(biggest, sizeof(biggest), "%s", im->getFileName().c_str());
-                                                }
-                                            }
-                                        }
-                                        else if (dynamic_cast<osgUtil::IncrementalCompileOperation::
-                                                     CompileProgramOp*>(opIt.get()))
-                                            ++prog;
-                                        else
-                                            ++drw;
-                                    }
-                        char db[224];
-                        snprintf(db, sizeof(db), "[DrawSpike] draw=%ums sets=%u tex=%u drw=%u prog=%u big=%uKB %s",
-                            (unsigned)((t1 - t0) / 1000), icoSets, tex, drw, prog, biggestKB, biggest);
-                        Vita::breadcrumb(db);
-                    }
-                    gl_draw_us += (uint32_t)(t1 - t0);
-                    gl_swap_us += (uint32_t)(t2 - t1);
-                    if ((uint32_t)(t1 - t0) > gl_draw_max)
-                        gl_draw_max = (uint32_t)(t1 - t0);
-                    if ((uint32_t)(t2 - t1) > gl_swap_max)
-                        gl_swap_max = (uint32_t)(t2 - t1);
-                    Vita::noteRenderTime(t2 - t0);
-                    Vita::setDrawInFlight(false);
-                });
+                glw->run([renderer, gc, icoProbe] { vitaDrawAndSwap(renderer, gc, icoProbe); });
             }
             else
             {
                 renderer->draw();
+                vitaRunCompileOperation(mViewer->getIncrementalCompileOperation(), mViewer->getCamera()->getGraphicsContext());
                 mViewer->getCamera()->getGraphicsContext()->swapBuffers();
                 Vita::setDrawInFlight(false);
             }
@@ -813,12 +1095,19 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
             runSimPhases(frameStart, nextFrame, nextDt, nextPaused);
         });
         mSimPrimed = true;
-        renderer->draw();
-        mViewer->getCamera()->getGraphicsContext()->swapBuffers();
+        osg::GraphicsContext* gc = mViewer->getCamera()->getGraphicsContext();
+        auto* ico = mViewer->getIncrementalCompileOperation();
+        Vita::callOnGL(
+            [renderer, gc, ico] {
+                renderer->draw();
+                vitaRunCompileOperation(ico, gc);
+                gc->swapBuffers();
+            },
+            "draw");
         Vita::setDrawInFlight(false);
     }
     else
-        mViewer->renderingTraversals();
+        Vita::renderingTraversalsOnGL(*mViewer);
     if (!Vita::getGLWorker())
         Vita::noteRenderTime(sceKernelGetProcessTimeWide() - renderStartUs);
 #else
@@ -826,6 +1115,20 @@ bool OMW::Engine::frame(unsigned frameNumber, float frametime)
 #endif
 
 #ifdef __vita__
+    if (mVitaLuaOverlap)
+    {
+        // The worker culls; run Lua's update meanwhile (see
+        // vitaLuaOverlapEnabled). The worker waits for this before its sim
+        // phases, so signal even if the update throws.
+        VitaSignalOnExit luaDone{ mVitaLuaUpdDone };
+        vita_lua_overlap_start_us += vitaWaitFlag(mVitaWorkerUpdDone);
+        vitaPhaseT0 = sceKernelGetProcessTimeWide();
+        vitaMainPhase("lua");
+        mLuaWorker->allowUpdate(frameStart, frameNumber, *stats);
+        const uint32_t luaUs = (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
+        vita_lua_overlap_us += luaUs;
+        ++vita_lua_overlap_frames;
+    }
     vitaPhaseT0 = sceKernelGetProcessTimeWide();
     mLuaWorker->finishUpdate(frameStart, frameNumber, *stats);
     phase_lua_us += (uint32_t)(sceKernelGetProcessTimeWide() - vitaPhaseT0);
@@ -1243,6 +1546,7 @@ void OMW::Engine::setWindowIcon()
 void OMW::Engine::prepareEngine()
 {
     VITA_CRUMB("prepareEngine() enter");
+    vitaMainPhase("prep");
     mStateManager = std::make_unique<MWState::StateManager>(mCfgMgr.getUserDataPath() / "saves", mContentFiles);
     mEnvironment.setStateManager(*mStateManager);
 
@@ -1254,6 +1558,7 @@ void OMW::Engine::prepareEngine()
     mViewer->setSceneData(rootNode);
 
     VITA_CRUMB("prepareEngine() createWindow");
+    vitaMainPhase("prep");
 #ifdef __vita__
     Vita::logMemoryStatus("Pre-createWindow");
 #endif
@@ -1384,11 +1689,15 @@ void OMW::Engine::prepareEngine()
     guiRoot->setNodeMask(MWRender::Mask_GUI);
     mStereoManager->disableStereoForNode(guiRoot);
     rootNode->addChild(guiRoot);
+#ifdef __vita__
+    Vita::addCullTimer(guiRoot, Vita::CullGui);
+#endif
 
 #ifdef __vita__
     Vita::logMemoryStatus("Post-VFS");
 #endif
     VITA_CRUMB("prepareEngine() creating WindowManager");
+    vitaMainPhase("prep");
     mWindowManager = std::make_unique<MWGui::WindowManager>(mWindow, mViewer, guiRoot, mResourceSystem.get(),
         mWorkQueue.get(), mCfgMgr.getLogPath(), mScriptConsoleMode, mTranslationDataStorage, mEncoding, mExportFonts,
         Version::getOpenmwVersionDescription(), shadersSupported, mCfgMgr);
@@ -1425,6 +1734,7 @@ void OMW::Engine::prepareEngine()
     }
     Vita::logMemoryStatus("Pre-data-load");
     VITA_CRUMB("prepareEngine() loading data async");
+    vitaMainPhase("prep");
     // Parse chases the prefetch reads started before createWindow.
     listener->loadingOn();
     {
@@ -1443,6 +1753,7 @@ void OMW::Engine::prepareEngine()
     Vita::logMemoryStatus("Post-data-load");
 #else
     VITA_CRUMB("prepareEngine() loading data async");
+    vitaMainPhase("prep");
     auto dataLoading = std::async(std::launch::async,
         [&] { mWorld->loadData(mFileCollections, mContentFiles, mGroundcoverFiles, mEncoder.get(), &asyncListener); });
 
@@ -1465,6 +1776,7 @@ void OMW::Engine::prepareEngine()
     VITA_CRUMB("prepareEngine() data loaded");
 
     VITA_CRUMB("prepareEngine() world init");
+    vitaMainPhase("prep");
 #ifdef __vita__
     Vita::logMemoryStatus("Pre-World::init");
 #endif
@@ -1491,6 +1803,7 @@ void OMW::Engine::prepareEngine()
     mWindowManager->setStore(mWorld->getStore());
 #ifdef __vita__
     Vita::logMemoryStatus("Pre-initUI");
+    vitaMainPhase("prep");
 #endif
     mWindowManager->initUI();
 #ifdef __vita__
@@ -1542,6 +1855,7 @@ void OMW::Engine::prepareEngine()
 
 #ifdef __vita__
     Vita::logMemoryStatus("Pre-LuaInit");
+    vitaMainPhase("prep");
 #endif
     mLuaManager->loadPermanentStorage(mCfgMgr.getUserConfigPath());
     mLuaManager->init();
@@ -1604,9 +1918,36 @@ void OMW::Engine::go()
         mSimWorker = std::make_unique<Vita::SimWorker>();
         mSimOverlap = Settings::general().mVitaSimOverlap;
         mCullOverlap = Settings::general().mVitaCullOverlap;
+        // Cull on the GL thread in parallel with sim: needs the cull-overlap
+        // pipeline and a GL worker. Opt-in by toggle file while it soaks.
+        if (mSimOverlap && mCullOverlap)
+        {
+            SceIoStat st;
+            if (sceIoGetstat("ux0:data/openmw/cullongl.txt", &st) >= 0)
+            {
+                if (Vita::GLWorker* glw = Vita::getGLWorker())
+                {
+                    glw->call([] { osg_vita_cow_enable(1); }, "cowinit");
+                    // The sim thread is the one that edits the live scene
+                    // while the GL thread culls.
+                    mSimWorker->run([] { osg_vita_cow_set_writer(); });
+                    mSimWorker->finish();
+                    mCullOnGL = true;
+                }
+                else
+                    Vita::breadcrumb("[Pipeline] cullongl.txt ignored: no GL worker");
+            }
+        }
+        Vita::breadcrumb(mCullOnGL                 ? "[Pipeline] cull on GL thread, parallel with sim (cullongl.txt)"
+                : mSimOverlap && mCullOverlap ? "[Pipeline] cull on sim worker, before sim"
+                                              : "[Pipeline] cull on main");
         // Nested render loops (loading, video) must consume a pending
         // culled frame first or the queue serves them a stale scene.
         Vita::setDrainDrawHook([this] {
+            // Nested renders follow on the GL thread; let any async draw job
+            // land first even when no culled frame is pending.
+            if (Vita::GLWorker* glw = Vita::getGLWorker())
+                glw->finish();
             if (!mCullPrimed)
                 return;
             // From sim thread: cull already ran (it precedes sim in the batch);
@@ -1615,7 +1956,7 @@ void OMW::Engine::go()
                 mSimWorker->finish();
             auto* renderer = static_cast<osgViewer::Renderer*>(mViewer->getCamera()->getRenderer());
             if (Vita::GLWorker* glw = Vita::getGLWorker())
-                glw->call([renderer] { renderer->draw(); });
+                glw->call([renderer] { renderer->draw(); }, "drain");
             else
                 renderer->draw();
             mCullPrimed = false;
@@ -1627,8 +1968,24 @@ void OMW::Engine::go()
     mViewer->setUseConfigureAffinity(false);
 
     mEnvironment.setFrameRateLimit(Settings::video().mFramerateLimit);
+#ifdef __vita__
+    if (Vita::benchFrameCap() >= 0.f)
+    {
+        mEnvironment.setFrameRateLimit(Vita::benchFrameCap());
+        char b[96];
+        snprintf(b, sizeof(b), "[Bench] fps option: frame cap %.0f, streaming target %.0f", Vita::benchFrameCap(),
+            Vita::benchStreamingTarget());
+        Vita::breadcrumb(b);
+    }
+#endif
 
     prepareEngine();
+
+#ifdef __vita__
+    // Cull on GL: sim-thread node transforms wait for the cull fence.
+    if (mCullOnGL)
+        mWorld->getRenderingManager()->vitaSetDeferSimTransforms(true);
+#endif
 
 #ifdef _WIN32
     const auto* statsFile = _wgetenv(L"OPENMW_OSG_STATS_FILE");
@@ -1666,6 +2023,11 @@ void OMW::Engine::go()
 
     // Start the game
     VITA_CRUMB("go() starting game");
+#ifdef __vita__
+    // Benchmark replay (bench.txt): straight into the newest save.
+    if (mSaveGameFile.empty())
+        mSaveGameFile = Vita::benchSaveToLoad(mCfgMgr.getUserDataPath() / "saves");
+#endif
     if (!mSaveGameFile.empty())
     {
         mStateManager->loadGame(mSaveGameFile);
@@ -1700,17 +2062,32 @@ void OMW::Engine::go()
     MWWorld::DateTimeManager& timeManager = *mWorld->getTimeManager();
     Misc::FrameRateLimiter frameRateLimiter = Misc::makeFrameRateLimiter(mEnvironment.getFrameRateLimit());
     const std::chrono::steady_clock::duration maxSimulationInterval(std::chrono::milliseconds(200));
+#ifdef __vita__
+    const bool benchCap = Vita::benchFrameCap() >= 0.f;
+#endif
     while (!mViewer->done() && !mStateManager->hasQuitRequest())
     {
+#ifdef __vita__
+        // Frame cap chosen in the Vita settings tab (locked 30 / uncapped)
+        // takes effect on the next frame. A bench replay keeps its own.
+        if (!benchCap && Settings::video().mFramerateLimit != mEnvironment.getFrameRateLimit())
+        {
+            mEnvironment.setFrameRateLimit(Settings::video().mFramerateLimit);
+            frameRateLimiter = Misc::makeFrameRateLimiter(mEnvironment.getFrameRateLimit());
+            char b[64];
+            snprintf(b, sizeof(b), "[FrameCap] %.0f fps", mEnvironment.getFrameRateLimit());
+            Vita::breadcrumb(b);
+        }
+#endif
         const double dt = std::chrono::duration_cast<std::chrono::duration<double>>(
                               std::min(frameRateLimiter.getLastFrameDuration(), maxSimulationInterval))
                               .count()
             * timeManager.getSimulationTimeScale();
 
 #ifdef __vita__
-        // Cull overlap: worker reads the frame stamp; idle it before advance.
-        if (mSimWorker && mCullOverlap && mSimPrimed)
-            mSimWorker->finish();
+        // Cull overlap: cull reads the frame stamp; idle it before advance.
+        if (mSimWorker && mCullOverlap)
+            vitaJoinFrame();
 #endif
         mViewer->advance(timeManager.getRenderingSimulationTime());
 
@@ -1753,12 +2130,18 @@ void OMW::Engine::go()
                 const unsigned int vblanksPerFrame
                     = std::max(1u, (unsigned int)(60.f / fpsLimit + 0.5f));
                 const uint64_t paceT0 = sceKernelGetProcessTimeWide();
+                vitaMainPhase("pace");
                 const unsigned int vc = sceDisplayGetVcount();
-                if (s_lastVcount == 0 || vc >= s_lastVcount + vblanksPerFrame)
+                // Wrap-safe (vcount is a raw 32-bit counter since device
+                // boot) and bounded: an unbounded `<` spin here froze main
+                // forever once the counter wrapped (user hang reports:
+                // phase=render, all workers idle).
+                const int ahead = (int)(s_lastVcount + vblanksPerFrame - vc);
+                if (s_lastVcount == 0 || ahead <= 0 || ahead > 4)
                     s_lastVcount = vc;
                 else
                 {
-                    while (sceDisplayGetVcount() < s_lastVcount + vblanksPerFrame)
+                    for (int i = 0; i < ahead; ++i)
                         sceDisplayWaitVblankStart();
                     s_lastVcount += vblanksPerFrame;
                 }

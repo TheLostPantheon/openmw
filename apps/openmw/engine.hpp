@@ -1,6 +1,7 @@
 #ifndef ENGINE_H
 #define ENGINE_H
 
+#include <atomic>
 #include <filesystem>
 
 #include <components/compiler/extensions.hpp>
@@ -158,6 +159,15 @@ namespace OMW
         unsigned int mVitaWorkerUpdateMask = ~0u;
         osg::ref_ptr<osgUtil::UpdateVisitor> mVitaWorkerUpdateVisitor;
         bool mCullPrimed = false;
+        // Cull on the GL thread in parallel with sim (ux0:data/openmw/cullongl.txt).
+        bool mCullOnGL = false;
+        std::atomic<bool> mVitaUpdDone{ true }; // worker update traversal N done; GL may cull
+        std::atomic<bool> mVitaCullDone{ true }; // cull N done; main may mutate the scene
+        // Lua update overlapped with the worker's cull (noluaoverlap.txt off):
+        // main runs it after the kick, between these two hand-offs.
+        bool mVitaLuaOverlap = false; // decided this frame, before the kick
+        std::atomic<bool> mVitaWorkerUpdDone{ true }; // worker update traversal done; Lua may run
+        std::atomic<bool> mVitaLuaUpdDone{ true }; // Lua update done; the worker may run sim phases
 #endif
         std::unique_ptr<L10n::Manager> mL10nManager;
         MWBase::Environment mEnvironment;
@@ -213,6 +223,14 @@ namespace OMW
 
         /// Scripts, mechanics, physics; may run on sim worker.
         void runSimPhases(osg::Timer_t frameStart, unsigned frameNumber, float frametime, bool paused);
+
+#ifdef __vita__
+        /// Join the sim job and, in cull-on-GL mode, the cull fence. After
+        /// it, main may mutate the scene (draw may still run, as before).
+        void vitaJoinFrame();
+        /// Sim worker: the non-hazard update traversal main deferred to it.
+        void vitaWorkerUpdate();
+#endif
 
         bool frame(unsigned frameNumber, float dt);
 

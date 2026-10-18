@@ -6,6 +6,14 @@
 #include <components/debug/debuglog.hpp>
 
 #include "luastate.hpp"
+#ifdef __vita__
+#include <algorithm>
+#include <cstdio>
+
+#include "scriptscontainer.hpp" // vitaLuaProfOn / vitaLuaNowUs
+
+extern "C" void vitaBreadcrumb(const char* msg); // apps/openmw/vita/VitaInit.cpp
+#endif
 
 namespace LuaUtil
 {
@@ -196,8 +204,29 @@ namespace LuaUtil
 
         void Registry::update(double dt)
         {
+#ifdef __vita__
+            // [InputActions] (luaprof.txt): time per action key across its
+            // bindings, value check and change handlers; logged every 300 calls.
+            const bool prof = vitaLuaProfOn();
+            static std::vector<unsigned long long> sUs;
+            static std::vector<unsigned> sCalls;
+            static unsigned sUpdates = 0;
+            static unsigned long long sGlueUs = 0;
+            unsigned long long nodeT0 = 0;
+            const unsigned long long updT0 = prof ? vitaLuaNowUs() : 0;
+            unsigned long long nodesUs = 0;
+            if (prof && sUs.size() < mKeys.size())
+            {
+                sUs.resize(mKeys.size(), 0);
+                sCalls.resize(mKeys.size(), 0);
+            }
+#endif
             std::vector<sol::object> dependencyValues;
-            mBindingTree.traverse([this, &dependencyValues, dt](Id node) {
+            mBindingTree.traverse([&, this, dt](Id node) {
+#ifdef __vita__
+                if (prof)
+                    nodeT0 = vitaLuaNowUs();
+#endif
                 sol::main_object newValue = mValues[node];
                 std::vector<Binding>& bindings = mBindings[node];
                 bindings.erase(std::remove_if(bindings.begin(), bindings.end(),
@@ -242,7 +271,45 @@ namespace LuaUtil
                                        }),
                         handlers.end());
                 }
+#ifdef __vita__
+                if (prof && node < sUs.size())
+                {
+                    const unsigned long long us = vitaLuaNowUs() - nodeT0;
+                    sUs[node] += us;
+                    sCalls[node] += (unsigned)bindings.size();
+                    nodesUs += us;
+                }
+#endif
             });
+#ifdef __vita__
+            if (!prof)
+                return;
+            sGlueUs += (vitaLuaNowUs() - updT0) - nodesUs; // traversal + setup outside nodes
+            if (++sUpdates < 300)
+                return;
+            std::vector<std::size_t> order(sUs.size());
+            for (std::size_t i = 0; i < order.size(); ++i)
+                order[i] = i;
+            std::sort(order.begin(), order.end(), [](std::size_t a, std::size_t b) { return sUs[a] > sUs[b]; });
+            unsigned long long total = sGlueUs;
+            for (unsigned long long us : sUs)
+                total += us;
+            char buf[600];
+            int w = snprintf(buf, sizeof(buf), "[InputActions] %u actions, %.2f ms/update (outside nodes %.2f):",
+                (unsigned)mKeys.size(), total / 1000.0 / sUpdates, sGlueUs / 1000.0 / sUpdates);
+            for (std::size_t i = 0; i < order.size() && i < 12 && w > 0 && (std::size_t)w < sizeof(buf); ++i)
+            {
+                const std::size_t k = order[i];
+                if (k < mKeys.size())
+                    w += snprintf(buf + w, sizeof(buf) - w, " %s=%.0fus/%u", mKeys[k].c_str(),
+                        sUs[k] / (double)sUpdates, sCalls[k] / sUpdates);
+            }
+            vitaBreadcrumb(buf);
+            std::fill(sUs.begin(), sUs.end(), 0);
+            std::fill(sCalls.begin(), sCalls.end(), 0);
+            sGlueUs = 0;
+            sUpdates = 0;
+#endif
         }
 
         void Registry::clear(bool force)

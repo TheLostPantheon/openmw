@@ -19,6 +19,9 @@ VITASDK="${VITASDK:-/usr/local/vitasdk}"
 VITAGL_DIR="${VITAGL_DIR:-${HOME}/vitaGL}"
 
 export PATH="${VITASDK}/bin:${PATH}"
+# Must match build-fast.sh: a reconfigure under a different pkg-config
+# changes dependency flags and recompiles the whole tree.
+export PKG_CONFIG="${PKG_CONFIG:-arm-vita-eabi-pkg-config}"
 
 echo "=== OpenMW Vita Build ==="
 echo "Source:  ${SRC_DIR}"
@@ -101,9 +104,18 @@ if [ ! -f "${ICU_HOST}/bin/icupkg" ]; then
     cd "${BUILD_DIR}"
 fi
 
+# ccache, when installed: unchanged files are cache hits even when a full
+# rebuild is forced (branch switch, clean build, toolchain change).
+CCACHE_ARGS=()
+if command -v ccache &> /dev/null; then
+    CCACHE_ARGS=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+    echo "ccache: on ($(ccache -s 2>/dev/null | grep -iE '^ *(cache size|Cache size)' | head -1 | sed 's/^ *//'))"
+fi
+
 # Configure (matches Docker build exactly)
 echo "=== Configuring ==="
 cmake -DCMAKE_TOOLCHAIN_FILE="${SRC_DIR}/cmake/VitaToolchain.cmake" \
+      "${CCACHE_ARGS[@]}" \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
       -DVITAGL_DIR="${VITAGL_DIR}" \
@@ -134,15 +146,18 @@ echo "=== Building OSG ==="
 make -C _deps/osg-build -j$(nproc)
 
 # Build eboot.bin
-echo "=== Building OpenMW ==="
+BUILD_ID="$(bash "${SCRIPT_DIR}/build-id.sh")"
+echo "=== Building OpenMW (id ${BUILD_ID}) ==="
 make -j$(nproc) eboot.bin-self
 
 # Build VPK (needed for ATTRIBUTE2 extra memory mode)
 echo "=== Building VPK ==="
 make openmw.vpk-vpk
 
+bash "${SCRIPT_DIR}/archive-build.sh" "${BUILD_ID}"
+
 echo ""
-echo "=== Build Complete ==="
+echo "=== Build Complete (${BUILD_ID}) ==="
 echo "eboot.bin: ${BUILD_DIR}/apps/openmw/eboot.bin"
 echo "VPK:       ${BUILD_DIR}/apps/openmw/openmw.vpk"
 echo ""

@@ -67,11 +67,13 @@ namespace MWInput
             return;
         const bool guiMode = MWBase::Environment::get().getWindowManager()->isGuiMode();
         const int z = zoneAt(e.mX, e.mY, guiMode);
-        if (z < 0)
+        // In play a touch anywhere reveals the tiles (they are smaller than
+        // their zones); sliding onto one and releasing fires it.
+        if (z < 0 && guiMode)
             return;
         mActiveFinger = e.mFinger;
         mHighlight = z;
-        if (!guiMode && sZones[z].action == A_TogglePOV)
+        if (z >= 0 && !guiMode && sZones[z].action == A_TogglePOV)
         {
             // Drive the real action channel: tap toggles, hold previews —
             // the Lua camera script sees exactly a held binding.
@@ -113,6 +115,8 @@ namespace MWInput
 
     void VitaTouchZones::update(float dt)
     {
+        if (MWGui::VitaTouchOverlay* ov = MWBase::Environment::get().getWindowManager()->getVitaTouchOverlay())
+            ov->update(dt);
         if (mIntroPending
             && MWBase::Environment::get().getStateManager()->getState() == MWBase::StateManager::State_Running
             && !MWBase::Environment::get().getWindowManager()->isGuiMode())

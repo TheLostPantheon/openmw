@@ -29,6 +29,9 @@ namespace MWPhysics
     btScalar ActorConvexCallback::addSingleResult(
         btCollisionWorld::LocalConvexResult& convexResult, bool normalInWorldSpace)
     {
+#ifdef __vita__
+        ++mVitaResults;
+#endif
         if (convexResult.m_hitCollisionObject == mMe)
             return 1;
 

@@ -9,6 +9,7 @@
 #include "../vita/VitaMemAudit.h"
 #include <components/vita/VitaEsmPrefetch.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/io/stat.h>
 #define VITA_CRUMB(msg) Vita::breadcrumb(msg)
 #else
 #define VITA_CRUMB(msg)
@@ -420,6 +421,114 @@ namespace MWWorld
             }
         }
     }
+
+    namespace
+    {
+        // Intervention/prison marker positions are static ESM data; the
+        // stock lookup materialises EVERY exterior cell store to find them
+        // (8-12s, ~40MB on a cast). Scan once at boot, cache to disk.
+        constexpr uint32_t kMarkerCacheMagic = 0x564d4b31u; // 'VMK1'
+        const ESM::RefId kMarkerIds[3] = { ESM::RefId::stringRefId("divinemarker"),
+            ESM::RefId::stringRefId("templemarker"), ESM::RefId::stringRefId("prisonmarker") };
+
+        bool tryLoadMarkerCache(const std::filesystem::path& path, uint64_t key,
+            std::map<ESM::RefId, std::vector<osg::Vec3f>>& out)
+        {
+            std::ifstream in(path, std::ios::binary);
+            if (!in)
+                return false;
+            uint32_t magic = 0;
+            uint64_t k = 0;
+            uint32_t n = 0;
+            in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+            in.read(reinterpret_cast<char*>(&k), sizeof(k));
+            in.read(reinterpret_cast<char*>(&n), sizeof(n));
+            if (!in || magic != kMarkerCacheMagic || k != key || n > 4096)
+                return false;
+            for (uint32_t i = 0; i < n; ++i)
+            {
+                uint8_t which = 0;
+                float p[3];
+                in.read(reinterpret_cast<char*>(&which), sizeof(which));
+                in.read(reinterpret_cast<char*>(p), sizeof(p));
+                if (!in || which > 2)
+                {
+                    out.clear();
+                    return false;
+                }
+                out[kMarkerIds[which]].push_back(osg::Vec3f(p[0], p[1], p[2]));
+            }
+            return true;
+        }
+
+        void saveMarkerCache(const std::filesystem::path& path, uint64_t key,
+            const std::map<ESM::RefId, std::vector<osg::Vec3f>>& table)
+        {
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            if (!out)
+                return;
+            uint32_t n = 0;
+            for (const auto& [id, positions] : table)
+                n += static_cast<uint32_t>(positions.size());
+            out.write(reinterpret_cast<const char*>(&kMarkerCacheMagic), sizeof(kMarkerCacheMagic));
+            out.write(reinterpret_cast<const char*>(&key), sizeof(key));
+            out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+            for (uint8_t which = 0; which < 3; ++which)
+            {
+                const auto it = table.find(kMarkerIds[which]);
+                if (it == table.end())
+                    continue;
+                for (const osg::Vec3f& v : it->second)
+                {
+                    const float p[3] = { v.x(), v.y(), v.z() };
+                    out.write(reinterpret_cast<const char*>(&which), sizeof(which));
+                    out.write(reinterpret_cast<const char*>(p), sizeof(p));
+                }
+            }
+        }
+
+        void scanMarkers(const MWWorld::ESMStore& store, ESM::ReadersCache& readers,
+            std::map<ESM::RefId, std::vector<osg::Vec3f>>& out)
+        {
+            const auto isMarker = [](const ESM::RefId& id) {
+                return id == kMarkerIds[0] || id == kMarkerIds[1] || id == kMarkerIds[2];
+            };
+            const MWWorld::Store<ESM::Cell>& cells = store.get<ESM::Cell>();
+            for (auto it = cells.extBegin(); it != cells.extEnd(); ++it)
+            {
+                const ESM::Cell& cell = *it;
+                if (cell.mContextList.empty())
+                    continue;
+                for (size_t i = 0; i < cell.mContextList.size(); i++)
+                {
+                    try
+                    {
+                        const std::size_t index = static_cast<std::size_t>(cell.mContextList[i].index);
+                        const ESM::ReadersCache::BusyItem reader = readers.get(index);
+                        cell.restore(*reader, i);
+                        ESM::CellRef ref;
+                        ESM::MovedCellRef cMRef;
+                        bool deleted = false;
+                        bool moved = false;
+                        while (ESM::Cell::getNextRef(
+                            *reader, ref, deleted, cMRef, moved, ESM::Cell::GetNextRefMode::LoadOnlyNotMoved))
+                        {
+                            if (deleted || moved)
+                                continue;
+                            if (isMarker(ref.mRefID))
+                                out[ref.mRefID].push_back(ref.mPos.asVec3());
+                        }
+                    }
+                    catch (const std::exception&)
+                    {
+                    }
+                }
+                for (const auto& [lref, ldeleted] : cell.mLeasedRefs)
+                    if (!ldeleted && isMarker(lref.mRefID))
+                        out[lref.mRefID].push_back(lref.mPos.asVec3());
+            }
+        }
+    }
 #endif
 
     void World::loadData(const Files::Collections& fileCollections, const std::vector<std::string>& contentFiles,
@@ -455,6 +564,20 @@ namespace MWWorld
 #ifdef __vita__
         if (!refCacheHit)
             saveRefCache(refCachePath, refCacheKey_, mStore);
+        {
+            const std::filesystem::path markerCachePath = mUserDataPath / "config" / "marker_cache.bin";
+            if (!tryLoadMarkerCache(markerCachePath, refCacheKey_, mVitaMarkerTable))
+            {
+                VITA_CRUMB("loadData: scanning intervention markers");
+                scanMarkers(mStore, mReaders, mVitaMarkerTable);
+                saveMarkerCache(markerCachePath, refCacheKey_, mVitaMarkerTable);
+            }
+            char mb[96];
+            snprintf(mb, sizeof(mb), "[Markers] divine=%u temple=%u prison=%u",
+                (unsigned)mVitaMarkerTable[kMarkerIds[0]].size(), (unsigned)mVitaMarkerTable[kMarkerIds[1]].size(),
+                (unsigned)mVitaMarkerTable[kMarkerIds[2]].size());
+            Vita::breadcrumb(mb);
+        }
 #endif
 #ifdef __vita__
         VITA_CRUMB("loadData: validate done");
@@ -1224,7 +1347,12 @@ namespace MWWorld
         }
         removeContainerScripts(getPlayerPtr());
         if (exteriorCell)
+#ifdef __vita__
+            mWorldScene->changeToExteriorCell(cellId, position, adjustPlayerPos, changeEvent,
+                /*vitaSeamlessCrossing*/ false, /*vitaTeleport*/ true);
+#else
             mWorldScene->changeToExteriorCell(cellId, position, adjustPlayerPos, changeEvent);
+#endif
         else
             mWorldScene->changeToInteriorCell(destinationCell->getNameId(), position, adjustPlayerPos, changeEvent);
         addContainerScripts(getPlayerPtr(), getPlayerPtr().getCell());
@@ -1365,7 +1493,17 @@ namespace MWWorld
                     if (mWorldScene->isCellActive(*newCell))
                         mWorldScene->changePlayerCell(*newCell, pos, false);
                     else
+                    {
+#ifdef __vita__
+                        // Walking into a not-yet-active adjacent exterior cell:
+                        // route SEAMLESS (radial hydration), not the loadScreen
+                        // path that full-hydrates synchronously.
+                        mWorldScene->changeToExteriorCell(
+                            newCell->getCell()->getId(), pos, false, true, /*vitaSeamlessCrossing*/ true);
+#else
                         mWorldScene->changeToExteriorCell(newCell->getCell()->getId(), pos, false);
+#endif
+                    }
                 }
                 addContainerScripts(getPlayerPtr(), newCell);
                 newPtr = getPlayerPtr();
@@ -1454,7 +1592,23 @@ namespace MWWorld
         const ESM::ExteriorCellLocation index
             = ESM::positionToExteriorCellLocation(position.x(), position.y(), worldspaceId);
 
-        CellStore* newCell = cell->isExterior() ? &mWorldModel.getExterior(index) : nullptr;
+        CellStore* newCell = nullptr;
+        if (cell->isExterior())
+        {
+#ifdef __vita__
+            // Called every frame for every actor (physics moveActors). Skip
+            // getExterior when the actor has not left its current cell (the
+            // common case) — the default forceLoad=true would otherwise
+            // synchronously parse a cold cell mid-physics if an NPC stepped
+            // onto an unloaded edge, bypassing the radial hydrator.
+            if (cell->getCell()->getGridX() == index.mX && cell->getCell()->getGridY() == index.mY)
+                newCell = cell;
+            else
+                newCell = &mWorldModel.getExterior(index);
+#else
+            newCell = &mWorldModel.getExterior(index);
+#endif
+        }
         bool isCellActive = getPlayerPtr().isInCell() && getPlayerPtr().getCell()->isExterior()
             && (newCell && mWorldScene->isCellActive(*newCell));
 
@@ -1989,6 +2143,25 @@ namespace MWWorld
 #ifdef __vita__
         {
             const uint64_t wsEnd = sceKernelGetProcessTimeWide();
+            // [WorldAvg]: per-step averages every 150 updates ([WorldSplit]
+            // below only fires on >500ms frames).
+            static uint64_t sWsSum[6] = {};
+            static unsigned sWsCount = 0;
+            for (int i = 0; i < 5; ++i)
+                sWsSum[i] += wsT[i + 1] - wsT[i];
+            sWsSum[5] += wsEnd - wsT[5];
+            if (++sWsCount >= 150)
+            {
+                char ab[160];
+                const double k = sWsCount * 1000.0;
+                snprintf(ab, sizeof(ab),
+                    "[WorldAvg] wthr=%.2f nav=%.2f plyr=%.2f scene=%.2f rend=%.2f snd=%.2f ms/frame",
+                    sWsSum[0] / k, sWsSum[1] / k, sWsSum[2] / k, sWsSum[3] / k, sWsSum[4] / k, sWsSum[5] / k);
+                Vita::breadcrumb(ab);
+                for (uint64_t& v : sWsSum)
+                    v = 0;
+                sWsCount = 0;
+            }
             if (wsEnd - wsT[0] > 500000ULL)
             {
                 char wb[160];
@@ -2099,7 +2272,35 @@ namespace MWWorld
         try
         {
             // inform the GUI about focused object
+#ifdef __vita__
+            // [Focus]: faced-object lookup vs GUI update, per call (it runs
+            // ten times a second and averaged 1.4 ms a frame in a town).
+            static uint64_t sFoUs[3] = {};
+            static unsigned sFoCalls = 0, sFoBusy = 0;
+            uint64_t foT = sceKernelGetProcessTimeWide();
+            static const bool sNoTry = [] {
+                SceIoStat st;
+                return sceIoGetstat("ux0:data/openmw/nofocustry.txt", &st) >= 0;
+            }();
+            mVitaFocusBusy = false;
+            mVitaFocusTry = !sNoTry && mVitaFocusBusyFrames < 3;
+#endif
             MWWorld::Ptr object = getFocusObject();
+#ifdef __vita__
+            mVitaFocusTry = false;
+            {
+                const uint64_t now = sceKernelGetProcessTimeWide();
+                sFoUs[0] += now - foT;
+                foT = now;
+            }
+            if (mVitaFocusBusy)
+            {
+                ++mVitaFocusBusyFrames;
+                ++sFoBusy;
+                return; // keep the last focus; the engine calls again next frame
+            }
+            mVitaFocusBusyFrames = 0;
+#endif
 
             // retrieve the object's top point's screen position so we know where to place the floating label
             if (!object.isEmpty())
@@ -2116,12 +2317,34 @@ namespace MWWorld
                 MWBase::Environment::get().getWindowManager()->setFocusObjectScreenCoords(pos.x(), pos.y());
             }
 
+#ifdef __vita__
+            {
+                const uint64_t now = sceKernelGetProcessTimeWide();
+                sFoUs[1] += now - foT;
+                foT = now;
+            }
+#endif
             MWBase::Environment::get().getWindowManager()->setFocusObject(object);
+#ifdef __vita__
+            sFoUs[2] += sceKernelGetProcessTimeWide() - foT;
+            if (++sFoCalls >= 50)
+            {
+                // faced includes the deferred calls' (busy) ray time.
+                char fb[160];
+                snprintf(fb, sizeof(fb), "[Focus] per call: faced=%.2f screen=%.2f gui=%.2f ms, %u deferred (lock busy)",
+                    sFoUs[0] / 1000.0 / sFoCalls, sFoUs[1] / 1000.0 / sFoCalls, sFoUs[2] / 1000.0 / sFoCalls, sFoBusy);
+                Vita::breadcrumb(fb);
+                sFoUs[0] = sFoUs[1] = sFoUs[2] = 0;
+                sFoCalls = sFoBusy = 0;
+            }
+#endif
         }
         catch (std::exception& e)
         {
             Log(Debug::Error) << "Error updating focus object: " << e.what();
 #ifdef __vita__
+            mVitaFocusTry = false;
+            mVitaFocusBusy = false;
             static std::chrono::steady_clock::time_point sLastFocusErr{};
             const auto nowFe = std::chrono::steady_clock::now();
             if (nowFe - sLastFocusErr > std::chrono::seconds(5))
@@ -2158,15 +2381,62 @@ namespace MWWorld
             std::vector<MWWorld::ConstPtr> ignore;
             if (ignorePlayer)
                 ignore.push_back(mPlayer->getPlayer());
-            const MWPhysics::RayCastingResult phys = mPhysics->castRay(rayStart, rayEnd, ignore, {},
-                MWPhysics::CollisionType_Default | MWPhysics::CollisionType_VisualOnly);
+            const uint64_t vitaRayT0 = sceKernelGetProcessTimeWide();
+            constexpr int kFocusMask = MWPhysics::CollisionType_Default | MWPhysics::CollisionType_VisualOnly;
+            MWPhysics::RayCastingResult phys;
+            if (mVitaFocusTry)
+            {
+                const std::optional<MWPhysics::RayCastingResult> tried
+                    = mPhysics->vitaTryCastRay(rayStart, rayEnd, ignore, kFocusMask);
+                if (!tried)
+                {
+                    mVitaFocusBusy = true;
+                    return MWWorld::Ptr();
+                }
+                phys = *tried;
+            }
+            else
+                phys = mPhysics->castRay(rayStart, rayEnd, ignore, {}, kFocusMask);
+            const uint64_t vitaRayT1 = sceKernelGetProcessTimeWide();
             const float physDist
                 = (phys.mHit && !phys.mHitObject.isEmpty()) ? (phys.mHitPos - rayStart).length() : -1.f;
 
+            // The scene ray tests the triangles of everything along it (~4 ms
+            // in a dense town): end it a little past the physics hit. Only a
+            // recessed door leaf just behind its frame's collision can win
+            // from there (below); farther objects are behind the hit.
+            const float sceneMax = physDist >= 0.f ? std::min(maxDistance, physDist + 64.f) : maxDistance;
+            // focusab.txt (diagnostic): alternate 10 s windows with and
+            // without statics in the scene ray; [FocusRay] reports each.
+            static const bool sFocusAb = [] {
+                SceIoStat st;
+                return sceIoGetstat("ux0:data/openmw/focusab.txt", &st) >= 0;
+            }();
+            const bool noStatics = sFocusAb && ((vitaRayT0 / 10000000ULL) & 1ULL) != 0;
             const MWRender::RenderingManager::RayResult scene = mRendering->castCameraToViewportRay(
-                0.5f, 0.5f, maxDistance, ignorePlayer,
+                0.5f, 0.5f, sceneMax, ignorePlayer,
                 MWRender::Mask_Scene | MWRender::Mask_Object | MWRender::Mask_VitaPick
-                    | MWRender::Mask_Static); // doors are remasked Static (door.cpp)
+                    | (noStatics ? 0u : (unsigned)MWRender::Mask_Static)); // doors are remasked Static (door.cpp)
+            {
+                // [FocusRay]: physics ray vs scene ray, per call, per mode.
+                static uint64_t sPhysUs[2] = {}, sSceneUs[2] = {};
+                static unsigned sCalls[2] = {}, sPhysHits[2] = {};
+                const int mode = noStatics ? 1 : 0;
+                sPhysUs[mode] += vitaRayT1 - vitaRayT0;
+                sSceneUs[mode] += sceKernelGetProcessTimeWide() - vitaRayT1;
+                sPhysHits[mode] += physDist >= 0.f ? 1 : 0;
+                if (++sCalls[mode] >= 50)
+                {
+                    char fb[160];
+                    snprintf(fb, sizeof(fb),
+                        "[FocusRay] %s: phys=%.2f scene=%.2f ms per call, phys hit %u/%u", mode ? "no statics" : "all",
+                        sPhysUs[mode] / 1000.0 / sCalls[mode], sSceneUs[mode] / 1000.0 / sCalls[mode],
+                        sPhysHits[mode], sCalls[mode]);
+                    Vita::breadcrumb(fb);
+                    sPhysUs[mode] = sSceneUs[mode] = 0;
+                    sCalls[mode] = sPhysHits[mode] = 0;
+                }
+            }
             float sceneDist = -1.f;
             MWWorld::Ptr sceneObject = scene.mHitObject;
             if (scene.mHit)
@@ -2174,7 +2444,7 @@ namespace MWWorld
                 if (sceneObject.isEmpty() && scene.mHitRefnum.isSet())
                     sceneObject = MWBase::Environment::get().getWorldModel()->getPtr(scene.mHitRefnum);
                 if (!sceneObject.isEmpty())
-                    sceneDist = scene.mRatio * maxDistance;
+                    sceneDist = scene.mRatio * sceneMax;
             }
 
             // Nameless scenery must not eat the prompt of a named object
@@ -3585,6 +3855,13 @@ namespace MWWorld
         return mPhysics->mPhysicsDt;
     }
 
+#ifdef __vita__
+    void World::vitaWaitPhysics()
+    {
+        mPhysics->vitaWaitForWorkers();
+    }
+#endif
+
     bool World::findInteriorPositionInWorldSpace(const MWWorld::CellStore* cell, osg::Vec3f& result)
     {
         if (cell->isExterior())
@@ -3690,6 +3967,93 @@ namespace MWWorld
     MWWorld::ConstPtr World::getClosestMarkerFromExteriorPosition(const osg::Vec3f& worldPos, const ESM::RefId& id)
     {
         const ESM::ExteriorCellLocation posIndex = ESM::positionToExteriorCellLocation(worldPos.x(), worldPos.y());
+
+#ifdef __vita__
+        // Marker table: same grid selection over cached positions, then
+        // materialise ONLY the winner's cell (the stock path below loads
+        // every exterior cell store in the game).
+        {
+            const auto mt = mVitaMarkerTable.find(id);
+            if (mt != mVitaMarkerTable.end() && !mt->second.empty())
+            {
+                struct PosInfo
+                {
+                    osg::Vec3f mPos;
+                    int mColumn, mRow;
+                };
+                std::vector<PosInfo> valid;
+                int minGrid = std::numeric_limits<int>::max();
+                osg::Vec3f winner(0.f, 0.f, 0.f);
+                bool haveWinner = false;
+                for (const osg::Vec3f& mp : mt->second)
+                {
+                    const ESM::ExteriorCellLocation midx = ESM::positionToExteriorCellLocation(mp.x(), mp.y());
+                    const int dX = midx.mX - posIndex.mX;
+                    const int dY = midx.mY - posIndex.mY;
+                    const int grid = std::max(std::abs(dX), std::abs(dY)) * 2;
+                    if (grid == 0)
+                    {
+                        winner = mp;
+                        haveWinner = true;
+                        break;
+                    }
+                    if (grid <= minGrid)
+                    {
+                        if (grid < minGrid)
+                        {
+                            valid.clear();
+                            minGrid = grid;
+                        }
+                        valid.push_back({ mp, grid / 2 + dX, grid / 2 + dY });
+                    }
+                }
+                if (!haveWinner && !valid.empty())
+                {
+                    int earliest = std::numeric_limits<int>::max();
+                    for (const PosInfo& m : valid)
+                    {
+                        int distance = 0;
+                        if (m.mRow == 0)
+                            distance = m.mColumn;
+                        else if (m.mColumn == minGrid)
+                            distance = minGrid + m.mRow;
+                        else if (m.mRow == minGrid)
+                            distance = minGrid * 3 - m.mColumn;
+                        else
+                            distance = minGrid * 4 - m.mRow;
+                        if (distance < earliest)
+                        {
+                            winner = m.mPos;
+                            earliest = distance;
+                        }
+                    }
+                    haveWinner = true;
+                }
+                if (haveWinner)
+                {
+                    const ESM::ExteriorCellLocation widx
+                        = ESM::positionToExteriorCellLocation(winner.x(), winner.y());
+                    CellStore& winnerCell = mWorldModel.getExterior(widx);
+                    ConstPtr best;
+                    winnerCell.forEachConst([&](const ConstPtr& p) {
+                        if (p.getCellRef().getRefId() != id)
+                            return true;
+                        if ((p.getRefData().getPosition().asVec3() - winner).length2() < 1.f)
+                        {
+                            best = p;
+                            return false;
+                        }
+                        if (best.isEmpty())
+                            best = p;
+                        return true;
+                    });
+                    if (!best.isEmpty())
+                        return best;
+                    // Table stale for this cell: fall through to the scan.
+                }
+            }
+        }
+#endif
 
         // Potential optimization: don't scan the entire world for markers and actually do the Todd spiral
         std::vector<Ptr> markers;

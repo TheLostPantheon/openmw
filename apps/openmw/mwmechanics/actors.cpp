@@ -1,5 +1,11 @@
 #include "actors.hpp"
 
+#ifdef __vita__
+#include <psp2/kernel/processmgr.h>
+
+#include "../vita/VitaInit.h"
+#endif
+
 #include <array>
 #include <optional>
 
@@ -1502,10 +1508,89 @@ namespace MWMechanics
         }
     }
 
+#ifdef __vita__
+    extern uint64_t gVitaAnimUs[8];
+    extern uint64_t gVitaAiRateUs, gVitaAiPkgUs[2];
+    extern uint32_t gVitaAiRateCalls;
+    namespace
+    {
+        // [MechSplit]: Actors::update by section, ms per frame (sim thread).
+        enum VitaMechSection
+        {
+            MechActor, // updateActor + continuous VFX
+            MechCombat, // engageCombat over all pairs
+            MechHead, // head tracking
+            MechCrime,
+            MechAi, // AI package execution
+            MechGreet, // greeting, idle dialogue, movement speed
+            MechMisc, // drowning, lights, Lua controls, loop overhead
+            MechAvoid, // predictAndAvoidCollisions
+            MechAnim, // CharacterController::update
+            MechAnimMisc, // the rest of the animation loop
+            MechTail, // knockdown, dead actors, sneaking
+            MechSectionCount
+        };
+        const char* const kVitaMechNames[MechSectionCount] = { "actor", "combat", "head", "crime", "ai", "greet",
+            "misc", "avoid", "anim", "animmisc", "tail" };
+        uint64_t gVitaMechUs[MechSectionCount] = {};
+        uint32_t gVitaMechFrames = 0, gVitaMechAiActors = 0, gVitaMechAnimActors = 0;
+        struct VitaMechLap
+        {
+            uint64_t mT = sceKernelGetProcessTimeWide();
+            void to(VitaMechSection k)
+            {
+                const uint64_t now = sceKernelGetProcessTimeWide();
+                gVitaMechUs[k] += now - mT;
+                mT = now;
+            }
+        };
+        void vitaMechReport()
+        {
+            if (++gVitaMechFrames < 150)
+                return;
+            char buf[320];
+            int n = snprintf(buf, sizeof(buf), "[MechSplit]");
+            for (int k = 0; k < MechSectionCount && n < (int)sizeof(buf); ++k)
+                n += snprintf(buf + n, sizeof(buf) - n, " %s=%.2f", kVitaMechNames[k],
+                    gVitaMechUs[k] / 1000.0 / gVitaMechFrames);
+            if (n < (int)sizeof(buf))
+                snprintf(buf + n, sizeof(buf) - n, " ms/frame; actors ai=%.1f anim=%.1f",
+                    (double)gVitaMechAiActors / gVitaMechFrames, (double)gVitaMechAnimActors / gVitaMechFrames);
+            Vita::breadcrumb(buf);
+            // CharacterController::update sections (character.cpp), every
+            // controller (actors and animated objects).
+            snprintf(buf, sizeof(buf),
+                "[AnimSplit] fx=%.2f move=%.2f queue=%.2f weapon=%.2f refresh=%.2f turn+head=%.2f run=%.2f "
+                "tail=%.2f ms/frame",
+                gVitaAnimUs[0] / 1000.0 / gVitaMechFrames, gVitaAnimUs[1] / 1000.0 / gVitaMechFrames,
+                gVitaAnimUs[7] / 1000.0 / gVitaMechFrames, gVitaAnimUs[6] / 1000.0 / gVitaMechFrames,
+                gVitaAnimUs[2] / 1000.0 / gVitaMechFrames, gVitaAnimUs[3] / 1000.0 / gVitaMechFrames,
+                gVitaAnimUs[4] / 1000.0 / gVitaMechFrames, gVitaAnimUs[5] / 1000.0 / gVitaMechFrames);
+            Vita::breadcrumb(buf);
+            std::fill(std::begin(gVitaAnimUs), std::end(gVitaAnimUs), 0);
+            snprintf(buf, sizeof(buf),
+                "[AiSplit] target rating=%.2f (%.1f calls) combat=%.2f other packages=%.2f ms/frame",
+                gVitaAiRateUs / 1000.0 / gVitaMechFrames, (double)gVitaAiRateCalls / gVitaMechFrames,
+                gVitaAiPkgUs[0] / 1000.0 / gVitaMechFrames, gVitaAiPkgUs[1] / 1000.0 / gVitaMechFrames);
+            Vita::breadcrumb(buf);
+            gVitaAiRateUs = gVitaAiPkgUs[0] = gVitaAiPkgUs[1] = 0;
+            gVitaAiRateCalls = 0;
+            std::fill(std::begin(gVitaMechUs), std::end(gVitaMechUs), 0);
+            gVitaMechFrames = gVitaMechAiActors = gVitaMechAnimActors = 0;
+        }
+    }
+#define VITA_MECH_LAP(k) vitaMechLap.to(k)
+#else
+#define VITA_MECH_LAP(k)
+#endif
+
     void Actors::update(float duration, bool paused)
     {
         if (!paused)
         {
+#ifdef __vita__
+            VitaMechLap vitaMechLap;
+#endif
 #ifdef __vita__
             const float updateEquippedLightInterval = 2.0f;
 #else
@@ -1550,6 +1635,7 @@ namespace MWMechanics
             // AI and magic effects update
             for (Actor& actor : mActors)
             {
+                VITA_MECH_LAP(MechMisc);
                 if (actor.isInvalid())
                     continue;
                 const bool isPlayer = actor.getPtr() == player;
@@ -1602,7 +1688,9 @@ namespace MWMechanics
                         ctrl.updateContinuousVfx();
                         if (!cellChanged && worldScene->hasCellChanged())
                             return;
+                        ++gVitaMechAiActors;
                     }
+                    VITA_MECH_LAP(MechActor);
 #else
                     updateActor(actorPtr, duration);
 
@@ -1648,13 +1736,16 @@ namespace MWMechanics
                                     actor.getPtr(), otherActor.getPtr(), cachedAllies, otherActor.getPtr() == player);
                             }
                         }
+                        VITA_MECH_LAP(MechCombat);
                         // Head tracking does an O(N) scan over all actors per NPC.
                         // Off-screen NPCs can't be observed → skip when out of LOD range.
                         if (mTimerUpdateHeadTrack == 0 && !vitaAiLodOutOfRange)
                             updateHeadTracking(actor.getPtr(), mActors, isPlayer, ctrl);
+                        VITA_MECH_LAP(MechHead);
 
                         if (actor.getPtr().getClass().isNpc() && !isPlayer)
                             updateCrimePursuit(actor.getPtr(), duration, cachedAllies);
+                        VITA_MECH_LAP(MechCrime);
 
                         if (!isPlayer)
                         {
@@ -1662,12 +1753,14 @@ namespace MWMechanics
                             if (isConscious(actor.getPtr()) && !(luaControls && luaControls->mDisableAI))
                             {
                                 stats.getAiSequence().execute(actor.getPtr(), ctrl, duration, vitaAiLodOutOfRange);
+                                VITA_MECH_LAP(MechAi);
                                 updateGreetingState(actor.getPtr(), actor, mTimerUpdateHello > 0);
                                 // Idle dialogue is inaudible at LOD range — skip the per-frame
                                 // distance/LOS/RNG checks for distant NPCs.
                                 if (!vitaAiLodOutOfRange)
                                     playIdleDialogue(actor.getPtr());
                                 updateMovementSpeed(actor.getPtr());
+                                VITA_MECH_LAP(MechGreet);
                             }
                         }
                     }
@@ -1676,6 +1769,7 @@ namespace MWMechanics
                     {
                         CreatureStats& stats = actor.getPtr().getClass().getCreatureStats(actor.getPtr());
                         stats.getAiSequence().execute(actor.getPtr(), ctrl, duration, /*outOfRange*/ true);
+                        VITA_MECH_LAP(MechAi);
                     }
 
                     if (inProcessingRange && actor.getPtr().getClass().isNpc())
@@ -1692,8 +1786,10 @@ namespace MWMechanics
                 }
             }
 
+            VITA_MECH_LAP(MechMisc);
             if (Settings::game().mNPCsAvoidCollisions)
                 predictAndAvoidCollisions(duration);
+            VITA_MECH_LAP(MechAvoid);
 
             mTimerUpdateHeadTrack += duration;
             mTimerUpdateEquippedLight += duration;
@@ -1764,6 +1860,7 @@ namespace MWMechanics
                 constexpr float kLodDist = 1500.f;
                 constexpr unsigned kLodSkipN = 3;
                 const uintptr_t stagger = reinterpret_cast<uintptr_t>(&actor) / 32;
+                VITA_MECH_LAP(MechAnimMisc);
                 if (dist > kLodDist
                     && ((s_vitaLodFrame + stagger) % kLodSkipN) != 0)
                 {
@@ -1773,7 +1870,9 @@ namespace MWMechanics
                 {
                     ctrl.update(duration + actor.getAccumulatedDt());
                     actor.clearAccumulatedDt();
+                    ++gVitaMechAnimActors;
                 }
+                VITA_MECH_LAP(MechAnim);
 #else
                 ctrl.update(duration);
 #endif
@@ -1781,6 +1880,7 @@ namespace MWMechanics
                 updateVisibility(actor.getPtr(), ctrl);
             }
 
+            VITA_MECH_LAP(MechAnimMisc);
             if (playerCharacter)
             {
                 MWBase::Environment::get().getWorld()->applyDeferredPreviewRotationToPlayer(duration);
@@ -1818,8 +1918,13 @@ namespace MWMechanics
                 }
             }
 
+            VITA_MECH_LAP(MechAnim);
             killDeadActors();
             updateSneaking(playerCharacter, duration);
+#ifdef __vita__
+            VITA_MECH_LAP(MechTail);
+            vitaMechReport();
+#endif
         }
     }
 

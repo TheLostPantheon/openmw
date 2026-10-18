@@ -7,6 +7,9 @@
 #include <unordered_set>
 
 #include "components/misc/guarded.hpp"
+#ifdef __vita__
+#include "components/esm3/esmreader.hpp"
+#endif
 #include "components/misc/strings/algorithm.hpp"
 #include "components/misc/utf8stream.hpp"
 
@@ -26,10 +29,21 @@ namespace ESM
 
         Misc::NotNullPtr<const std::string> getOrInsertString(std::string_view id)
         {
+#ifdef __vita__
+            const bool timing = VitaEsmTiming::sOn;
+            const unsigned long long t0 = timing ? VitaEsmTiming::nowUs() : 0;
+#endif
             const auto locked = getRefIds().lock();
             auto it = locked->find(std::string(id));
             if (it == locked->end())
                 it = locked->emplace(id).first;
+#ifdef __vita__
+            if (timing)
+            {
+                VitaEsmTiming::sIdUs += VitaEsmTiming::nowUs() - t0;
+                ++VitaEsmTiming::sIds;
+            }
+#endif
             return &*it;
         }
 

@@ -15,12 +15,32 @@ void vitaMemBreadcrumb(const char* msg);
 // Deadman heartbeat: stamp the phase the main thread is entering. Pass a
 // string LITERAL (the pointer is read from another thread).
 void vitaMainPhase(const char* phase);
+// Worker liveness, report-only; shown in [Deadman] lines.
+extern volatile int vita_gl_busy;
+extern volatile int vita_sim_busy;
+extern volatile int vita_draw_inflight;
+extern volatile unsigned long long vita_gl_job_start_us;
+extern const char* volatile vita_gl_phase;
+// Main thread's current phase (see vitaMainPhase); read by crash/deadman reports.
+extern const char* volatile vita_main_phase;
+// Flush the log ring if its locks can be taken within a bounded spin (crash
+// handlers: never wait on a lock the faulting thread may hold). 1 = flushed.
+int vitaLogFlushTry(void);
 }
 
 namespace Vita
 {
     // Must be called before anything else. Sets up clocks, OOM handler, logging.
     void initialize();
+
+    /// The player picked 640x368 in the Vita settings tab (config/res640.txt):
+    /// keep it instead of upgrading the old default to native 960x544.
+    bool vitaRes640Chosen();
+
+    // Pin the calling thread to one user core (0-2): main, sim and GL each
+    // get their own so the pipeline stages never time-slice one core.
+    // Disabled by ux0:data/openmw/nopin.txt (A/B without a rebuild).
+    void pinCurrentThread(int core, const char* name);
 
     // Apply Vita-specific settings overrides (video, shaders, memory, etc.)
     void applySettingsOverrides();
@@ -52,6 +72,14 @@ namespace Vita
 
     // Check if SELECT is held right now (raw SCE ctrl, no SDL needed).
     bool isSelectHeld();
+
+    // Free bytes in the vitaGL RAM pool (KB); SIZE_MAX before GL init.
+    // Pool exhaustion enters gpu_alloc's unsafe path (sceGxmFinish + 1s
+    // sleeps per failed alloc) — watch it like heap pressure.
+    size_t getVglRamFreeKB();
+    /// Free space across every pool a vitaGL allocation falls back through
+    /// (VRAM, RAM, phycont, budget): what "out of GPU memory" means.
+    size_t getVglTotalFreeKB();
 }
 
 // Convenience macro that compiles to nothing on non-Vita

@@ -13,8 +13,25 @@
 #include <sstream>
 #include <stdexcept>
 
+#ifdef __vita__
+#include <psp2/kernel/processmgr.h>
+#endif
+
 namespace ESM
 {
+#ifdef __vita__
+    namespace VitaEsmTiming
+    {
+        bool sOn = false;
+        unsigned long long sReadUs = 0, sIdUs = 0;
+        unsigned sReads = 0, sIds = 0;
+        unsigned long long nowUs()
+        {
+            return sceKernelGetProcessTimeWide();
+        }
+    }
+#endif
+
 
     ESM_Context ESMReader::getContext()
     {
