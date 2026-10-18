@@ -185,6 +185,12 @@ namespace MWWorld
         // Player moving at fast-travel speed (>1200 u/s) until then; the
         // memory governor shortens cache expiry meanwhile.
         std::chrono::steady_clock::time_point mVitaFastTravelUntil{};
+        // The cell being changed into, protected from store eviction for the
+        // whole change (vitaProtectedCells). The eviction passes inside a
+        // change only protect active cells and measure distance from the
+        // player's pre-teleport position, so a teleport's destination store
+        // could be freed under the change's reference to it.
+        CellStore* mVitaCellChangeTarget = nullptr;
         // [Land] cells that got the flat fallback heightfield because their
         // heights failed to load; retried once a second (vitaRetryLand).
         std::vector<std::pair<ESM::ExteriorCellLocation, int>> mVitaLandRetry;

@@ -2774,9 +2774,49 @@ namespace MWWorld
     }
 #endif
 
+    namespace
+    {
+        // Sets Scene::mVitaCellChangeTarget for a cell change, restoring the
+        // previous value on exit (also on throw; changes can nest through
+        // scripts run while loading).
+        // Test switches for the destination protection: evictstress.txt
+        // runs the pressure eviction pass on every seamless crossing;
+        // nocelltarget.txt drops the protection (reproduces the crash).
+        bool vitaFileFlag(const char* path)
+        {
+            SceIoStat st;
+            return sceIoGetstat(path, &st) >= 0;
+        }
+        bool vitaEvictStress()
+        {
+            static const bool s = vitaFileFlag("ux0:data/openmw/evictstress.txt");
+            return s;
+        }
+        bool vitaNoCellTarget()
+        {
+            static const bool s = vitaFileFlag("ux0:data/openmw/nocelltarget.txt");
+            return s;
+        }
+
+        struct VitaCellChangeTargetGuard
+        {
+            CellStore*& mSlot;
+            CellStore* mPrev;
+            VitaCellChangeTargetGuard(CellStore*& slot, CellStore* target)
+                : mSlot(slot)
+                , mPrev(slot)
+            {
+                mSlot = target;
+            }
+            ~VitaCellChangeTargetGuard() { mSlot = mPrev; }
+        };
+    }
+
     std::set<CellStore*, std::less<>> Scene::vitaProtectedCells() const
     {
         auto cells = mActiveCells;
+        if (mVitaCellChangeTarget != nullptr && !vitaNoCellTarget())
+            cells.insert(mVitaCellChangeTarget);
         for (const auto& pcl : mPendingCellLoads)
             cells.insert(pcl.cell);
         for (const auto& pp : mPendingPromotions)
@@ -7167,7 +7207,7 @@ namespace MWWorld
             && (Vita::getHeapUsedMB() > getVitaCellBudgetMB() - 40
                 || mWorld.getWorldModel().vitaCellStoreCount() > 120))
             vitaScreenHousekeeping();
-        else if (vitaSeamless && Vita::getHeapUsedMBFresh() > getVitaCellBudgetMB() - 12)
+        else if (vitaSeamless && (Vita::getHeapUsedMBFresh() > getVitaCellBudgetMB() - 12 || vitaEvictStress()))
         {
             // Same post-fence safe point as screened housekeeping. Play
             // accumulates ~20MB of transients that only unwind here; a
@@ -8101,6 +8141,11 @@ namespace MWWorld
         Vita::simFence(); // Scene teardown; wait out overlapped draw.
 #endif
         CellStore& cell = mWorld.getWorldModel().getInterior(cellName);
+#ifdef __vita__
+        // As changeToExteriorCell: no eviction may free the destination (or
+        // the name the caller passed, which views into it) mid-change.
+        const VitaCellChangeTargetGuard vitaTarget(mVitaCellChangeTarget, &cell);
+#endif
         bool useFading = (mCurrentCell != nullptr);
         if (useFading)
             MWBase::Environment::get().getWindowManager()->fadeScreenOut(0.5);
@@ -8321,6 +8366,12 @@ namespace MWWorld
         if (changeEvent && vitaScreen)
             MWBase::Environment::get().getWindowManager()->fadeScreenOut(0.5);
         CellStore& current = mWorld.getWorldModel().getCell(extCellId);
+#ifdef __vita__
+        // A Divine Intervention at the memory budget crashed in
+        // changePlayerCell on a freed destination store: changeCellGrid's
+        // pressure eviction ran before the destination became active.
+        const VitaCellChangeTargetGuard vitaTarget(mVitaCellChangeTarget, &current);
+#endif
 
         const osg::Vec2i cellIndex(current.getCell()->getGridX(), current.getCell()->getGridY());
 
@@ -8328,7 +8379,22 @@ namespace MWWorld
             ESM::ExteriorCellLocation(cellIndex.x(), cellIndex.y(), current.getCell()->getWorldSpace()), changeEvent,
             /*loadScreen*/ vitaScreen);
 
+#ifdef __vita__
+        // Look the store up again rather than trust a reference held across
+        // the load: the same store when protection held.
+        CellStore& vitaArrived = mWorld.getWorldModel().getCell(extCellId);
+        if (&vitaArrived != &current) // pointer compare only: `current` may be freed
+        {
+            static unsigned sReplaced = 0;
+            char rb[112];
+            snprintf(rb, sizeof(rb), "[CellChange] destination store was replaced during the change (%u)%s",
+                ++sReplaced, vitaNoCellTarget() ? ", protection off" : "");
+            Vita::breadcrumb(rb);
+        }
+        changePlayerCell(vitaNoCellTarget() ? current : vitaArrived, position, adjustPlayerPos);
+#else
         changePlayerCell(current, position, adjustPlayerPos);
+#endif
 
         if (changeEvent && vitaScreen)
             MWBase::Environment::get().getWindowManager()->fadeScreenIn(0.5);

@@ -432,7 +432,11 @@ if (VITA AND BUILD_OPENMW)
             ${CMAKE_CURRENT_BINARY_DIR}/openmw
         COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/vita/fix-veneers.py
             ${CMAKE_CURRENT_BINARY_DIR}/openmw
-        COMMENT "Fixing ARM relocations and veneer literal pools"
+        # A call at the edge of branch range can be mis-linked (veneer made
+        # but not used): route it through the veneer, or fail the build.
+        COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/vita/check-branches.py --fix --remove-on-fail
+            ${CMAKE_CURRENT_BINARY_DIR}/openmw
+        COMMENT "Fixing ARM relocations and veneer literal pools; checking branch targets"
         VERBATIM
     )
 
