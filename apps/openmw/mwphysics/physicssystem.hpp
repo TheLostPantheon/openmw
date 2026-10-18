@@ -109,6 +109,8 @@ namespace MWPhysics
         // for actors standing still); Sync keeps the actor's ground state
         // when no step did.
         bool mVitaSolved = false;
+        // Movement solve time this frame, physics thread ([PhysTop]).
+        uint32_t mVitaSolveUs = 0;
 #endif
     };
 

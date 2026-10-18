@@ -230,6 +230,9 @@ MWWorld::Ptr MWWorld::WorldModel::getPtrAndCache(const ESM::RefId& name, CellSto
 
     if (!ptr.isEmpty() && ptr.isInCell())
     {
+#ifdef __vita__
+        mVitaLookupStamp[&cellStore] = std::chrono::steady_clock::now();
+#endif
         mIdCache[mIdCacheIndex].first = name;
         mIdCache[mIdCacheIndex].second = &cellStore;
         if (++mIdCacheIndex >= mIdCache.size())
@@ -450,7 +453,12 @@ MWWorld::Ptr MWWorld::WorldModel::getPtrByRefId(const ESM::RefId& name)
             continue;
         Ptr ptr = cellStore->getPtr(name);
         if (!ptr.isEmpty())
+        {
+#ifdef __vita__
+            mVitaLookupStamp[cellStore] = std::chrono::steady_clock::now();
+#endif
             return ptr;
+        }
     }
 
     // Then check cells that are already listed
@@ -547,6 +555,8 @@ void MWWorld::WorldModel::vitaCheckDanglingCells(
 {
     if (gone.empty())
         return;
+    for (const CellStore* store : gone)
+        mVitaLookupStamp.erase(store);
     int logged = 0;
     const std::size_t n = mPtrRegistry.vitaDropEntriesInCells(gone, [&](ESM::RefNum refNum, const Ptr& ptr) {
         if (logged++ >= 4)

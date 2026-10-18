@@ -22,6 +22,25 @@ namespace MWPhysics
 
         btScalar addSingleResult(btCollisionWorld::LocalConvexResult& convexResult, bool normalInWorldSpace) override;
 
+#ifdef __vita__
+        // Slow-sweep anatomy (trace.cpp): broadphase candidates and the
+        // narrowphase results they produced.
+        bool needsCollision(btBroadphaseProxy* proxy0) const override
+        {
+            const bool needs = btCollisionWorld::ClosestConvexResultCallback::needsCollision(proxy0);
+            if (needs)
+            {
+                if (mVitaCandidateCount < 6)
+                    mVitaCandidates[mVitaCandidateCount] = static_cast<const btCollisionObject*>(proxy0->m_clientObject);
+                ++mVitaCandidateCount;
+            }
+            return needs;
+        }
+        mutable const btCollisionObject* mVitaCandidates[6] = {};
+        mutable unsigned mVitaCandidateCount = 0;
+        unsigned mVitaResults = 0;
+#endif
+
     protected:
         const btCollisionObject* mMe;
         const btVector3 mMotion;

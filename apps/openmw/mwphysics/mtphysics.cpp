@@ -44,6 +44,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/io/stat.h>
 #include <cstdio>
+#include <algorithm>
 #endif
 #include "object.hpp"
 #include "physicssystem.hpp"
@@ -326,8 +327,12 @@ namespace
                 }
                 ++MWPhysics::gVitaPhysActorSolves;
                 sim.second.get().mVitaSolved = true;
-#endif
+                const uint64_t vitaSolveT0 = sceKernelGetProcessTimeWide();
                 MWPhysics::MovementSolver::move(sim.second, mPhysicsDt, mCollisionWorld, mWorldFrameData);
+                sim.second.get().mVitaSolveUs += (uint32_t)(sceKernelGetProcessTimeWide() - vitaSolveT0);
+#else
+                MWPhysics::MovementSolver::move(sim.second, mPhysicsDt, mCollisionWorld, mWorldFrameData);
+#endif
             }
             void operator()(const LockedProjectileSimulation& sim) const
             {
@@ -335,6 +340,81 @@ namespace
                     MWPhysics::MovementSolver::move(sim.second, mPhysicsDt, mCollisionWorld);
             }
         };
+
+#ifdef __vita__
+        // [PhysTop]: the actors whose movement solves cost the most, by name,
+        // with where they are and how fast they fall (a stuck or endlessly
+        // falling actor makes every sweep expensive). Gathered in Sync, on the
+        // thread that syncs results, so reading the Ptr is safe.
+        struct VitaPhysTopEntry
+        {
+            const MWPhysics::Actor* mActor = nullptr;
+            char mName[40] = {};
+            uint64_t mUs = 0;
+            uint32_t mSolves = 0;
+            osg::Vec3f mPos, mInertia;
+            unsigned mStuck = 0;
+        };
+        VitaPhysTopEntry sVitaPhysTop[16];
+        unsigned sVitaPhysTopSyncs = 0;
+
+        void vitaPhysTopNote(const MWPhysics::Actor* actor, const MWWorld::Ptr& ptr,
+            const MWPhysics::ActorFrameData& d)
+        {
+            if (d.mVitaSolveUs == 0)
+                return;
+            VitaPhysTopEntry* slot = nullptr;
+            for (VitaPhysTopEntry& e : sVitaPhysTop)
+                if (e.mActor == actor)
+                {
+                    slot = &e;
+                    break;
+                }
+            if (slot == nullptr)
+            {
+                // Free slot, else replace the cheapest.
+                slot = &sVitaPhysTop[0];
+                for (VitaPhysTopEntry& e : sVitaPhysTop)
+                    if (e.mActor == nullptr || e.mUs < slot->mUs)
+                    {
+                        slot = &e;
+                        if (e.mActor == nullptr)
+                            break;
+                    }
+                *slot = VitaPhysTopEntry();
+                slot->mActor = actor;
+                snprintf(slot->mName, sizeof(slot->mName), "%s", ptr.getCellRef().getRefId().toDebugString().c_str());
+            }
+            slot->mUs += d.mVitaSolveUs;
+            ++slot->mSolves;
+            slot->mPos = d.mPosition;
+            slot->mInertia = d.mInertia;
+            slot->mStuck = d.mStuckFrames;
+        }
+
+        void vitaPhysTopReport()
+        {
+            if (++sVitaPhysTopSyncs < 300)
+                return;
+            std::sort(std::begin(sVitaPhysTop), std::end(sVitaPhysTop),
+                [](const VitaPhysTopEntry& a, const VitaPhysTopEntry& b) { return a.mUs > b.mUs; });
+            char buf[400];
+            int n = snprintf(buf, sizeof(buf), "[PhysTop] per frame over %u syncs:", sVitaPhysTopSyncs);
+            for (int i = 0; i < 3 && sVitaPhysTop[i].mActor != nullptr && n > 0 && n < (int)sizeof(buf); ++i)
+            {
+                const VitaPhysTopEntry& e = sVitaPhysTop[i];
+                n += snprintf(buf + n, sizeof(buf) - n,
+                    " %s %.2fms (%.0fus/solve) at (%.0f,%.0f,%.0f) inertia.z=%.0f stuck=%u;", e.mName,
+                    e.mUs / 1000.0 / sVitaPhysTopSyncs, e.mSolves ? (double)e.mUs / e.mSolves : 0.0, e.mPos.x(),
+                    e.mPos.y(), e.mPos.z(), e.mInertia.z(), e.mStuck);
+            }
+            if (sVitaPhysTop[0].mActor != nullptr)
+                Vita::breadcrumb(buf);
+            for (VitaPhysTopEntry& e : sVitaPhysTop)
+                e = VitaPhysTopEntry();
+            sVitaPhysTopSyncs = 0;
+        }
+#endif
 
         struct Sync
         {
@@ -350,6 +430,9 @@ namespace
                 auto& [actor, frameDataRef] = *locked;
                 auto& frameData = frameDataRef.get();
                 auto ptr = actor->getPtr();
+#ifdef __vita__
+                vitaPhysTopNote(actor.get(), ptr, frameData);
+#endif
 
                 MWMechanics::CreatureStats& stats = ptr.getClass().getCreatureStats(ptr);
                 const float heightDiff = frameData.mPosition.z() - frameData.mOldHeight;
@@ -831,7 +914,7 @@ namespace MWPhysics
     void PhysicsTaskScheduler::contactTest(
         btCollisionObject* colObj, btCollisionWorld::ContactResultCallback& resultCallback)
     {
-        #ifdef __vita__
+#ifdef __vita__
         VitaQueryTimer timer;
 #endif
         MaybeSharedLock lock(mCollisionWorldMutex, mLockingPolicy);
@@ -850,7 +933,7 @@ namespace MWPhysics
         // path was reached unlocked via PhysicsSystem and produced a
         // SceGxm-class data abort inside Bullet's rayTestSingleInternal
         // when an arrow happened to be in flight during a cell change.
-        #ifdef __vita__
+#ifdef __vita__
         VitaQueryTimer timer;
 #endif
         MaybeLock lock(mCollisionWorldMutex, mLockingPolicy);
@@ -862,7 +945,7 @@ namespace MWPhysics
 
     std::optional<btVector3> PhysicsTaskScheduler::getHitPoint(const btTransform& from, btCollisionObject* target)
     {
-        #ifdef __vita__
+#ifdef __vita__
         VitaQueryTimer timer;
 #endif
         MaybeLock lock(mCollisionWorldMutex, mLockingPolicy);
@@ -887,7 +970,7 @@ namespace MWPhysics
     void PhysicsTaskScheduler::aabbTest(
         const btVector3& aabbMin, const btVector3& aabbMax, btBroadphaseAabbCallback& callback)
     {
-        #ifdef __vita__
+#ifdef __vita__
         VitaQueryTimer timer;
 #endif
         MaybeSharedLock lock(mCollisionWorldMutex, mLockingPolicy);
@@ -899,7 +982,7 @@ namespace MWPhysics
 
     void PhysicsTaskScheduler::getAabb(const btCollisionObject* obj, btVector3& min, btVector3& max)
     {
-        #ifdef __vita__
+#ifdef __vita__
         VitaQueryTimer timer;
 #endif
         MaybeSharedLock lock(mCollisionWorldMutex, mLockingPolicy);
@@ -911,7 +994,7 @@ namespace MWPhysics
 
     void PhysicsTaskScheduler::setCollisionFilterMask(btCollisionObject* collisionObject, int collisionFilterMask)
     {
-        #ifdef __vita__
+#ifdef __vita__
         VitaQueryTimer timer;
 #endif
         MaybeExclusiveLock lock(mCollisionWorldMutex, mLockingPolicy);
@@ -924,7 +1007,7 @@ namespace MWPhysics
     void PhysicsTaskScheduler::addCollisionObject(
         btCollisionObject* collisionObject, int collisionFilterGroup, int collisionFilterMask)
     {
-        #ifdef __vita__
+#ifdef __vita__
         VitaQueryTimer timer;
 #endif
         MaybeExclusiveLock lock(mCollisionWorldMutex, mLockingPolicy);
@@ -937,7 +1020,7 @@ namespace MWPhysics
 
     void PhysicsTaskScheduler::removeCollisionObject(btCollisionObject* collisionObject)
     {
-        #ifdef __vita__
+#ifdef __vita__
         VitaQueryTimer timer;
 #endif
         MaybeExclusiveLock lock(mCollisionWorldMutex, mLockingPolicy);
@@ -964,7 +1047,7 @@ namespace MWPhysics
     bool PhysicsTaskScheduler::getLineOfSight(
         const std::shared_ptr<Actor>& actor1, const std::shared_ptr<Actor>& actor2)
     {
-        #ifdef __vita__
+#ifdef __vita__
         VitaQueryTimer timer;
 #endif
         MaybeExclusiveLock lock(mLOSCacheMutex, mLockingPolicy);
@@ -1215,6 +1298,9 @@ namespace MWPhysics
         const Visitors::Sync vis{ mAdvanceSimulation, mTimeAccum, mPhysicsDt, this };
         for (auto& sim : *mSimulations)
             std::visit(vis, sim);
+#ifdef __vita__
+        Visitors::vitaPhysTopReport();
+#endif
         mSimulations->clear();
         mSimulations = nullptr;
     }

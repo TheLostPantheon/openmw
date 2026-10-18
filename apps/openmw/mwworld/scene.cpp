@@ -2824,6 +2824,7 @@ namespace MWWorld
         for (const auto& pd : mPendingDemotions)
             cells.insert(pd.cell);
         mPreloader->vitaCollectHeldCells(cells);
+        mWorld.getWorldModel().vitaCollectRecentLookups(cells, std::chrono::seconds(30));
 
         // A store owns its LiveCellRefs; freeing one while a body or render
         // node still points at them is a use-after-free. Walk the registries

@@ -4,6 +4,7 @@
 #include <list>
 #include <map>
 #ifdef __vita__
+#include <chrono>
 #include <functional>
 #include <set>
 #endif
@@ -124,6 +125,26 @@ namespace MWWorld
                 if (entry.second == store)
                     entry = { ESM::RefId(), nullptr };
         }
+#ifdef __vita__
+        /// Stores a reference lookup by id (scripts: `"agronian guy"->OnDeath`)
+        /// found its target in recently. Scene keeps them out of eviction:
+        /// a script asking every frame about an actor in an inactive cell had
+        /// the cell evicted and reloaded about once a second (~43 ms each).
+        void vitaCollectRecentLookups(std::set<CellStore*, std::less<>>& out, std::chrono::seconds window)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            for (auto it = mVitaLookupStamp.begin(); it != mVitaLookupStamp.end();)
+            {
+                if (now - it->second > window)
+                    it = mVitaLookupStamp.erase(it);
+                else
+                {
+                    out.insert(const_cast<CellStore*>(it->first));
+                    ++it;
+                }
+            }
+        }
+#endif
         std::size_t vitaIdCachePinnedCount() const
         {
             std::set<const CellStore*> distinct;
@@ -182,6 +203,9 @@ namespace MWWorld
         mutable std::map<ESM::ExteriorCellLocation, CellStore*> mExteriors;
         ESM::Cell mDraftCell;
         std::vector<std::pair<ESM::RefId, CellStore*>> mIdCache;
+#ifdef __vita__
+        std::unordered_map<const CellStore*, std::chrono::steady_clock::time_point> mVitaLookupStamp;
+#endif
 #ifdef __vita__
         // Session ledger: one append-only file of headerless cell records.
         struct VitaLedgerSpan
