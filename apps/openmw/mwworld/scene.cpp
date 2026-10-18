@@ -8336,7 +8336,7 @@ namespace MWWorld
     }
 
     void Scene::changeToExteriorCell(const ESM::RefId& extCellId, const ESM::Position& position, bool adjustPlayerPos,
-        bool changeEvent, bool vitaSeamlessCrossing)
+        bool changeEvent, bool vitaSeamlessCrossing, bool vitaTeleport)
     {
 #ifdef __vita__
         Vita::simFence(); // Scene teardown; wait out overlapped draw.
@@ -8359,6 +8359,18 @@ namespace MWWorld
                 vitaScreen = false; // a walk, not a load
         }
         vitaScreen = vitaScreen && !vitaSeamlessCrossing;
+        // A teleport (door, travel, intervention, Recall, script) is a fresh
+        // load even when it lands a cell or two away: screened, so
+        // changeCellGrid releases the area being left before loading the
+        // destination, and clears caches and distant stores near the memory
+        // budget. A seamless short teleport loaded the new area on top of
+        // the old one (232 MB against a 228 MB budget at a Divine
+        // Intervention that crashed) and stalled play ~1.5 s anyway. Walking
+        // into a not-yet-active cell stays seamless (vitaSeamlessCrossing).
+        // ux0:data/openmw/seamlessteleport.txt restores seamless short hops.
+        static const bool sSeamlessTeleports = vitaFileFlag("ux0:data/openmw/seamlessteleport.txt");
+        if (vitaTeleport && !sSeamlessTeleports)
+            vitaScreen = true;
 #else
         const bool vitaScreen = true;
 #endif

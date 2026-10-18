@@ -1347,7 +1347,12 @@ namespace MWWorld
         }
         removeContainerScripts(getPlayerPtr());
         if (exteriorCell)
+#ifdef __vita__
+            mWorldScene->changeToExteriorCell(cellId, position, adjustPlayerPos, changeEvent,
+                /*vitaSeamlessCrossing*/ false, /*vitaTeleport*/ true);
+#else
             mWorldScene->changeToExteriorCell(cellId, position, adjustPlayerPos, changeEvent);
+#endif
         else
             mWorldScene->changeToInteriorCell(destinationCell->getNameId(), position, adjustPlayerPos, changeEvent);
         addContainerScripts(getPlayerPtr(), getPlayerPtr().getCell());
