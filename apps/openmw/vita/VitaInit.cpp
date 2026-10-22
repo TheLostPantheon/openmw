@@ -42,6 +42,7 @@
 #include <exception>
 #include <malloc.h>
 #include <new>
+#include <set>
 #include <string>
 #include <vector>
 #include <unistd.h>
@@ -1355,7 +1356,8 @@ namespace Vita
     // Reorders the auto-detected content= lines so every plugin comes after
     // the auto-detected plugins it depends on, and the auto-detected data=
     // lines the same way by the plugins they hold, keeping the existing
-    // order otherwise. User-written lines above the marker stay put.
+    // order otherwise; leaves out plugins whose masters aren't loaded.
+    // User-written lines above the marker stay put.
     static void sortAutoContentByMasters()
     {
         static const char* cfgPath = "ux0:data/openmw/config/openmw.cfg";
@@ -1420,7 +1422,7 @@ namespace Vita
                 slots.push_back(i);
                 names.push_back(lower(valueOf(lines[i], 8)));
             }
-        if (slots.size() < 2)
+        if (slots.empty())
             return;
 
         std::vector<std::vector<std::string>> masters(slots.size());
@@ -1440,6 +1442,65 @@ namespace Vita
                 break;
             }
         }
+        // A plugin whose master isn't loaded stops the game at boot ("asks for
+        // parent file ... not available"), e.g. Tamriel Rebuilt copied
+        // without Tamriel_Data. Leave such plugins out, commented with the
+        // reason; the next rescan (adding the master is one) reconsiders them.
+        std::set<std::string> loaded;
+        for (const std::string& line : lines)
+            if (line.rfind("content=", 0) == 0)
+                loaded.insert(lower(valueOf(line, 8)));
+        int disabled = 0;
+        std::vector<bool> leftOut(slots.size(), false);
+        std::vector<std::string> files(slots.size());
+        for (size_t k = 0; k < slots.size(); ++k)
+            files[k] = valueOf(lines[slots[k]], 8);
+        for (bool changed = true; changed;)
+        {
+            changed = false;
+            for (size_t k = 0; k < slots.size(); ++k)
+            {
+                if (lines[slots[k]].rfind("content=", 0) != 0)
+                    continue;
+                for (const std::string& m : masters[k])
+                {
+                    if (loaded.count(m))
+                        continue;
+                    lines[slots[k]] = "# " + lines[slots[k]] + " (not loaded: master " + m + " missing)";
+                    leftOut[k] = true;
+                    loaded.erase(names[k]);
+                    ++disabled;
+                    changed = true;
+                    char crumb[300];
+                    snprintf(crumb, sizeof(crumb), "Mod scan: left out %s, its master %s is missing",
+                        files[k].c_str(), m.c_str());
+                    breadcrumb(crumb);
+                    break;
+                }
+            }
+        }
+
+        // A left-out plugin's scripts expect its records: TR's
+        // strongholds.lua failed every frame without TR_Mainland.esm.
+        for (size_t k = 0; k < slots.size(); ++k)
+        {
+            if (leftOut[k] || home[k] < 0 || names[k].size() < 11
+                || names[k].compare(names[k].size() - 11, 11, ".omwscripts") != 0)
+                continue;
+            for (size_t j = 0; j < slots.size(); ++j)
+            {
+                if (!leftOut[j] || home[j] != home[k])
+                    continue;
+                lines[slots[k]] = "# " + lines[slots[k]] + " (not loaded: " + files[j] + " is left out)";
+                leftOut[k] = true;
+                ++disabled;
+                char crumb[300];
+                snprintf(crumb, sizeof(crumb), "Mod scan: left out %s with %s", files[k].c_str(), files[j].c_str());
+                breadcrumb(crumb);
+                break;
+            }
+        }
+
         const auto needsPlugin = [&](size_t k, size_t j) {
             return std::find(masters[k].begin(), masters[k].end(), names[j]) != masters[k].end();
         };
@@ -1476,7 +1537,7 @@ namespace Vita
         int dataMoved = 0;
         for (size_t k = 0; k < dataOrder.size(); ++k)
             dataMoved += dataOrder[k] != k;
-        if (moved == 0 && dataMoved == 0)
+        if (moved == 0 && dataMoved == 0 && disabled == 0)
             return;
 
         std::vector<std::string> sorted = lines;
