@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <cstring>
+#include <strings.h>
 #include <ctime>
 #include <exception>
 #include <malloc.h>
@@ -655,23 +656,74 @@ namespace Vita
     // Format note: changing this struct's layout invalidates old cookies
     // (size mismatch in readModsScanCookie), which forces one rescan on
     // upgrade. Clean migration, no version field needed.
+    // Fingerprints of what the scans read, not folder mtimes: exFAT leaves
+    // a folder's mtime alone when files are added inside it, so a new mod
+    // in mods/ or a plugin dropped into Data Files was never scanned unless
+    // SELECT was held.
     struct ModsScanCookie
     {
-        SceDateTime modsMtime;
-        SceDateTime dataFilesMtime;
+        uint64_t modsHash;
+        uint64_t dataFilesHash;
+        uint32_t modsEntries;
+        uint32_t dataFilesEntries;
         uint32_t bakedBsaCount;
+        uint32_t pad;
         uint64_t bakedBsaTotalSize;
     };
 
     static const char* kModsScanCookiePath = "ux0:data/openmw/config/mods_scan.cookie";
     static const char* kBakedModsDir = "app0:resources/baked-mods";
 
-    static bool fetchDirMtime(const char* path, SceDateTime* out)
+    // Asset folders hold no plugins; listing them (thousands of textures)
+    // would cost every boot.
+    static bool isAssetDir(const char* name)
     {
-        SceIoStat s{};
-        if (sceIoGetstat(path, &s) < 0)
+        static const char* const kAssetDirs[] = { "meshes", "textures", "icons", "sound", "music", "bookart",
+            "splash", "fonts", "video", "shaders", "distantland", "mwse", "fomod", "docs", "images", "screenshots" };
+        for (const char* asset : kAssetDirs)
+            if (strcasecmp(name, asset) == 0)
+                return true;
+        return false;
+    }
+
+    // Order-independent hash of a folder's entries (name, and size + mtime
+    // for files), `levels` deep. Returns false when the folder can't be opened.
+    static bool fingerprintDir(const char* path, int levels, uint64_t* hash, uint32_t* entries)
+    {
+        SceUID dd = sceIoDopen(path);
+        if (dd < 0)
             return false;
-        *out = s.st_mtime;
+        SceIoDirent ent{};
+        while (sceIoDread(dd, &ent) > 0)
+        {
+            if (ent.d_name[0] != '.')
+            {
+                uint64_t h = 1469598103934665603ULL; // FNV-1a
+                const auto mix = [&h](const void* data, size_t len) {
+                    const unsigned char* bytes = static_cast<const unsigned char*>(data);
+                    for (size_t i = 0; i < len; ++i)
+                        h = (h ^ bytes[i]) * 1099511628211ULL;
+                };
+                mix(path, strlen(path));
+                mix(ent.d_name, strlen(ent.d_name));
+                const bool dir = SCE_S_ISDIR(ent.d_stat.st_mode);
+                if (!dir)
+                {
+                    mix(&ent.d_stat.st_size, sizeof(ent.d_stat.st_size));
+                    mix(&ent.d_stat.st_mtime, sizeof(ent.d_stat.st_mtime));
+                }
+                *hash += h;
+                *entries += 1;
+                if (dir && levels > 1 && !isAssetDir(ent.d_name))
+                {
+                    char sub[1024];
+                    snprintf(sub, sizeof(sub), "%s/%s", path, ent.d_name);
+                    fingerprintDir(sub, levels - 1, hash, entries);
+                }
+            }
+            memset(&ent, 0, sizeof(ent));
+        }
+        sceIoDclose(dd);
         return true;
     }
 
@@ -713,12 +765,23 @@ namespace Vita
         return n == (int)sizeof(*out);
     }
 
+    // Data Files: the content scan reads its top level only. mods/: mod
+    // folders, their contents and one more level (FOMOD-style subfolders).
+    static bool fetchModsFingerprint(ModsScanCookie* out)
+    {
+        fingerprintDir("ux0:data/openmw/mods", 3, &out->modsHash, &out->modsEntries);
+        if (!fingerprintDir("ux0:data/openmw/Data Files", 1, &out->dataFilesHash, &out->dataFilesEntries))
+            return false;
+        uint32_t bakedCount = 0;
+        fetchBakedFingerprint(&bakedCount, &out->bakedBsaTotalSize);
+        out->bakedBsaCount = bakedCount;
+        return true;
+    }
+
     static void writeModsScanCookie()
     {
         ModsScanCookie cookie{};
-        fetchDirMtime("ux0:data/openmw/mods", &cookie.modsMtime);
-        fetchDirMtime("ux0:data/openmw/Data Files", &cookie.dataFilesMtime);
-        fetchBakedFingerprint(&cookie.bakedBsaCount, &cookie.bakedBsaTotalSize);
+        fetchModsFingerprint(&cookie);
         SceUID fd = sceIoOpen(kModsScanCookiePath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
         if (fd >= 0)
         {
@@ -730,11 +793,8 @@ namespace Vita
     static bool modsScanCookieMatchesCurrent()
     {
         ModsScanCookie current{};
-        if (!fetchDirMtime("ux0:data/openmw/mods", &current.modsMtime))
+        if (!fetchModsFingerprint(&current))
             return false;
-        if (!fetchDirMtime("ux0:data/openmw/Data Files", &current.dataFilesMtime))
-            return false;
-        fetchBakedFingerprint(&current.bakedBsaCount, &current.bakedBsaTotalSize);
         ModsScanCookie saved{};
         if (!readModsScanCookie(&saved))
             return false;
@@ -1333,6 +1393,11 @@ namespace Vita
             // Wipe stale auto-added entries first so deleted mods don't leave
             // dangling content= / data= lines that crash the engine on load.
             pruneAutoDetectedSections();
+            // The content-file scan cache is checked against the data folder
+            // list only: a plugin added to an existing folder stayed missing
+            // ("content file does not exist"), and the engine loads it before
+            // it knows SELECT is held. A rescan means the folders changed.
+            sceIoRemove("ux0:data/openmw/config/scan_cache.bin");
             autoDetectContent();
             autoDetectModDataDirs();
             // Must run AFTER the two above so the baked-mod fallback-archive

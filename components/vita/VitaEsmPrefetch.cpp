@@ -19,6 +19,14 @@ namespace Vita::EsmPrefetch
     namespace
     {
         constexpr size_t kChunkBytes = 4 * 1024 * 1024;
+        // All prefetch buffers live until loading ends, on top of the parsed
+        // store (vanilla: Morrowind + Tribunal + Bloodmoon = 94 MB, heap at
+        // 153 of 268 MB mid-load). A Turkish translation with two ~70 MB
+        // plugins asked for ~237 MB of buffers and ran out of memory at boot.
+        // Files are taken in load order while they fit; the rest parse from
+        // disk. The allocation must not fail: the OOM handler exits instead
+        // of letting new(std::nothrow) return null.
+        constexpr size_t kBudgetBytes = 112 * 1024 * 1024;
 
         struct Entry
         {
@@ -178,12 +186,20 @@ namespace Vita::EsmPrefetch
     {
         if (!sEntries.empty())
             return; // engine already kicked the reader at boot
+        size_t budgetLeft = kBudgetBytes;
         for (auto& path : files)
         {
             std::error_code ec;
             const auto size = std::filesystem::file_size(path, ec);
             if (ec || size == 0)
                 continue;
+            if (size > budgetLeft)
+            {
+                crumb("[EsmLoad] %s (%u MB) over the prefetch budget: parsed from disk",
+                    path.filename().string().c_str(), static_cast<unsigned>(size >> 20));
+                continue;
+            }
+            budgetLeft -= static_cast<size_t>(size);
             auto entry = std::make_shared<Entry>();
             entry->mPath = std::move(path);
             entry->mSize = static_cast<size_t>(size);
