@@ -240,6 +240,18 @@ namespace LuaUtil
                 }
                 catch (std::exception& e)
                 {
+#ifdef __vita__
+                    const unsigned failures = vitaCountFailure(handler.mScriptId, handlers.mName);
+                    if (!vitaLogFailure(failures))
+                        continue;
+                    if (failures >= 3)
+                    {
+                        Log(Debug::Error) << mNamePrefix << "[" << scriptPath(handler.mScriptId) << "] "
+                                          << handlers.mName << " failed " << failures
+                                          << " times (repeats are logged every 1000th). " << e.what();
+                        continue;
+                    }
+#endif
                     Log(Debug::Error) << mNamePrefix << "[" << scriptPath(handler.mScriptId) << "] " << handlers.mName
                                       << " failed. " << e.what();
                 }
@@ -293,6 +305,15 @@ namespace LuaUtil
         Script& getScript(int scriptId);
 
         void printError(int scriptId, std::string_view msg, const std::exception& e) const;
+#ifdef __vita__
+        // How many times this script's \a what has failed, this one included.
+        // A broken mod script can fail every frame, and writing each error and
+        // traceback to the memory card cost ~40 ms a frame (Tamriel Rebuilt's
+        // strongholds.lua without its plugin): failures past the third are
+        // logged every 1000th.
+        unsigned vitaCountFailure(int scriptId, std::string_view what) const;
+        static bool vitaLogFailure(unsigned count) { return count <= 3 || count % 1000 == 0; }
+#endif
 
         const VFS::Path::Normalized& scriptPath(int scriptId) const
         {

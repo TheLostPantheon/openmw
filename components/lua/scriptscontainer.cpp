@@ -17,6 +17,8 @@ namespace
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <map>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -130,8 +132,29 @@ namespace LuaUtil
         }
     }
 
+#ifdef __vita__
+    unsigned ScriptsContainer::vitaCountFailure(int scriptId, std::string_view what) const
+    {
+        static std::mutex sMutex;
+        static std::map<std::string, unsigned> sFailures;
+        const std::lock_guard lock(sMutex);
+        return ++sFailures[mNamePrefix + scriptPath(scriptId).value() + "|" + std::string(what)];
+    }
+#endif
+
     void ScriptsContainer::printError(int scriptId, std::string_view msg, const std::exception& e) const
     {
+#ifdef __vita__
+        const unsigned count = vitaCountFailure(scriptId, msg);
+        if (!vitaLogFailure(count))
+            return;
+        if (count >= 3)
+        {
+            Log(Debug::Error) << mNamePrefix << "[" << scriptPath(scriptId) << "] " << msg << " (failed " << count
+                              << " times; repeats are logged every 1000th): " << e.what();
+            return;
+        }
+#endif
         Log(Debug::Error) << mNamePrefix << "[" << scriptPath(scriptId) << "] " << msg << ": " << e.what();
     }
 
