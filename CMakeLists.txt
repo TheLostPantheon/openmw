@@ -112,7 +112,7 @@ set(OPENMW_DOC_BASEURL "https://openmw.readthedocs.io/en/")
 # Vita port release: the main menu shows OPENMW_VITA_VERSION and the VPK's
 # APP_VER is derived from the same numbers (2.3 -> 02.30, 2.3.1 -> 02.31).
 set(OPENMW_VITA_VERSION_MAJOR 2)
-set(OPENMW_VITA_VERSION_MINOR 3)
+set(OPENMW_VITA_VERSION_MINOR 4)
 set(OPENMW_VITA_VERSION_PATCH 0)
 set(OPENMW_VITA_VERSION "${OPENMW_VITA_VERSION_MAJOR}.${OPENMW_VITA_VERSION_MINOR}")
 if (OPENMW_VITA_VERSION_PATCH)
