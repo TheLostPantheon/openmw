@@ -461,9 +461,15 @@ if (VITA AND BUILD_OPENMW)
     # LiveArea assets
     set(VITA_DATA_DIR ${CMAKE_SOURCE_DIR}/data/openMW)
 
-    # Create VPK package
+    # Create VPK package. APP_VER is XX.YY: 2.3.1 -> 02.31.
+    if (OPENMW_VITA_VERSION_MAJOR LESS 10)
+        set(VITA_APP_VER "0${OPENMW_VITA_VERSION_MAJOR}")
+    else ()
+        set(VITA_APP_VER "${OPENMW_VITA_VERSION_MAJOR}")
+    endif ()
+    string(APPEND VITA_APP_VER ".${OPENMW_VITA_VERSION_MINOR}${OPENMW_VITA_VERSION_PATCH}")
     vita_create_vpk(openmw.vpk ${VITA_TITLEID} eboot.bin
-        VERSION 02.30
+        VERSION ${VITA_APP_VER}
         NAME ${VITA_APP_NAME}
         FILE ${CMAKE_SOURCE_DIR}/apps/openmw/vita/openmw.cfg openmw.cfg
         FILE ${CMAKE_BINARY_DIR}/defaults.bin defaults.bin

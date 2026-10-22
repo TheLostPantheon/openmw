@@ -33,7 +33,7 @@ namespace Version
     std::string getOpenmwVersionDescription()
     {
 #ifdef __vita__
-        std::string str = "OpenMW Vita 2.1 (engine ";
+        std::string str = "OpenMW Vita @OPENMW_VITA_VERSION@ (engine ";
         str += getVersion();
         str += ")";
 #else

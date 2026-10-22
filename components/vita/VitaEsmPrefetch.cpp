@@ -19,6 +19,14 @@ namespace Vita::EsmPrefetch
     namespace
     {
         constexpr size_t kChunkBytes = 4 * 1024 * 1024;
+        // All prefetch buffers live until loading ends, on top of the parsed
+        // store (vanilla: Morrowind + Tribunal + Bloodmoon = 94 MB, heap at
+        // 153 of 268 MB mid-load). A Turkish translation with two ~70 MB
+        // plugins asked for ~237 MB of buffers and ran out of memory at boot.
+        // Files are taken in load order while they fit; the rest parse from
+        // disk. The allocation must not fail: the OOM handler exits instead
+        // of letting new(std::nothrow) return null.
+        constexpr size_t kBudgetBytes = 112 * 1024 * 1024;
 
         struct Entry
         {
@@ -32,6 +40,8 @@ namespace Vita::EsmPrefetch
 
         std::vector<std::shared_ptr<Entry>> sEntries;
         std::thread sThread;
+        bool sSkippedAny = false; // a content file is parsed from disk
+        bool sKeepRequested = false;
 
         void crumb(const char* fmt, const char* name, unsigned mb)
         {
@@ -178,18 +188,30 @@ namespace Vita::EsmPrefetch
     {
         if (!sEntries.empty())
             return; // engine already kicked the reader at boot
+        size_t budgetLeft = kBudgetBytes;
         for (auto& path : files)
         {
             std::error_code ec;
             const auto size = std::filesystem::file_size(path, ec);
             if (ec || size == 0)
                 continue;
+            if (size > budgetLeft)
+            {
+                sSkippedAny = true;
+                crumb("[EsmLoad] %s (%u MB) over the prefetch budget: parsed from disk",
+                    path.filename().string().c_str(), static_cast<unsigned>(size >> 20));
+                continue;
+            }
+            budgetLeft -= static_cast<size_t>(size);
             auto entry = std::make_shared<Entry>();
             entry->mPath = std::move(path);
             entry->mSize = static_cast<size_t>(size);
             entry->mData.reset(new (std::nothrow) char[entry->mSize]);
             if (!entry->mData)
+            {
+                sSkippedAny = true;
                 continue; // fall back to disk for this file
+            }
             sEntries.push_back(std::move(entry));
         }
         if (sEntries.empty())
@@ -212,6 +234,35 @@ namespace Vita::EsmPrefetch
             return std::make_unique<WaitingIMemStream>(entry);
         }
         return nullptr;
+    }
+
+    void setKeepUntilFinish(bool keep)
+    {
+        sKeepRequested = keep;
+    }
+
+    bool keepUntilFinish()
+    {
+        return sKeepRequested && !sSkippedAny && !sEntries.empty();
+    }
+
+    void release(const std::filesystem::path& path)
+    {
+        if (keepUntilFinish())
+            return;
+        for (const auto& entry : sEntries)
+        {
+            // The reader thread is done with an entry once all of it landed
+            // (or the read failed); use_count 1 means no stream reads it.
+            if (entry->mPath != path || !entry->mData || entry.use_count() != 1)
+                continue;
+            if (!entry->mFailed.load(std::memory_order_acquire)
+                && entry->mAvail.load(std::memory_order_acquire) < entry->mSize)
+                continue;
+            entry->mData.reset();
+            crumb("[EsmLoad] released %s (%u MB)", entry->mPath.filename().string().c_str(),
+                static_cast<unsigned>(entry->mSize >> 20));
+        }
     }
 
     void finish()

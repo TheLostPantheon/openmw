@@ -13,6 +13,7 @@
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/vshbridge.h>
 
 #include "VitaBuildInfo.h"
 #include "VitaGLGuard.h"
@@ -236,8 +237,23 @@ namespace
 
 namespace Vita
 {
+    // kubridge is a kernel plugin, linked weak so the app loads without it,
+    // but an unresolved weak import is not a no-op: calling it jumps to
+    // address 0. 2.3 crashed at boot (prefetch abort, PC 0, R12 = the
+    // kuKernelRegisterExceptionHandler stub) on a console without kubridge.
+    bool kubridgeLoaded()
+    {
+        SceUInt32 search[16] = {};
+        return _vshKernelSearchModuleByName("kubridge", search) >= 0;
+    }
+
     void installCrashReporter()
     {
+        if (!kubridgeLoaded())
+        {
+            vitaBreadcrumb("[Crash] reporter not armed: kubridge not loaded (psp2core dumps still work)");
+            return;
+        }
         SceUID mod = sceKernelGetModuleIdByAddr(reinterpret_cast<void*>(&installCrashReporter));
         SceKernelModuleInfo info{};
         info.size = sizeof(info);

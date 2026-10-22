@@ -20,12 +20,24 @@
 
 #include "../mwmechanics/spelllist.hpp"
 
+#ifdef __vita__
+#include <cstdio>
+
+#include <components/vita/VitaEsmPrefetch.h>
+#include <components/vita/VitaWindowFileStream.h>
+
+#include "../vita/VitaInit.h"
+#endif
+
 namespace
 {
     struct Ref
     {
         ESM::RefNum mRefNum;
         std::size_t mRefID;
+#ifdef __vita__
+        uint32_t mCellIdx = 0; // the cell it was read from (sole-cell index)
+#endif
 
         Ref(ESM::RefNum refNum, std::size_t refID)
             : mRefNum(refNum)
@@ -36,6 +48,62 @@ namespace
 
     constexpr std::size_t deletedRefID = std::numeric_limits<std::size_t>::max();
 
+    // Index of a ref's id in refIDs. With refIdIndex each distinct id is
+    // stored once (Vita: Tamriel Rebuilt places 1.35M objects of far fewer
+    // kinds; one RefId per placed object was ~25 MB at boot).
+    struct RefIdList
+    {
+        std::vector<ESM::RefId>& mIds;
+        std::unordered_map<ESM::RefId, std::size_t>* mIndex;
+
+        std::size_t add(ESM::RefId&& id)
+        {
+            if (mIndex == nullptr)
+            {
+                mIds.push_back(std::move(id));
+                return mIds.size() - 1;
+            }
+            const auto [it, inserted] = mIndex->try_emplace(id, mIds.size());
+            if (inserted)
+                mIds.push_back(std::move(id));
+            return it->second;
+        }
+    };
+
+    // The refs of one of the cell's contexts; the reader is restored to it.
+    void readContextRefs(
+        const ESM::Cell& cell, ESM::ESMReader& reader, std::vector<Ref>& refs, RefIdList ids, std::set<ESM::RefId>& keyIDs)
+    {
+        ESM::CellRef ref;
+        bool deleted = false;
+        while (cell.getNextRef(reader, ref, deleted))
+        {
+            if (deleted)
+                refs.emplace_back(ref.mRefNum, deletedRefID);
+            else if (std::find(cell.mMovedRefs.begin(), cell.mMovedRefs.end(), ref.mRefNum) == cell.mMovedRefs.end())
+            {
+                if (!ref.mKey.empty())
+                    keyIDs.insert(std::move(ref.mKey));
+                refs.emplace_back(ref.mRefNum, ids.add(std::move(ref.mRefID)));
+            }
+        }
+    }
+
+    void readLeasedRefs(const ESM::Cell& cell, std::vector<Ref>& refs, RefIdList ids, std::set<ESM::RefId>& keyIDs)
+    {
+        for (const auto& [value, deleted] : cell.mLeasedRefs)
+        {
+            if (deleted)
+                refs.emplace_back(value.mRefNum, deletedRefID);
+            else
+            {
+                if (!value.mKey.empty())
+                    keyIDs.insert(std::move(value.mKey));
+                refs.emplace_back(value.mRefNum, ids.add(ESM::RefId(value.mRefID)));
+            }
+        }
+    }
+
     void readRefs(const ESM::Cell& cell, std::vector<Ref>& refs, std::vector<ESM::RefId>& refIDs,
         std::set<ESM::RefId>& keyIDs, ESM::ReadersCache& readers)
     {
@@ -45,34 +113,9 @@ namespace
             const std::size_t index = static_cast<std::size_t>(cell.mContextList[i].index);
             const ESM::ReadersCache::BusyItem reader = readers.get(index);
             cell.restore(*reader, i);
-            ESM::CellRef ref;
-            bool deleted = false;
-            while (cell.getNextRef(*reader, ref, deleted))
-            {
-                if (deleted)
-                    refs.emplace_back(ref.mRefNum, deletedRefID);
-                else if (std::find(cell.mMovedRefs.begin(), cell.mMovedRefs.end(), ref.mRefNum)
-                    == cell.mMovedRefs.end())
-                {
-                    if (!ref.mKey.empty())
-                        keyIDs.insert(std::move(ref.mKey));
-                    refs.emplace_back(ref.mRefNum, refIDs.size());
-                    refIDs.push_back(std::move(ref.mRefID));
-                }
-            }
+            readContextRefs(cell, *reader, refs, RefIdList{ refIDs, nullptr }, keyIDs);
         }
-        for (const auto& [value, deleted] : cell.mLeasedRefs)
-        {
-            if (deleted)
-                refs.emplace_back(value.mRefNum, deletedRefID);
-            else
-            {
-                if (!value.mKey.empty())
-                    keyIDs.insert(std::move(value.mKey));
-                refs.emplace_back(value.mRefNum, refIDs.size());
-                refIDs.push_back(value.mRefID);
-            }
-        }
+        readLeasedRefs(cell, refs, RefIdList{ refIDs, nullptr }, keyIDs);
     }
 
     const ESM::RefId& getDefaultClass(const MWWorld::Store<ESM::Class>& classes)
@@ -557,6 +600,44 @@ namespace MWWorld
         countAllCellRefsAndMarkKeys(readers);
     }
 
+#ifdef __vita__
+    void vitaForEachCellContext(const std::vector<const ESM::Cell*>& cells, ESM::ReadersCache& readers,
+        const std::function<void(std::size_t, std::size_t, ESM::ESMReader&)>& visit)
+    {
+        struct Task
+        {
+            std::size_t mCell;
+            std::size_t mContext;
+            int mFile;
+            std::size_t mPos;
+        };
+        std::vector<Task> tasks;
+        for (std::size_t c = 0; c < cells.size(); ++c)
+            for (std::size_t i = 0; i < cells[c]->mContextList.size(); ++i)
+                tasks.push_back(Task{ c, i, cells[c]->mContextList[i].index, cells[c]->mContextList[i].filePos });
+        std::stable_sort(tasks.begin(), tasks.end(),
+            [](const Task& l, const Task& r) { return l.mFile < r.mFile || (l.mFile == r.mFile && l.mPos < r.mPos); });
+        // Readers still over their in-RAM copies (EsmPrefetch kept them for
+        // this first boot) stay as they are.
+        const bool fromRam = Vita::EsmPrefetch::keepUntilFinish();
+        for (std::size_t t = 0; t < tasks.size();)
+        {
+            const int file = tasks[t].mFile;
+            {
+                const ESM::ReadersCache::BusyItem reader = readers.get(static_cast<std::size_t>(file));
+                const std::filesystem::path& name = cells[tasks[t].mCell]->mContextList[tasks[t].mContext].filename;
+                if (!fromRam)
+                    if (auto windowed = Vita::openWindowFileStream(name))
+                        reader->open(std::move(windowed), name);
+                for (; t < tasks.size() && tasks[t].mFile == file; ++t)
+                    visit(tasks[t].mCell, tasks[t].mContext, *reader);
+            }
+            if (!fromRam)
+                readers.vitaClose(static_cast<std::size_t>(file)); // drop the 1 MB window
+        }
+    }
+#endif
+
     void ESMStore::countAllCellRefsAndMarkKeys(ESM::ReadersCache& readers)
     {
         // TODO: We currently need to read entire files here again.
@@ -568,53 +649,85 @@ namespace MWWorld
         std::vector<ESM::RefId> refIDs;
         const Store<ESM::Cell>& cells = get<ESM::Cell>();
 #ifdef __vita__
-        std::vector<uint32_t> refCellIdx;
-        std::vector<ESM::RefId> walkedCells;
-#endif
+        // One 16-byte Ref per placed object and each distinct id once: the
+        // per-object id copies, cell index vector and RefNum hash map this
+        // replaces came to ~70 bytes per object, ~115 MB for Tamriel Rebuilt.
+        std::unordered_map<ESM::RefId, std::size_t> refIdIndex;
+        const RefIdList ids{ refIDs, &refIdIndex };
+        std::vector<const ESM::Cell*> walkOrder;
         for (auto it = cells.intBegin(); it != cells.intEnd(); ++it)
-        {
-            readRefs(*it, refs, refIDs, keyIDs, readers);
-#ifdef __vita__
-            walkedCells.push_back(it->mId);
-            refCellIdx.resize(refs.size(), static_cast<uint32_t>(walkedCells.size() - 1));
-#endif
-        }
+            walkOrder.push_back(&*it);
         for (auto it = cells.extBegin(); it != cells.extEnd(); ++it)
+            walkOrder.push_back(&*it);
+        std::vector<ESM::RefId> walkedCells;
+        walkedCells.reserve(walkOrder.size());
+        for (const ESM::Cell* cell : walkOrder)
+            walkedCells.push_back(cell->mId);
+        // Read in file order; the sort below puts refs back in cell order.
+        vitaForEachCellContext(walkOrder, readers, [&](std::size_t cellIdx, std::size_t context, ESM::ESMReader& reader) {
+            const ESM::Cell& cell = *walkOrder[cellIdx];
+            cell.restore(reader, context);
+            const std::size_t first = refs.size();
+            readContextRefs(cell, reader, refs, ids, keyIDs);
+            for (std::size_t i = first; i < refs.size(); ++i)
+                refs[i].mCellIdx = static_cast<uint32_t>(cellIdx);
+        });
+        for (std::size_t cellIdx = 0; cellIdx < walkOrder.size(); ++cellIdx)
         {
-            readRefs(*it, refs, refIDs, keyIDs, readers);
-#ifdef __vita__
-            walkedCells.push_back(it->mId);
-            refCellIdx.resize(refs.size(), static_cast<uint32_t>(walkedCells.size() - 1));
-#endif
+            const std::size_t first = refs.size();
+            readLeasedRefs(*walkOrder[cellIdx], refs, ids, keyIDs);
+            for (std::size_t i = first; i < refs.size(); ++i)
+                refs[i].mCellIdx = static_cast<uint32_t>(cellIdx);
         }
-#ifdef __vita__
-        // Ref -> sole cell; must precede count pass.
         {
-            std::unordered_map<uint64_t, std::pair<std::size_t, uint32_t>> lastByRefNum;
-            lastByRefNum.reserve(refs.size());
-            for (std::size_t i = 0; i < refs.size(); ++i)
+            char crumb[128];
+            snprintf(crumb, sizeof(crumb), "[RefScan] %u refs, %u ids, %u cells", static_cast<unsigned>(refs.size()),
+                static_cast<unsigned>(refIDs.size()), static_cast<unsigned>(walkedCells.size()));
+            vitaMemBreadcrumb(crumb);
+        }
+        refIdIndex = {};
+#else
+        for (auto it = cells.intBegin(); it != cells.intEnd(); ++it)
+            readRefs(*it, refs, refIDs, keyIDs, readers);
+        for (auto it = cells.extBegin(); it != cells.extEnd(); ++it)
+            readRefs(*it, refs, refIDs, keyIDs, readers);
+#endif
+#ifdef __vita__
+        // Per RefNum in cell walk order, as upstream reads them; within a
+        // cell, contexts come in load order either way.
+        const auto lessByRefNum = [](const Ref& l, const Ref& r) {
+            return l.mRefNum < r.mRefNum || (l.mRefNum == r.mRefNum && l.mCellIdx < r.mCellIdx);
+        };
+#else
+        const auto lessByRefNum = [](const Ref& l, const Ref& r) { return l.mRefNum < r.mRefNum; };
+#endif
+        std::stable_sort(refs.begin(), refs.end(), lessByRefNum);
+#ifdef __vita__
+        // Ref -> sole cell. Sorted stably, each RefNum's refs are adjacent in
+        // load order and the last one is the one that stands.
+        mVitaRefCellIndex.clear();
+        for (std::size_t end = refs.size(); end > 0;)
+        {
+            const Ref& last = refs[end - 1];
+            std::size_t first = end - 1;
+            while (first > 0 && refs[first - 1].mRefNum == last.mRefNum)
+                --first;
+            if (last.mRefID != deletedRefID)
             {
-                const ESM::RefNum n = refs[i].mRefNum;
-                const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(n.mContentFile)) << 32)
-                    | n.mIndex;
-                lastByRefNum[key] = { refs[i].mRefID, refCellIdx[i] };
-            }
-            mVitaRefCellIndex.clear();
-            for (const auto& [num, v] : lastByRefNum)
-            {
-                if (v.first == deletedRefID)
-                    continue;
-                const ESM::RefId& cellId = walkedCells[v.second];
-                auto [slot, inserted] = mVitaRefCellIndex.try_emplace(refIDs[v.first], cellId);
+                const ESM::RefId& cellId = walkedCells[last.mCellIdx];
+                auto [slot, inserted] = mVitaRefCellIndex.try_emplace(refIDs[last.mRefID], cellId);
                 if (!inserted && slot->second != cellId)
                     slot->second = ESM::RefId(); // ambiguous
             }
-            std::erase_if(mVitaRefCellIndex, [](const auto& p) { return p.second.empty(); });
+            end = first;
         }
-#endif
-        const auto lessByRefNum = [](const Ref& l, const Ref& r) { return l.mRefNum < r.mRefNum; };
-        std::stable_sort(refs.begin(), refs.end(), lessByRefNum);
-        const auto equalByRefNum = [](const Ref& l, const Ref& r) { return l.mRefNum == r.mRefNum; };
+        std::erase_if(mVitaRefCellIndex, [](const auto& p) { return p.second.empty(); });
+        // Ids are shared between refs here: copy, don't move.
+        const auto incrementRefCount = [&](const Ref& value) {
+            if (value.mRefID != deletedRefID)
+                ++mRefCount[refIDs[value.mRefID]];
+        };
+#else
         const auto incrementRefCount = [&](const Ref& value) {
             if (value.mRefID != deletedRefID)
             {
@@ -622,6 +735,8 @@ namespace MWWorld
                 ++mRefCount[std::move(refId)];
             }
         };
+#endif
+        const auto equalByRefNum = [](const Ref& l, const Ref& r) { return l.mRefNum == r.mRefNum; };
         Misc::forEachUnique(refs.rbegin(), refs.rend(), equalByRefNum, incrementRefCount);
         auto& store = getWritable<ESM::Miscellaneous>().mStatic;
         for (const auto& id : keyIDs)

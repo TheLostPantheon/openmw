@@ -20,6 +20,7 @@
 #include "../vita/VitaInit.h"
 #include <components/vita/VitaDialogueText.h>
 #include <components/vita/VitaEsmPrefetch.h>
+#include <components/vita/VitaWindowFileStream.h>
 #endif
 
 namespace MWWorld
@@ -61,24 +62,43 @@ namespace MWWorld
                 // Slurp the whole file: one bulk SD read, then parse from RAM
                 // with zero syscalls. Buffers released after setUp (worldimp
                 // clears the readers cache; contexts reopen from disk later).
+                // Only for small files: the files over the prefetch budget are
+                // the large ones (two ~70 MB translation plugins), and holding
+                // them whole ran out of memory at boot. Those parse from disk.
                 {
                     stream->seekg(0, std::ios::end);
                     const std::streamoff size = stream->tellg();
                     stream->seekg(0);
-                    std::string buf;
-                    buf.resize(static_cast<size_t>(size));
-                    stream->read(buf.data(), size);
+                    constexpr std::streamoff kSlurpMaxBytes = 16 * 1024 * 1024;
+                    if (size > kSlurpMaxBytes)
                     {
                         char crumb[160];
-                        snprintf(crumb, sizeof(crumb), "[EsmLoad] slurped %s (%d MB)",
+                        snprintf(crumb, sizeof(crumb), "[EsmLoad] parsing %s (%d MB) from disk",
                             Files::pathToUnicodeString(filepath.filename()).c_str(),
                             static_cast<int>(size / (1024 * 1024)));
                         Vita::breadcrumb(crumb);
+                        if (auto windowed = Vita::openWindowFileStream(filepath))
+                            reader->open(std::move(windowed), filepath);
+                        else
+                            reader->open(filepath);
                     }
-                    if (stream->gcount() == size)
-                        reader->open(std::make_unique<Files::OwningIMemStream>(std::move(buf)), filepath);
                     else
-                        reader->open(filepath); // slurp failed; parse from disk
+                    {
+                        std::string buf;
+                        buf.resize(static_cast<size_t>(size));
+                        stream->read(buf.data(), size);
+                        {
+                            char crumb[160];
+                            snprintf(crumb, sizeof(crumb), "[EsmLoad] slurped %s (%d MB)",
+                                Files::pathToUnicodeString(filepath.filename()).c_str(),
+                                static_cast<int>(size / (1024 * 1024)));
+                            Vita::breadcrumb(crumb);
+                        }
+                        if (stream->gcount() == size)
+                            reader->open(std::make_unique<Files::OwningIMemStream>(std::move(buf)), filepath);
+                        else
+                            reader->open(filepath); // slurp failed; parse from disk
+                    }
                 }
 #else
                 reader->open(filepath);
@@ -115,6 +135,16 @@ namespace MWWorld
             }
         }
         mNameToIndex[Misc::StringUtils::lowerCase(Files::pathToUnicodeString(filepath.filename()))] = index;
+#ifdef __vita__
+        // Parsed: drop the file's in-RAM copy now rather than when loading
+        // ends. Readers needed later (first-boot reference count) reopen
+        // the file from disk.
+        if (!Vita::EsmPrefetch::keepUntilFinish())
+        {
+            mReaders.vitaClose(static_cast<std::size_t>(index));
+            Vita::EsmPrefetch::release(filepath);
+        }
+#endif
     }
 
 } /* namespace MWWorld */

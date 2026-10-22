@@ -37,10 +37,14 @@
 #include <cstdlib>
 #include <atomic>
 #include <cstring>
+#include <strings.h>
 #include <ctime>
 #include <exception>
 #include <malloc.h>
 #include <new>
+#include <set>
+#include <string>
+#include <vector>
 #include <unistd.h>
 
 // These symbols MUST be at file scope with C linkage — the Vita loader and
@@ -655,23 +659,77 @@ namespace Vita
     // Format note: changing this struct's layout invalidates old cookies
     // (size mismatch in readModsScanCookie), which forces one rescan on
     // upgrade. Clean migration, no version field needed.
+    // Fingerprints of what the scans read, not folder mtimes: exFAT leaves
+    // a folder's mtime alone when files are added inside it, so a new mod
+    // in mods/ or a plugin dropped into Data Files was never scanned unless
+    // SELECT was held.
     struct ModsScanCookie
     {
-        SceDateTime modsMtime;
-        SceDateTime dataFilesMtime;
+        uint64_t modsHash;
+        uint64_t dataFilesHash;
+        uint32_t modsEntries;
+        uint32_t dataFilesEntries;
         uint32_t bakedBsaCount;
+        uint32_t scanVersion; // kModsScanVersion: a scanner fix rescans once
         uint64_t bakedBsaTotalSize;
     };
 
     static const char* kModsScanCookiePath = "ux0:data/openmw/config/mods_scan.cookie";
+    // 1: Data Files scan skips macOS ._ files (earlier scans added
+    // content=._Morrowind.esm and the like for files copied from a Mac).
+    static constexpr uint32_t kModsScanVersion = 1;
     static const char* kBakedModsDir = "app0:resources/baked-mods";
 
-    static bool fetchDirMtime(const char* path, SceDateTime* out)
+    // Asset folders hold no plugins; listing them (thousands of textures)
+    // would cost every boot.
+    static bool isAssetDir(const char* name)
     {
-        SceIoStat s{};
-        if (sceIoGetstat(path, &s) < 0)
+        static const char* const kAssetDirs[] = { "meshes", "textures", "icons", "sound", "music", "bookart",
+            "splash", "fonts", "video", "shaders", "distantland", "mwse", "fomod", "docs", "images", "screenshots" };
+        for (const char* asset : kAssetDirs)
+            if (strcasecmp(name, asset) == 0)
+                return true;
+        return false;
+    }
+
+    // Order-independent hash of a folder's entries (name, and size + mtime
+    // for files), `levels` deep. Returns false when the folder can't be opened.
+    static bool fingerprintDir(const char* path, int levels, uint64_t* hash, uint32_t* entries)
+    {
+        SceUID dd = sceIoDopen(path);
+        if (dd < 0)
             return false;
-        *out = s.st_mtime;
+        SceIoDirent ent{};
+        while (sceIoDread(dd, &ent) > 0)
+        {
+            if (ent.d_name[0] != '.')
+            {
+                uint64_t h = 1469598103934665603ULL; // FNV-1a
+                const auto mix = [&h](const void* data, size_t len) {
+                    const unsigned char* bytes = static_cast<const unsigned char*>(data);
+                    for (size_t i = 0; i < len; ++i)
+                        h = (h ^ bytes[i]) * 1099511628211ULL;
+                };
+                mix(path, strlen(path));
+                mix(ent.d_name, strlen(ent.d_name));
+                const bool dir = SCE_S_ISDIR(ent.d_stat.st_mode);
+                if (!dir)
+                {
+                    mix(&ent.d_stat.st_size, sizeof(ent.d_stat.st_size));
+                    mix(&ent.d_stat.st_mtime, sizeof(ent.d_stat.st_mtime));
+                }
+                *hash += h;
+                *entries += 1;
+                if (dir && levels > 1 && !isAssetDir(ent.d_name))
+                {
+                    char sub[1024];
+                    snprintf(sub, sizeof(sub), "%s/%s", path, ent.d_name);
+                    fingerprintDir(sub, levels - 1, hash, entries);
+                }
+            }
+            memset(&ent, 0, sizeof(ent));
+        }
+        sceIoDclose(dd);
         return true;
     }
 
@@ -713,12 +771,24 @@ namespace Vita
         return n == (int)sizeof(*out);
     }
 
+    // Data Files: the content scan reads its top level only. mods/: mod
+    // folders down to <mod>/<option>/Data Files (autoDetectModDataDirs).
+    static bool fetchModsFingerprint(ModsScanCookie* out)
+    {
+        fingerprintDir("ux0:data/openmw/mods", 4, &out->modsHash, &out->modsEntries);
+        if (!fingerprintDir("ux0:data/openmw/Data Files", 1, &out->dataFilesHash, &out->dataFilesEntries))
+            return false;
+        uint32_t bakedCount = 0;
+        fetchBakedFingerprint(&bakedCount, &out->bakedBsaTotalSize);
+        out->bakedBsaCount = bakedCount;
+        out->scanVersion = kModsScanVersion;
+        return true;
+    }
+
     static void writeModsScanCookie()
     {
         ModsScanCookie cookie{};
-        fetchDirMtime("ux0:data/openmw/mods", &cookie.modsMtime);
-        fetchDirMtime("ux0:data/openmw/Data Files", &cookie.dataFilesMtime);
-        fetchBakedFingerprint(&cookie.bakedBsaCount, &cookie.bakedBsaTotalSize);
+        fetchModsFingerprint(&cookie);
         SceUID fd = sceIoOpen(kModsScanCookiePath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
         if (fd >= 0)
         {
@@ -730,11 +800,8 @@ namespace Vita
     static bool modsScanCookieMatchesCurrent()
     {
         ModsScanCookie current{};
-        if (!fetchDirMtime("ux0:data/openmw/mods", &current.modsMtime))
+        if (!fetchModsFingerprint(&current))
             return false;
-        if (!fetchDirMtime("ux0:data/openmw/Data Files", &current.dataFilesMtime))
-            return false;
-        fetchBakedFingerprint(&current.bakedBsaCount, &current.bakedBsaTotalSize);
         ModsScanCookie saved{};
         if (!readModsScanCookie(&saved))
             return false;
@@ -817,6 +884,14 @@ namespace Vita
             memset(&dirent, 0, sizeof(dirent));
             while (sceIoDread(dfd, &dirent) > 0 && foundCount < MAX_FILES)
             {
+                // Dot files: copying from a Mac leaves a ._<name> metadata
+                // file beside every file (._Morrowind.esm), which loaded as
+                // a plugin and failed.
+                if (dirent.d_name[0] == '.')
+                {
+                    memset(&dirent, 0, sizeof(dirent));
+                    continue;
+                }
                 int type = -1;
                 if (hasExtension(dirent.d_name, ".esm")) type = 0;
                 else if (hasExtension(dirent.d_name, ".esp")) type = 1;
@@ -929,6 +1004,39 @@ namespace Vita
             sceIoDclose(dd);
         }
         return false;
+    }
+
+    // A mod folder, or one of its option folders, whose data lives in a
+    // "Data Files" subfolder (Tamriel Rebuilt: 00 Core/Data Files/...).
+    // Writes the data root to `out`; false when there is none.
+    static bool resolveModDataRoot(const char* dir, char* out, size_t outSize)
+    {
+        if (isDataRoot(dir))
+        {
+            snprintf(out, outSize, "%s", dir);
+            return true;
+        }
+        SceUID dd = sceIoDopen(dir);
+        if (dd < 0)
+            return false;
+        bool found = false;
+        SceIoDirent ent{};
+        while (!found && sceIoDread(dd, &ent) > 0)
+        {
+            if (SCE_S_ISDIR(ent.d_stat.st_mode) && strcasecmp(ent.d_name, "Data Files") == 0)
+            {
+                char child[1024];
+                snprintf(child, sizeof(child), "%s/%s", dir, ent.d_name);
+                if (isDataRoot(child))
+                {
+                    snprintf(out, outSize, "%s", child);
+                    found = true;
+                }
+            }
+            memset(&ent, 0, sizeof(ent));
+        }
+        sceIoDclose(dd);
+        return found;
     }
 
     static bool isSkippableModSubdir(const char* name)
@@ -1084,11 +1192,13 @@ namespace Vita
             char modPath[1024];
             snprintf(modPath, sizeof(modPath), "%s/%s", modsDir, modEnt.d_name);
 
-            // Flat-layout: mods/Foo/Meshes
-            if (isDataRoot(modPath))
+            // Flat-layout: mods/Foo/Meshes or mods/Foo/Data Files/Meshes
+            char modRoot[1024];
+            const bool modHasRoot = resolveModDataRoot(modPath, modRoot, sizeof(modRoot));
+            if (modHasRoot)
             {
-                tryAdd(modPath);
-                scanPluginsIn(modPath);
+                tryAdd(modRoot);
+                scanPluginsIn(modRoot);
             }
 
             // FOMOD-layout: mods/Foo/00 Core/Meshes
@@ -1106,10 +1216,15 @@ namespace Vita
                     continue;
                 char subPath[1024];
                 snprintf(subPath, sizeof(subPath), "%s/%s", modPath, subEnt.d_name);
-                if (isDataRoot(subPath))
+                // FOMOD-layout, or an option folder with its own Data Files
+                // (Tamriel Rebuilt: 00 Core/Data Files). Skip the root the
+                // flat check already took.
+                char subRoot[1024];
+                if (resolveModDataRoot(subPath, subRoot, sizeof(subRoot))
+                    && !(modHasRoot && strcmp(subRoot, modRoot) == 0))
                 {
-                    tryAdd(subPath);
-                    scanPluginsIn(subPath);
+                    tryAdd(subRoot);
+                    scanPluginsIn(subRoot);
                 }
             }
             sceIoDclose(sub);
@@ -1117,6 +1232,336 @@ namespace Vita
         sceIoDclose(dfd);
         sceIoClose(fd);
         free(cfgBuf);
+    }
+
+    // The masters a plugin's TES3 header lists (MAST subrecords). Empty for
+    // files that are not TES3 plugins (.omwscripts) or can't be read.
+    static std::vector<std::string> readPluginMasters(const std::string& path)
+    {
+        std::vector<std::string> masters;
+        SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
+        if (fd < 0)
+            return masters;
+        unsigned char header[16];
+        if (sceIoRead(fd, header, sizeof(header)) == (int)sizeof(header) && memcmp(header, "TES3", 4) == 0)
+        {
+            uint32_t size = 0;
+            memcpy(&size, header + 4, sizeof(size));
+            if (size > 0 && size < (1u << 20))
+            {
+                std::vector<char> record(size);
+                if (sceIoRead(fd, record.data(), size) == (int)size)
+                {
+                    for (size_t p = 0; p + 8 <= size;)
+                    {
+                        uint32_t subSize = 0;
+                        memcpy(&subSize, &record[p + 4], sizeof(subSize));
+                        if (p + 8 + subSize > size)
+                            break;
+                        if (memcmp(&record[p], "MAST", 4) == 0)
+                            masters.emplace_back(&record[p + 8], strnlen(&record[p + 8], subSize));
+                        p += 8 + subSize;
+                    }
+                }
+            }
+        }
+        sceIoClose(fd);
+        return masters;
+    }
+
+    // Each data folder's loose-file list is cached (vfs_dir_N.bin) and
+    // checked against the folder's path only, so a mod updated in place kept
+    // its old list and the new meshes and textures were missing. A rescan
+    // means mods/ changed: drop the mod folders' caches. Data Files' caches
+    // (seeded from the VPK, slow to rebuild) stay.
+    static void removeModVfsCaches()
+    {
+        static const char* configDir = "ux0:data/openmw/config";
+        static const char kModsPrefix[] = "ux0:data/openmw/mods/";
+        std::vector<std::string> stale;
+        SceUID dd = sceIoDopen(configDir);
+        if (dd < 0)
+            return;
+        SceIoDirent ent{};
+        while (sceIoDread(dd, &ent) > 0)
+        {
+            if (strncmp(ent.d_name, "vfs_dir_", 8) == 0 && hasExtension(ent.d_name, ".bin"))
+            {
+                const std::string path = std::string(configDir) + "/" + ent.d_name;
+                char header[12 + sizeof(kModsPrefix) - 1]; // magic, schema, path length, path
+                SceUID fd = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
+                if (fd >= 0)
+                {
+                    if (sceIoRead(fd, header, sizeof(header)) == (int)sizeof(header)
+                        && memcmp(header, "VFSC", 4) == 0
+                        && memcmp(header + 12, kModsPrefix, sizeof(kModsPrefix) - 1) == 0)
+                        stale.push_back(path);
+                    sceIoClose(fd);
+                }
+            }
+            memset(&ent, 0, sizeof(ent));
+        }
+        sceIoDclose(dd);
+        for (const std::string& path : stale)
+            sceIoRemove(path.c_str());
+        if (!stale.empty())
+        {
+            char crumb[96];
+            snprintf(crumb, sizeof(crumb), "Mod scan: dropped %d mod folder file caches", (int)stale.size());
+            breadcrumb(crumb);
+        }
+    }
+
+    // Earliest-first topological order of n items: each comes after the
+    // items it needs, otherwise as listed. A cycle keeps the rest as listed.
+    template <class Needs>
+    static std::vector<size_t> dependencyOrder(size_t n, Needs needs)
+    {
+        std::vector<bool> emitted(n, false);
+        std::vector<size_t> order;
+        while (order.size() < n)
+        {
+            bool progressed = false;
+            for (size_t k = 0; k < n && !progressed; ++k)
+            {
+                if (emitted[k])
+                    continue;
+                bool ready = true;
+                for (size_t j = 0; j < n && ready; ++j)
+                    if (!emitted[j] && j != k && needs(k, j))
+                        ready = false;
+                if (ready)
+                {
+                    emitted[k] = true;
+                    order.push_back(k);
+                    progressed = true;
+                }
+            }
+            if (!progressed)
+                for (size_t k = 0; k < n; ++k)
+                    if (!emitted[k])
+                    {
+                        emitted[k] = true;
+                        order.push_back(k);
+                    }
+        }
+        return order;
+    }
+
+    // Auto-detected mods are added in folder order and their plugins ESMs
+    // first, then alphabetically, with no regard for masters: Tamriel
+    // Rebuilt's TR_Mainland.esm could land ahead of its master
+    // Tamriel_Data.esm and the engine refuses to load, and TR's newer copies
+    // of Tamriel_Data's scripts only win when TR's folder comes later.
+    // Reorders the auto-detected content= lines so every plugin comes after
+    // the auto-detected plugins it depends on, and the auto-detected data=
+    // lines the same way by the plugins they hold, keeping the existing
+    // order otherwise; leaves out plugins whose masters aren't loaded.
+    // User-written lines above the marker stay put.
+    static void sortAutoContentByMasters()
+    {
+        static const char* cfgPath = "ux0:data/openmw/config/openmw.cfg";
+        char* buf = nullptr;
+        const int size = readFileToBuffer(cfgPath, &buf);
+        if (!buf || size <= 0)
+        {
+            free(buf);
+            return;
+        }
+        std::vector<std::string> lines;
+        for (const char* p = buf; *p;)
+        {
+            const char* nl = strchr(p, '\n');
+            lines.emplace_back(p, nl ? nl - p : strlen(p));
+            if (!nl)
+                break;
+            p = nl + 1;
+        }
+        const bool trailingNewline = buf[size - 1] == '\n';
+        free(buf);
+
+        const auto valueOf = [](const std::string& line, size_t keyLen) {
+            std::string v = line.substr(keyLen);
+            while (!v.empty() && (v.back() == '\r' || v.back() == ' '))
+                v.pop_back();
+            if (v.size() >= 2 && v.front() == '"' && v.back() == '"')
+                v = v.substr(1, v.size() - 2);
+            return v;
+        };
+        const auto lower = [](std::string s) {
+            for (char& c : s)
+                c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            return s;
+        };
+
+        size_t marker = lines.size();
+        std::vector<std::string> dataDirs{ "ux0:data/openmw/Data Files" };
+        std::vector<int> dataSlotOf{ -1 }; // per dataDirs entry: index into dataSlots, or -1
+        std::vector<size_t> dataSlots; // line indices of auto-detected data=
+        for (size_t i = 0; i < lines.size(); ++i)
+        {
+            if (marker == lines.size() && lines[i].rfind("# Auto-detected", 0) == 0)
+                marker = i;
+            if (lines[i].rfind("data=", 0) == 0)
+            {
+                const std::string dir = valueOf(lines[i], 5);
+                if (!dir.empty() && dir[0] != '?')
+                {
+                    dataDirs.push_back(dir);
+                    dataSlotOf.push_back(i > marker ? static_cast<int>(dataSlots.size()) : -1);
+                    if (i > marker)
+                        dataSlots.push_back(i);
+                }
+            }
+        }
+        std::vector<size_t> slots; // line indices of auto-detected content=
+        std::vector<std::string> names;
+        for (size_t i = marker; i < lines.size(); ++i)
+            if (lines[i].rfind("content=", 0) == 0)
+            {
+                slots.push_back(i);
+                names.push_back(lower(valueOf(lines[i], 8)));
+            }
+        if (slots.empty())
+            return;
+
+        std::vector<std::vector<std::string>> masters(slots.size());
+        std::vector<int> home(slots.size(), -1); // data slot holding each plugin
+        for (size_t k = 0; k < slots.size(); ++k)
+        {
+            const std::string file = valueOf(lines[slots[k]], 8);
+            for (size_t d = dataDirs.size(); d-- > 0;)
+            {
+                const std::string path = dataDirs[d] + "/" + file;
+                SceIoStat st;
+                if (sceIoGetstat(path.c_str(), &st) < 0)
+                    continue;
+                for (const std::string& m : readPluginMasters(path))
+                    masters[k].push_back(lower(m));
+                home[k] = dataSlotOf[d];
+                break;
+            }
+        }
+        // A plugin whose master isn't loaded stops the game at boot ("asks for
+        // parent file ... not available"), e.g. Tamriel Rebuilt copied
+        // without Tamriel_Data. Leave such plugins out, commented with the
+        // reason; the next rescan (adding the master is one) reconsiders them.
+        std::set<std::string> loaded;
+        for (const std::string& line : lines)
+            if (line.rfind("content=", 0) == 0)
+                loaded.insert(lower(valueOf(line, 8)));
+        int disabled = 0;
+        std::vector<bool> leftOut(slots.size(), false);
+        std::vector<std::string> files(slots.size());
+        for (size_t k = 0; k < slots.size(); ++k)
+            files[k] = valueOf(lines[slots[k]], 8);
+        for (bool changed = true; changed;)
+        {
+            changed = false;
+            for (size_t k = 0; k < slots.size(); ++k)
+            {
+                if (lines[slots[k]].rfind("content=", 0) != 0)
+                    continue;
+                for (const std::string& m : masters[k])
+                {
+                    if (loaded.count(m))
+                        continue;
+                    lines[slots[k]] = "# " + lines[slots[k]] + " (not loaded: master " + m + " missing)";
+                    leftOut[k] = true;
+                    loaded.erase(names[k]);
+                    ++disabled;
+                    changed = true;
+                    char crumb[300];
+                    snprintf(crumb, sizeof(crumb), "Mod scan: left out %s, its master %s is missing",
+                        files[k].c_str(), m.c_str());
+                    breadcrumb(crumb);
+                    break;
+                }
+            }
+        }
+
+        // A left-out plugin's scripts expect its records: TR's
+        // strongholds.lua failed every frame without TR_Mainland.esm.
+        for (size_t k = 0; k < slots.size(); ++k)
+        {
+            if (leftOut[k] || home[k] < 0 || names[k].size() < 11
+                || names[k].compare(names[k].size() - 11, 11, ".omwscripts") != 0)
+                continue;
+            for (size_t j = 0; j < slots.size(); ++j)
+            {
+                if (!leftOut[j] || home[j] != home[k])
+                    continue;
+                lines[slots[k]] = "# " + lines[slots[k]] + " (not loaded: " + files[j] + " is left out)";
+                leftOut[k] = true;
+                ++disabled;
+                char crumb[300];
+                snprintf(crumb, sizeof(crumb), "Mod scan: left out %s with %s", files[k].c_str(), files[j].c_str());
+                breadcrumb(crumb);
+                break;
+            }
+        }
+
+        const auto needsPlugin = [&](size_t k, size_t j) {
+            return std::find(masters[k].begin(), masters[k].end(), names[j]) != masters[k].end();
+        };
+        // Data slot a needs data slot b when a plugin in a has its master in b.
+        std::vector<std::vector<bool>> dataNeeds(dataSlots.size(), std::vector<bool>(dataSlots.size(), false));
+        for (size_t k = 0; k < slots.size(); ++k)
+            for (size_t j = 0; j < slots.size(); ++j)
+                if (home[k] >= 0 && home[j] >= 0 && home[k] != home[j] && needsPlugin(k, j))
+                    dataNeeds[home[k]][home[j]] = true;
+
+        const std::vector<size_t> dataOrder
+            = dependencyOrder(dataSlots.size(), [&](size_t a, size_t b) { return dataNeeds[a][b]; });
+        // Plugins follow their mod's folder, so a mod's files stay together
+        // (TR's .omwscripts, with no masters, otherwise sorted ahead of
+        // Tamriel_Data.esm); then each after the plugins it depends on.
+        std::vector<size_t> dataRank(dataSlots.size());
+        for (size_t k = 0; k < dataOrder.size(); ++k)
+            dataRank[dataOrder[k]] = k;
+        std::vector<size_t> grouped(slots.size());
+        for (size_t k = 0; k < slots.size(); ++k)
+            grouped[k] = k;
+        std::stable_sort(grouped.begin(), grouped.end(), [&](size_t l, size_t r) {
+            const long lr = home[l] < 0 ? -1 : static_cast<long>(dataRank[home[l]]);
+            const long rr = home[r] < 0 ? -1 : static_cast<long>(dataRank[home[r]]);
+            return lr < rr;
+        });
+        std::vector<size_t> order = dependencyOrder(
+            slots.size(), [&](size_t k, size_t j) { return needsPlugin(grouped[k], grouped[j]); });
+        for (size_t& k : order)
+            k = grouped[k];
+        int moved = 0;
+        for (size_t k = 0; k < order.size(); ++k)
+            moved += order[k] != k;
+        int dataMoved = 0;
+        for (size_t k = 0; k < dataOrder.size(); ++k)
+            dataMoved += dataOrder[k] != k;
+        if (moved == 0 && dataMoved == 0 && disabled == 0)
+            return;
+
+        std::vector<std::string> sorted = lines;
+        for (size_t k = 0; k < slots.size(); ++k)
+            sorted[slots[k]] = lines[slots[order[k]]];
+        for (size_t k = 0; k < dataSlots.size(); ++k)
+            sorted[dataSlots[k]] = lines[dataSlots[dataOrder[k]]];
+        std::string out;
+        for (size_t i = 0; i < sorted.size(); ++i)
+        {
+            out += sorted[i];
+            if (i + 1 < sorted.size() || trailingNewline)
+                out += '\n';
+        }
+        SceUID fd = sceIoOpen(cfgPath, SCE_O_WRONLY | SCE_O_TRUNC | SCE_O_CREAT, 0666);
+        if (fd >= 0)
+        {
+            sceIoWrite(fd, out.data(), out.size());
+            sceIoClose(fd);
+        }
+        char crumb[128];
+        snprintf(crumb, sizeof(crumb), "Mod scan: moved %d plugins and %d data folders after their masters", moved,
+            dataMoved);
+        breadcrumb(crumb);
     }
 
     // Scans app0:/resources/baked-mods/ for .bsa files (sorted alphabetically
@@ -1333,8 +1778,15 @@ namespace Vita
             // Wipe stale auto-added entries first so deleted mods don't leave
             // dangling content= / data= lines that crash the engine on load.
             pruneAutoDetectedSections();
+            // The content-file scan cache is checked against the data folder
+            // list only: a plugin added to an existing folder stayed missing
+            // ("content file does not exist"), and the engine loads it before
+            // it knows SELECT is held. A rescan means the folders changed.
+            sceIoRemove("ux0:data/openmw/config/scan_cache.bin");
+            removeModVfsCaches();
             autoDetectContent();
             autoDetectModDataDirs();
+            sortAutoContentByMasters();
             // Must run AFTER the two above so the baked-mod fallback-archive
             // lines append AFTER vanilla Morrowind.bsa et al — OpenMW's
             // last-BSA-wins precedence then puts the optimization mods on top.

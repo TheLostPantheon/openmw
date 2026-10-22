@@ -63,6 +63,12 @@ namespace ESM
 
         void clear();
 
+#ifdef __vita__
+        /// Close the free reader for \a index now, releasing its stream (the
+        /// in-RAM content file buffer at boot); the next get() reopens it.
+        void vitaClose(std::size_t index);
+#endif
+
     private:
         const std::size_t mCapacity;
 #ifdef __vita__

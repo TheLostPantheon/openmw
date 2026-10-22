@@ -27,6 +27,9 @@ namespace Files
                     continue;
 
                 const auto filename = Files::pathToUnicodeString(path.filename());
+                // macOS ._<name> metadata beside each file copied from a Mac.
+                if (filename.starts_with("._"))
+                    continue;
 
                 TIter result = mFiles.find(filename);
 

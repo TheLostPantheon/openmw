@@ -29,6 +29,7 @@ if (GIT_CHECKOUT)
             -DOPENMW_LUA_API_REVISION=${OPENMW_LUA_API_REVISION}
             -DOPENMW_POSTPROCESSING_API_REVISION=${OPENMW_POSTPROCESSING_API_REVISION}
             -DOPENMW_VERSION=${OPENMW_VERSION}
+            -DOPENMW_VITA_VERSION=${OPENMW_VITA_VERSION}
             -DOPENMW_DOC_BASEURL=${OPENMW_DOC_BASEURL}
             -DMACROSFILE=${CMAKE_SOURCE_DIR}/cmake/OpenMWMacros.cmake
             "-DCMAKE_CONFIGURATION_TYPES=${CMAKE_CONFIGURATION_TYPES}"
@@ -411,6 +412,7 @@ if(VITA)
         CellCullCallback
         VitaDialogueText
         VitaEsmPrefetch
+        VitaWindowFileStream
     )
 endif()
 

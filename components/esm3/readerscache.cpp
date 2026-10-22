@@ -144,6 +144,25 @@ namespace ESM
         }
     }
 
+#ifdef __vita__
+    void ReadersCache::vitaClose(std::size_t index)
+    {
+        const std::lock_guard<std::recursive_mutex> lock(mVitaMutex);
+        const auto indexIt = mIndex.find(index);
+        if (indexIt == mIndex.end() || indexIt->second->mState != State::Free)
+            return;
+        const auto it = indexIt->second;
+        if (it->mReader.isOpen())
+        {
+            it->mName = it->mReader.getName();
+            it->mFileSize = it->mReader.getFileSize();
+            it->mReader.close();
+        }
+        mClosedItems.splice(mClosedItems.end(), mFreeItems, it);
+        it->mState = State::Closed;
+    }
+#endif
+
     void ReadersCache::clear()
     {
 #ifdef __vita__

@@ -14,6 +14,10 @@ namespace VFS
     {
     public:
         FileSystemArchiveFile(const std::filesystem::path& path);
+        explicit FileSystemArchiveFile(std::string&& path)
+            : mPath(std::move(path))
+        {
+        }
 
         Files::IStreamPtr open() override;
 
@@ -21,10 +25,14 @@ namespace VFS
 
         std::string getStem() const override;
 
-        const std::filesystem::path& getPath() const { return mPath; }
+        const std::string& getPath() const { return mPath; }
 
     private:
-        std::filesystem::path mPath;
+        // UTF-8, not std::filesystem::path: libstdc++ keeps a path's components
+        // as separate heap entries (~300 bytes for a mod's
+        // data/openmw/mods/<mod>/Data Files/meshes/x/y.nif), once per loose
+        // file. Tamriel_Data alone has 54k.
+        std::string mPath;
     };
 
     class FileSystemArchive : public Archive
@@ -45,6 +53,9 @@ namespace VFS
         bool loadCache(const std::filesystem::path& cacheFile);
         void saveCache(const std::filesystem::path& cacheFile) const;
         void walkDirectory();
+#ifdef __vita__
+        bool walkDirectoryVita();
+#endif
 
         std::map<VFS::Path::Normalized, FileSystemArchiveFile, std::less<>> mIndex;
         std::filesystem::path mPath;

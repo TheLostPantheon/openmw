@@ -10,6 +10,7 @@
 #include <components/debug/debuglog.hpp>
 #include <components/esm/defs.hpp>
 #include <components/esm3/esmreader.hpp>
+#include <components/files/conversion.hpp>
 #include <components/misc/strings/algorithm.hpp>
 #include <components/misc/utf8stream.hpp>
 
@@ -106,6 +107,9 @@ MWState::Character::Character(const std::filesystem::path& saves, const std::str
     {
         for (const auto& iter : std::filesystem::directory_iterator(mPath))
         {
+            // macOS ._<name> metadata beside each save copied from a Mac.
+            if (Files::pathToUnicodeString(iter.path().filename()).starts_with("._"))
+                continue;
             try
             {
                 addSlot(iter, game);
