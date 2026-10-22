@@ -1,6 +1,7 @@
 #include "bindingsmanager.hpp"
 
 #include <filesystem>
+#include <fstream>
 
 #include <MyGUI_EditBox.h>
 
@@ -183,13 +184,21 @@ namespace MWInput
         loadKeyDefaults();
         loadControllerDefaults();
 #ifdef __vita__
-        // Migrate saved bindings from the pre-touch-zone layout.
-        if (mInputBinder->getChannel(A_Rest)->getControlsCount() != 0)
+        // Migrate saved bindings from the pre-touch-zone layout (Rest on
+        // D-pad up), once: checked on every start, it reset all controller
+        // bindings for anyone who bound Rest to D-pad up themselves.
+        const auto migrated = mUserFile.parent_path() / "input-touchzone-migrated.txt";
+        std::error_code markerError;
+        if (!std::filesystem::exists(migrated, markerError))
         {
-            ICS::Control* rest = mInputBinder->getChannel(A_Rest)->getAttachedControls().front().control;
-            if (mInputBinder->getJoystickButtonBinding(rest, sFakeDeviceId, ICS::Control::INCREASE)
-                == SDL_CONTROLLER_BUTTON_DPAD_UP)
-                loadControllerDefaults(true);
+            if (mInputBinder->getChannel(A_Rest)->getControlsCount() != 0)
+            {
+                ICS::Control* rest = mInputBinder->getChannel(A_Rest)->getAttachedControls().front().control;
+                if (mInputBinder->getJoystickButtonBinding(rest, sFakeDeviceId, ICS::Control::INCREASE)
+                    == SDL_CONTROLLER_BUTTON_DPAD_UP)
+                    loadControllerDefaults(true);
+            }
+            std::ofstream(migrated) << "1\n";
         }
 #endif
 
@@ -772,6 +781,14 @@ namespace MWInput
             newFileName = Files::pathToUnicodeString(mUserFile) + ".new";
             if (mInputBinder->save(newFileName))
             {
+#ifdef __vita__
+                // The Vita's rename does not replace an existing file: only the
+                // first save ever landed and later control changes were lost
+                // on every restart. The engine recovers a .new left behind if
+                // the game dies between these two steps.
+                std::error_code removeError;
+                std::filesystem::remove(mUserFile, removeError);
+#endif
                 std::filesystem::rename(Files::pathFromUnicodeString(newFileName), mUserFile);
                 Log(Debug::Info) << "Saved input bindings: " << mUserFile;
             }

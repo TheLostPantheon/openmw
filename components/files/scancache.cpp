@@ -155,6 +155,10 @@ namespace Files
             }
         }
 
+#ifdef __vita__
+        // No replacing rename on the Vita: a stale cache was never updated.
+        std::filesystem::remove(cachePath, ec);
+#endif
         std::filesystem::rename(tmp, cachePath, ec);
         if (ec)
         {

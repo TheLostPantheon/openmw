@@ -1637,6 +1637,17 @@ void OMW::Engine::prepareEngine()
     // showing a loading screen and keeping the window responsive while doing so
 
     const auto keybinderUser = mCfgMgr.getUserConfigPath() / "input_v3.xml";
+#ifdef __vita__
+    {
+        // BindingsManager::saveBindings removes the old file before renaming
+        // the new one into place (no replacing rename on the Vita); a .new
+        // left alone by a crash between the two is the latest bindings.
+        const auto pending = mCfgMgr.getUserConfigPath() / "input_v3.xml.new";
+        std::error_code ec;
+        if (!std::filesystem::exists(keybinderUser, ec) && std::filesystem::exists(pending, ec))
+            std::filesystem::rename(pending, keybinderUser, ec);
+    }
+#endif
     bool keybinderUserExists = std::filesystem::exists(keybinderUser);
     if (!keybinderUserExists)
     {
