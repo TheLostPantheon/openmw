@@ -669,11 +669,14 @@ namespace Vita
         uint32_t modsEntries;
         uint32_t dataFilesEntries;
         uint32_t bakedBsaCount;
-        uint32_t pad;
+        uint32_t scanVersion; // kModsScanVersion: a scanner fix rescans once
         uint64_t bakedBsaTotalSize;
     };
 
     static const char* kModsScanCookiePath = "ux0:data/openmw/config/mods_scan.cookie";
+    // 1: Data Files scan skips macOS ._ files (earlier scans added
+    // content=._Morrowind.esm and the like for files copied from a Mac).
+    static constexpr uint32_t kModsScanVersion = 1;
     static const char* kBakedModsDir = "app0:resources/baked-mods";
 
     // Asset folders hold no plugins; listing them (thousands of textures)
@@ -777,6 +780,7 @@ namespace Vita
         uint32_t bakedCount = 0;
         fetchBakedFingerprint(&bakedCount, &out->bakedBsaTotalSize);
         out->bakedBsaCount = bakedCount;
+        out->scanVersion = kModsScanVersion;
         return true;
     }
 
@@ -879,6 +883,14 @@ namespace Vita
             memset(&dirent, 0, sizeof(dirent));
             while (sceIoDread(dfd, &dirent) > 0 && foundCount < MAX_FILES)
             {
+                // Dot files: copying from a Mac leaves a ._<name> metadata
+                // file beside every file (._Morrowind.esm), which loaded as
+                // a plugin and failed.
+                if (dirent.d_name[0] == '.')
+                {
+                    memset(&dirent, 0, sizeof(dirent));
+                    continue;
+                }
                 int type = -1;
                 if (hasExtension(dirent.d_name, ".esm")) type = 0;
                 else if (hasExtension(dirent.d_name, ".esp")) type = 1;
