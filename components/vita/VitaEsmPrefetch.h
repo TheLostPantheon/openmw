@@ -19,6 +19,22 @@ namespace Vita::EsmPrefetch
     /// Null if the file is not prefetched (caller falls back to disk).
     std::unique_ptr<std::istream> takeStream(const std::filesystem::path& path);
 
+    /// Free the buffer of \a path once it is parsed and its stream closed:
+    /// holding every buffer until loading ended left no room to parse a
+    /// large plugin after them (Tamriel Rebuilt: ~88 MB of records).
+    /// No-op while keepUntilFinish().
+    void release(const std::filesystem::path& path);
+
+    /// Ask to keep every buffer (and the readers over them) until finish():
+    /// a first boot re-reads every cell after parsing (reference count,
+    /// intervention markers), 10 s from RAM against 22 s from the card for
+    /// vanilla.
+    void setKeepUntilFinish(bool keep);
+
+    /// The request above, honoured only if every content file was prefetched
+    /// (none over the budget): otherwise the buffers go as files are parsed.
+    bool keepUntilFinish();
+
     /// Join the reader thread. Cheap once parsing has consumed everything.
     void finish();
 }

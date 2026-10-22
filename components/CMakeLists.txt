@@ -412,6 +412,7 @@ if(VITA)
         CellCullCallback
         VitaDialogueText
         VitaEsmPrefetch
+        VitaWindowFileStream
     )
 endif()
 

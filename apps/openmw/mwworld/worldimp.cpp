@@ -323,6 +323,17 @@ namespace MWWorld
             return h;
         }
 
+        // The cache at \a path is for this content (it will load).
+        bool cacheKeyMatches(const std::filesystem::path& path, uint32_t magic, uint64_t key)
+        {
+            std::ifstream in(path, std::ios::binary);
+            uint32_t fileMagic = 0;
+            uint64_t fileKey = 0;
+            in.read(reinterpret_cast<char*>(&fileMagic), sizeof(fileMagic));
+            in.read(reinterpret_cast<char*>(&fileKey), sizeof(fileKey));
+            return in && fileMagic == magic && fileKey == key;
+        }
+
         bool tryLoadRefCache(const std::filesystem::path& path, uint64_t key, MWWorld::ESMStore& store)
         {
             std::ifstream in(path, std::ios::binary);
@@ -494,24 +505,23 @@ namespace MWWorld
                 return id == kMarkerIds[0] || id == kMarkerIds[1] || id == kMarkerIds[2];
             };
             const MWWorld::Store<ESM::Cell>& cells = store.get<ESM::Cell>();
+            std::vector<const ESM::Cell*> exteriors;
             for (auto it = cells.extBegin(); it != cells.extEnd(); ++it)
-            {
-                const ESM::Cell& cell = *it;
-                if (cell.mContextList.empty())
-                    continue;
-                for (size_t i = 0; i < cell.mContextList.size(); i++)
-                {
+                exteriors.push_back(&*it);
+            // File order (see vitaForEachCellContext). The table is a set of
+            // positions per marker; the order they are found in doesn't matter.
+            MWWorld::vitaForEachCellContext(
+                exteriors, readers, [&](std::size_t cellIdx, std::size_t context, ESM::ESMReader& reader) {
                     try
                     {
-                        const std::size_t index = static_cast<std::size_t>(cell.mContextList[i].index);
-                        const ESM::ReadersCache::BusyItem reader = readers.get(index);
-                        cell.restore(*reader, i);
+                        const ESM::Cell& cell = *exteriors[cellIdx];
+                        cell.restore(reader, context);
                         ESM::CellRef ref;
                         ESM::MovedCellRef cMRef;
                         bool deleted = false;
                         bool moved = false;
                         while (ESM::Cell::getNextRef(
-                            *reader, ref, deleted, cMRef, moved, ESM::Cell::GetNextRefMode::LoadOnlyNotMoved))
+                            reader, ref, deleted, cMRef, moved, ESM::Cell::GetNextRefMode::LoadOnlyNotMoved))
                         {
                             if (deleted || moved)
                                 continue;
@@ -522,11 +532,11 @@ namespace MWWorld
                     catch (const std::exception&)
                     {
                     }
-                }
-                for (const auto& [lref, ldeleted] : cell.mLeasedRefs)
+                });
+            for (const ESM::Cell* cell : exteriors)
+                for (const auto& [lref, ldeleted] : cell->mLeasedRefs)
                     if (!ldeleted && isMarker(lref.mRefID))
                         out[lref.mRefID].push_back(lref.mPos.asVec3());
-            }
         }
     }
 #endif
@@ -538,6 +548,14 @@ namespace MWWorld
         mESMVersions.resize(mContentFiles.size(), -1);
 
 #ifdef __vita__
+        {
+            // Without both caches this boot re-reads every cell after parsing:
+            // keep the in-RAM copies for that when they all fit.
+            const std::filesystem::path config = mUserDataPath / "config";
+            const uint64_t key = refCacheKey(fileCollections, contentFiles);
+            Vita::EsmPrefetch::setKeepUntilFinish(!cacheKeyMatches(config / "refcount_cache.bin", kRefCacheMagic, key)
+                || !cacheKeyMatches(config / "marker_cache.bin", kMarkerCacheMagic, key));
+        }
         vitaMemBreadcrumb("[VitaAudit] before ESM content load");
 #endif
         loadContentFiles(fileCollections, contentFiles, encoder, listener);

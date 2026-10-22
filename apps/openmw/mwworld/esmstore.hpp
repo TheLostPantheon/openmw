@@ -2,6 +2,7 @@
 #define OPENMW_MWWORLD_ESMSTORE_H
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <tuple>
@@ -26,6 +27,7 @@ namespace MWMechanics
 
 namespace ESM
 {
+    class ESMReader;
     class ReadersCache;
     class Script;
     struct Activator;
@@ -119,6 +121,17 @@ namespace ESM4
 namespace MWWorld
 {
     struct ESMStoreImp;
+
+#ifdef __vita__
+    /// Calls visit(cell index, context index, reader) for every context of
+    /// \a cells in file order, each file read through a 1 MB window; the
+    /// visitor restores the context. Walking cells in store order seeked per
+    /// cell and every seek refilled the reader's 64 KB buffer: the first-boot
+    /// reference count read Tamriel Rebuilt's cells several times over
+    /// (113 s), vanilla's in 30 s against 4 s from RAM.
+    void vitaForEachCellContext(const std::vector<const ESM::Cell*>& cells, ESM::ReadersCache& readers,
+        const std::function<void(std::size_t, std::size_t, ESM::ESMReader&)>& visit);
+#endif
 
     class ESMStore
     {

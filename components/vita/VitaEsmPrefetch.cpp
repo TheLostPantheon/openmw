@@ -40,6 +40,8 @@ namespace Vita::EsmPrefetch
 
         std::vector<std::shared_ptr<Entry>> sEntries;
         std::thread sThread;
+        bool sSkippedAny = false; // a content file is parsed from disk
+        bool sKeepRequested = false;
 
         void crumb(const char* fmt, const char* name, unsigned mb)
         {
@@ -195,6 +197,7 @@ namespace Vita::EsmPrefetch
                 continue;
             if (size > budgetLeft)
             {
+                sSkippedAny = true;
                 crumb("[EsmLoad] %s (%u MB) over the prefetch budget: parsed from disk",
                     path.filename().string().c_str(), static_cast<unsigned>(size >> 20));
                 continue;
@@ -205,7 +208,10 @@ namespace Vita::EsmPrefetch
             entry->mSize = static_cast<size_t>(size);
             entry->mData.reset(new (std::nothrow) char[entry->mSize]);
             if (!entry->mData)
+            {
+                sSkippedAny = true;
                 continue; // fall back to disk for this file
+            }
             sEntries.push_back(std::move(entry));
         }
         if (sEntries.empty())
@@ -228,6 +234,35 @@ namespace Vita::EsmPrefetch
             return std::make_unique<WaitingIMemStream>(entry);
         }
         return nullptr;
+    }
+
+    void setKeepUntilFinish(bool keep)
+    {
+        sKeepRequested = keep;
+    }
+
+    bool keepUntilFinish()
+    {
+        return sKeepRequested && !sSkippedAny && !sEntries.empty();
+    }
+
+    void release(const std::filesystem::path& path)
+    {
+        if (keepUntilFinish())
+            return;
+        for (const auto& entry : sEntries)
+        {
+            // The reader thread is done with an entry once all of it landed
+            // (or the read failed); use_count 1 means no stream reads it.
+            if (entry->mPath != path || !entry->mData || entry.use_count() != 1)
+                continue;
+            if (!entry->mFailed.load(std::memory_order_acquire)
+                && entry->mAvail.load(std::memory_order_acquire) < entry->mSize)
+                continue;
+            entry->mData.reset();
+            crumb("[EsmLoad] released %s (%u MB)", entry->mPath.filename().string().c_str(),
+                static_cast<unsigned>(entry->mSize >> 20));
+        }
     }
 
     void finish()
