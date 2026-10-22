@@ -1450,9 +1450,26 @@ namespace Vita
                 if (home[k] >= 0 && home[j] >= 0 && home[k] != home[j] && needsPlugin(k, j))
                     dataNeeds[home[k]][home[j]] = true;
 
-        const std::vector<size_t> order = dependencyOrder(slots.size(), needsPlugin);
         const std::vector<size_t> dataOrder
             = dependencyOrder(dataSlots.size(), [&](size_t a, size_t b) { return dataNeeds[a][b]; });
+        // Plugins follow their mod's folder, so a mod's files stay together
+        // (TR's .omwscripts, with no masters, otherwise sorted ahead of
+        // Tamriel_Data.esm); then each after the plugins it depends on.
+        std::vector<size_t> dataRank(dataSlots.size());
+        for (size_t k = 0; k < dataOrder.size(); ++k)
+            dataRank[dataOrder[k]] = k;
+        std::vector<size_t> grouped(slots.size());
+        for (size_t k = 0; k < slots.size(); ++k)
+            grouped[k] = k;
+        std::stable_sort(grouped.begin(), grouped.end(), [&](size_t l, size_t r) {
+            const long lr = home[l] < 0 ? -1 : static_cast<long>(dataRank[home[l]]);
+            const long rr = home[r] < 0 ? -1 : static_cast<long>(dataRank[home[r]]);
+            return lr < rr;
+        });
+        std::vector<size_t> order = dependencyOrder(
+            slots.size(), [&](size_t k, size_t j) { return needsPlugin(grouped[k], grouped[j]); });
+        for (size_t& k : order)
+            k = grouped[k];
         int moved = 0;
         for (size_t k = 0; k < order.size(); ++k)
             moved += order[k] != k;
