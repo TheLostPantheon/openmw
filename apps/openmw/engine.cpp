@@ -1580,6 +1580,7 @@ void OMW::Engine::prepareEngine()
         }
         VFS::registerArchives(mVFS.get(), mFileCollections, mArchives, true,
             &mEncoder.get()->getStatelessEncoder(), cacheDir);
+        Vita::logMemoryStatus("Post-VFS-index");
     }
 
     {
