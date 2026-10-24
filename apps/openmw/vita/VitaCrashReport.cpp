@@ -10,10 +10,10 @@
 
 #include <kubridge.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
-#include <psp2/vshbridge.h>
 
 #include "VitaBuildInfo.h"
 #include "VitaGLGuard.h"
@@ -235,23 +235,63 @@ namespace
     }
 }
 
-namespace Vita
+namespace
 {
-    // kubridge is a kernel plugin, linked weak so the app loads without it,
-    // but an unresolved weak import is not a no-op: calling it jumps to
-    // address 0. 2.3 crashed at boot (prefetch abort, PC 0, R12 = the
-    // kuKernelRegisterExceptionHandler stub) on a console without kubridge.
-    bool kubridgeLoaded()
+    // Whether the module loader bound an import stub, as seen on the
+    // console: a kernel plugin's call (kubridge) becomes movw r12, #<syscall>
+    // / svc 0 / bx lr, a user module's movw r12 / movt r12 / bx r12 to its
+    // address. A weak import it could not bind becomes sub r12, pc, #8 /
+    // mov pc, #0, which jumps to address 0 when called. Anything else is
+    // treated as unbound.
+    bool importBound(const uint32_t* w)
     {
-        SceUInt32 search[16] = {};
-        return _vshKernelSearchModuleByName("kubridge", search) >= 0;
+        if ((w[0] & 0xFFF0F000u) != 0xE300C000u) // movw r12, #imm16
+            return false;
+        if (w[1] == 0xEF000000u) // svc 0
+            return true;
+        if ((w[1] & 0xFFF0F000u) != 0xE340C000u) // movt r12, #imm16
+            return false;
+        const uint32_t lo = ((w[0] >> 4) & 0xF000u) | (w[0] & 0x0FFFu);
+        const uint32_t hi = ((w[1] >> 4) & 0xF000u) | (w[1] & 0x0FFFu);
+        return ((hi << 16) | lo) != 0;
     }
 
+    const uint32_t* stubWords(const void* fn)
+    {
+        return reinterpret_cast<const uint32_t*>(reinterpret_cast<uintptr_t>(fn) & ~uintptr_t(1));
+    }
+}
+
+namespace Vita
+{
     void installCrashReporter()
     {
-        if (!kubridgeLoaded())
+        // kubridge is a kernel plugin, linked weak so the app loads without
+        // it, but calling an unbound weak import jumps to address 0: 2.3
+        // crashed at boot without kubridge, and 2.4, which checked that
+        // kubridge was loaded, crashed with a kubridge too old to have the
+        // exception handler API (PC 0 from installCrashReporter). Arm only
+        // when both calls are bound.
+        //
+        // And only on request (crashreport.txt): a kubridge whose exception
+        // API is bound but misbehaves would still take the boot down, and
+        // players' psp2core dumps already give the same backtrace.
+        SceIoStat st;
+        if (sceIoGetstat("ux0:data/openmw/crashreport.txt", &st) < 0)
         {
-            vitaBreadcrumb("[Crash] reporter not armed: kubridge not loaded (psp2core dumps still work)");
+            vitaBreadcrumb("[Crash] reporter off (ux0:data/openmw/crashreport.txt turns it on; needs kubridge)");
+            return;
+        }
+        const uint32_t* registerStub = stubWords(reinterpret_cast<const void*>(&kuKernelRegisterExceptionHandler));
+        const uint32_t* releaseStub = stubWords(reinterpret_cast<const void*>(&kuKernelReleaseExceptionHandler));
+        if (!importBound(registerStub) || !importBound(releaseStub))
+        {
+            char why[192];
+            snprintf(why, sizeof(why),
+                "[Crash] reporter not armed: kubridge missing or without the exception handler API (stub %08x %08x; "
+                "psp2core dumps still work)",
+                (unsigned)registerStub[0], (unsigned)registerStub[1]);
+            vitaBreadcrumb(why);
             return;
         }
         SceUID mod = sceKernelGetModuleIdByAddr(reinterpret_cast<void*>(&installCrashReporter));

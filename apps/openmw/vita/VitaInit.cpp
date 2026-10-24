@@ -204,6 +204,10 @@ namespace
     std::atomic_flag s_logIoLock = ATOMIC_FLAG_INIT;
     std::atomic<bool> s_logThreadStarted{ false };
     char s_logFlushBuf[kLogRingSize];
+    // During Vita::initialize() each crumb is written at once, so a boot
+    // that dies early (users without a dump to send) still shows how far it
+    // got. ~15 crumbs at 13-22 ms each. Starts after boot.log is rotated.
+    std::atomic<bool> s_logSyncBoot{ false };
 
     // Spin briefly, then sleep between tries. A pure spin could starve the
     // lock holder: the flusher runs at priority 191 on any core, and a
@@ -274,6 +278,8 @@ namespace
         else
             ++s_logDropped;
         s_logLock.clear(std::memory_order_release);
+        if (s_logSyncBoot.load(std::memory_order_relaxed))
+            vitaLogFlushNow();
     }
 }
 
@@ -1863,6 +1869,7 @@ namespace Vita
         sceIoRemove("ux0:data/openmw/debug.log.prev");
         sceIoRename("ux0:data/openmw/debug.log", "ux0:data/openmw/debug.log.prev");
 
+        s_logSyncBoot.store(true, std::memory_order_relaxed);
         breadcrumb("BOOT: Vita::initialize() start");
         installCrashReporter();
         pinCurrentThread(0, "main");
@@ -2057,6 +2064,7 @@ namespace Vita
         debugLog(initBuf);
         breadcrumb(initBuf);
         breadcrumb("BOOT: Vita::initialize() done");
+        s_logSyncBoot.store(false, std::memory_order_relaxed);
     }
 
     void breadcrumb(const char* msg)
