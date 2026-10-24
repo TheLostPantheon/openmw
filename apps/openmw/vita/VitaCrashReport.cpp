@@ -271,11 +271,15 @@ namespace Vita
         // crashed at boot without kubridge, and 2.4, which checked that
         // kubridge was loaded, crashed with a kubridge too old to have the
         // exception handler API (PC 0 from installCrashReporter). Arm only
-        // when both calls are bound; nocrashreport.txt turns it off outright.
+        // when both calls are bound.
+        //
+        // And only on request (crashreport.txt): a kubridge whose exception
+        // API is bound but misbehaves would still take the boot down, and
+        // players' psp2core dumps already give the same backtrace.
         SceIoStat st;
-        if (sceIoGetstat("ux0:data/openmw/nocrashreport.txt", &st) >= 0)
+        if (sceIoGetstat("ux0:data/openmw/crashreport.txt", &st) < 0)
         {
-            vitaBreadcrumb("[Crash] reporter off (nocrashreport.txt)");
+            vitaBreadcrumb("[Crash] reporter off (ux0:data/openmw/crashreport.txt turns it on; needs kubridge)");
             return;
         }
         const uint32_t* registerStub = stubWords(reinterpret_cast<const void*>(&kuKernelRegisterExceptionHandler));
