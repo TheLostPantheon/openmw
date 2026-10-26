@@ -444,6 +444,36 @@ int sqlite3_os_end(void) { return 0; }
 
 namespace Vita
 {
+    extern std::atomic<size_t> s_newFailSize;
+    extern std::atomic<uintptr_t> s_newFailCaller;
+}
+
+// libstdc++'s operator new loop, plus the request size and caller for the
+// new-handler's OOM lines.
+void* operator new(std::size_t size)
+{
+    if (size == 0)
+        size = 1;
+    for (;;)
+    {
+        if (void* p = std::malloc(size))
+            return p;
+        Vita::s_newFailSize.store(size);
+        Vita::s_newFailCaller.store(reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+        const std::new_handler handler = std::get_new_handler();
+        if (handler == nullptr)
+            throw std::bad_alloc();
+        handler();
+    }
+}
+
+void* operator new[](std::size_t size)
+{
+    return ::operator new(size);
+}
+
+namespace Vita
+{
     static char s_emergencyBuf[256];
     static size_t s_minHeapFree = SIZE_MAX;
     static SceUID s_debugLogFd = -1;
@@ -539,6 +569,24 @@ namespace Vita
         free(ptr);
     }
 
+    // The C++ allocation the new-handler runs for (see operator new below).
+    std::atomic<size_t> s_newFailSize{ 0 };
+    std::atomic<uintptr_t> s_newFailCaller{ 0 };
+
+    // "need=... caller=... thread=... arena=... top=..." for the OOM lines:
+    // players' OOMs failed with 47-68 MB free, so the request size, who made
+    // it and how fragmented the heap is are what tell causes apart.
+    static void describeFailedNew(char* out, size_t outSize)
+    {
+        struct mallinfo mi = mallinfo();
+        SceKernelThreadInfo ti{};
+        ti.size = sizeof(ti);
+        const bool named = sceKernelGetThreadInfo(sceKernelGetThreadId(), &ti) >= 0;
+        snprintf(out, outSize, "need=%u caller=0x%08x thread=%s arena=%uKB top=%uKB",
+            static_cast<unsigned>(s_newFailSize.load()), static_cast<unsigned>(s_newFailCaller.load()),
+            named ? ti.name : "?", static_cast<unsigned>(mi.arena / 1024), static_cast<unsigned>(mi.keepcost / 1024));
+    }
+
     static void vitaNewHandler()
     {
         // Release emergency reserve to give breathing room for the
@@ -548,9 +596,11 @@ namespace Vita
         {
             releaseEmergencyReserve();
             {
-                char rb[96];
-                snprintf(rb, sizeof(rb), "[OOM_RECOVERY] Released 4MB emergency reserve phase=%s",
-                    vita_main_phase ? vita_main_phase : "?");
+                char what[160];
+                describeFailedNew(what, sizeof(what));
+                char rb[256];
+                snprintf(rb, sizeof(rb), "[OOM_RECOVERY] Released emergency reserve phase=%s %s",
+                    vita_main_phase ? vita_main_phase : "?", what);
                 breadcrumb(rb);
             }
             vitaLogFlushNow();
@@ -558,7 +608,14 @@ namespace Vita
             return;
         }
         // Reserve already spent — unrecoverable
-        logOomAndExit("OOM", 0);
+        {
+            char what[160];
+            describeFailedNew(what, sizeof(what));
+            char rb[192];
+            snprintf(rb, sizeof(rb), "[OOM] %s", what);
+            breadcrumb(rb);
+        }
+        logOomAndExit("OOM", s_newFailSize.load());
     }
 
     void debugLog(const char* msg)

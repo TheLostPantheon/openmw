@@ -1518,12 +1518,19 @@ namespace MWWorld
                 if ((sGovApplied < base || fastTravel) && nowUs - sGovLogUs > 5000000)
                 {
                     sGovLogUs = nowUs;
-                    char gb[112];
+                    char gb[192];
                     char fast[48] = "";
                     if (fastTravel)
                         snprintf(fast, sizeof(fast), ", objects %.1fs (fast travel)", std::min(kFastExpiry, sGovApplied));
-                    snprintf(gb, sizeof(gb), "[MemGov] heap=%dMB expiry=%.1fs (target %.1fs)%s", usedMB, sGovApplied,
-                        target, fast);
+                    // Fragmentation: players' OOMs failed with 47-68 MB free.
+                    // arena = heap handed out so far (max 268 MB), chunks =
+                    // free pieces, top = the free tail it can still grow into.
+                    const struct mallinfo mi = mallinfo();
+                    snprintf(gb, sizeof(gb),
+                        "[MemGov] heap=%dMB expiry=%.1fs (target %.1fs)%s arena=%uMB free=%uMB chunks=%u top=%uKB",
+                        usedMB, sGovApplied, target, fast, static_cast<unsigned>(mi.arena >> 20),
+                        static_cast<unsigned>(mi.fordblks >> 20), static_cast<unsigned>(mi.ordblks),
+                        static_cast<unsigned>(mi.keepcost >> 10));
                     Vita::breadcrumb(gb);
                 }
             }
