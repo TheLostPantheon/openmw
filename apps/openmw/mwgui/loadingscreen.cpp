@@ -316,12 +316,29 @@ namespace MWGui
             std::string mPath;
             osg::ref_ptr<osg::Image> mImage;
         };
+
+        // A new splash costs a 3-4 MB block and ~1.1 s of decoding. With
+        // seamless crossing off every crossing is a loading screen, and a
+        // fresh splash each time (38 in 12 minutes) was the largest source
+        // of big allocations in play: on a heap held near its budget they
+        // fragmented it until a later request failed with 47-68 MB free
+        // (players' OOMs after 12 minutes to 2+ hours). Splashes vary while
+        // the heap has room (menu, early in a session); past this they keep
+        // the one already loaded.
+        constexpr int kVitaSplashRotateMaxHeapMB = 150;
+
+        bool vitaSplashCanRotate()
+        {
+            return Vita::getHeapUsedMB() < kVitaSplashRotateMaxHeapMB;
+        }
     }
 
     void LoadingScreen::vitaPrefetchNextSplash()
     {
         if (mSplashScreens.empty() || mVitaSplashItem)
             return; // already armed
+        if (!mVitaCurSplash.empty() && !vitaSplashCanRotate())
+            return; // the next screen keeps the current splash
         MWBase::World* world = MWBase::Environment::get().getWorld();
         if (!world || !world->getRenderingManager())
             return;
@@ -340,18 +357,22 @@ namespace MWGui
         {
 #ifdef __vita__
             // Use the splash prefetched at the previous loadingOff (its image
-            // is already decoded in the image cache), else roll now.
-            std::string randomSplash = mVitaNextSplash.empty()
-                ? mSplashScreens.at(Misc::Rng::rollDice(mSplashScreens.size()))
-                : mVitaNextSplash;
+            // is already decoded in the image cache), else roll now; keep the
+            // current one when the heap has no room for another.
+            const bool keep = !mVitaCurSplash.empty() && !vitaSplashCanRotate();
+            std::string randomSplash = keep   ? mVitaCurSplash
+                : mVitaNextSplash.empty() ? mSplashScreens.at(Misc::Rng::rollDice(mSplashScreens.size()))
+                                          : mVitaNextSplash;
             mVitaNextSplash.clear();
             // Re-seat the held image so loadFromFile's getImage() hits. If
             // the prefetch is not done (worker busy), do NOT block on it:
             // fall back to the live decode; blocking a saturated worker cost
             // more than the decode.
+            // Keeping the current splash: drop the prefetched one (and its
+            // decoded image) instead.
             if (mVitaSplashItem)
             {
-                if (mVitaSplashItem->isDone())
+                if (!keep && mVitaSplashItem->isDone())
                     if (auto* it = static_cast<VitaSplashPrefetchItem*>(mVitaSplashItem.get()))
                         if (osg::ref_ptr<osg::Image> img = it->takeImage())
                             mResourceSystem->getImageManager()->vitaInsertImage(
