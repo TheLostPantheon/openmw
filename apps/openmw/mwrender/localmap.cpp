@@ -1,5 +1,6 @@
 #include "localmap.hpp"
 
+#include <algorithm>
 #include <cstdint>
 
 #include <osg/ComputeBoundsVisitor>
@@ -27,11 +28,17 @@
 
 #include "../mwbase/environment.hpp"
 #include "../mwbase/windowmanager.hpp"
+#include "../mwbase/world.hpp"
 
 #include "../mwworld/cellstore.hpp"
 
 #include "util.hpp"
 #include "vismask.hpp"
+
+#ifdef __vita__
+#include <cstdio>
+extern "C" void vitaBreadcrumb(const char* msg);
+#endif
 
 namespace
 {
@@ -409,6 +416,56 @@ namespace MWRender
         osg::Quat cameraOrient(mAngle, osg::Vec3d(0, 0, -1));
 
         auto segments = divideIntoSegments(mBounds, mMapWorldSize);
+#ifdef __vita__
+        // Bounds this large come from cell data far from the room itself
+        // (Tel Branora, Upper Tower: 157k units square, 20x20 segments). Each
+        // segment is a render target, all set up at once (vitaGL failed after
+        // 47 and the overflow went to the heap), and the map window builds
+        // widgets for the whole grid (~1,900 here: a ~14 s stall, +20 MB);
+        // the heap ran out minutes later. Keep at most 4x4 segments, the
+        // window holding the player. Whole-segment shifts keep saved fog
+        // textures on their segments.
+        {
+            constexpr int kVitaMaxMapSegments = 4;
+            const int fullX = segments.first;
+            const int fullY = segments.second;
+            if (fullX > kVitaMaxMapSegments || fullY > kVitaMaxMapSegments)
+            {
+                const osg::Vec3f p
+                    = MWBase::Environment::get().getWorld()->getPlayerPtr().getRefData().getPosition().asVec3();
+                float nX = 0.f;
+                float nY = 0.f;
+                int playerX = 0;
+                int playerY = 0;
+                worldToInteriorMapPosition(osg::Vec2f(p.x(), p.y()), nX, nY, playerX, playerY);
+                const auto windowStart = [](int full, int player) {
+                    return std::clamp(player - kVitaMaxMapSegments / 2, 0, full - kVitaMaxMapSegments);
+                };
+                const float span = kVitaMaxMapSegments * mMapWorldSize - 1.f;
+                if (fullX > kVitaMaxMapSegments)
+                {
+                    const int start = windowStart(fullX, playerX);
+                    mBounds.xMin() += start * mMapWorldSize;
+                    mBounds.xMax() = mBounds.xMin() + span;
+                    xOffset -= start;
+                }
+                if (fullY > kVitaMaxMapSegments)
+                {
+                    const int start = windowStart(fullY, playerY);
+                    mBounds.yMin() += start * mMapWorldSize;
+                    mBounds.yMax() = mBounds.yMin() + span;
+                    yOffset -= start;
+                }
+                segments = divideIntoSegments(mBounds, mMapWorldSize);
+            }
+            char lb[192];
+            const std::string_view name = cell->getCell()->getNameId();
+            snprintf(lb, sizeof(lb), "[LocalMap] interior \"%.*s\": %dx%d segments (of %dx%d)",
+                static_cast<int>(name.size()), name.data(), segments.first, segments.second, fullX, fullY);
+            vitaBreadcrumb(lb);
+        }
+        min = osg::Vec2f(mBounds.xMin(), mBounds.yMin()); // the loop starts from the clamped corner
+#endif
         for (int x = 0; x < segments.first; ++x)
         {
             for (int y = 0; y < segments.second; ++y)
