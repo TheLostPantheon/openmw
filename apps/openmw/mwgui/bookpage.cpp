@@ -1216,6 +1216,26 @@ namespace MWGui
         void createActiveFormats(std::shared_ptr<TypesetBookImpl> newBook)
         {
             newBook->visitRuns(0, 0x7FFFFFFF, CreateActiveFormat(this));
+#ifdef __vita__
+            // The counts above cover the whole book, but doRender draws one
+            // page (runs of lines within mViewTop..mViewBottom, always one of
+            // mPages). A 253-page journal reserved 655k vertices: one 15 MB
+            // block per open (two, double-buffered), which a fragmented heap
+            // late in a session could not supply, and opening the journal
+            // crashed. Reserve for the largest page, visited the same way.
+            std::map<MyGUI::IFont*, int> largestPage;
+            for (const TypesetBookImpl::Page& page : newBook->mPages)
+            {
+                std::map<MyGUI::IFont*, int> pageVertices;
+                newBook->visitRuns(page.first, page.second,
+                    [&pageVertices](const TypesetBookImpl::Section&, const TypesetBookImpl::Line&,
+                        const TypesetBookImpl::Run& run) { pageVertices[run.mStyle->mFont] += run.mPrintableChars * 6; });
+                for (const auto& [font, count] : pageVertices)
+                    largestPage[font] = std::max(largestPage[font], count);
+            }
+            for (auto& [font, format] : mActiveTextFormats)
+                format->mCountVertex = largestPage[font];
+#endif
 
             if (mNode != nullptr)
                 for (ActiveTextFormats::iterator i = mActiveTextFormats.begin(); i != mActiveTextFormats.end(); ++i)
