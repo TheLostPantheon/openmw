@@ -66,6 +66,9 @@ namespace Vita
             // replay: "shot=<s>[,<s>...]" screenshots that many seconds after
             // the start is placed, with the touch-zone overlay shown first
             std::vector<float> mShots;
+            // replay: "journal=<s>[,<s>...]" toggles the journal (the Journal
+            // action, SELECT on Vita) that many seconds after the start
+            std::vector<float> mJournal;
             // replay: "race" moves the player on main right after the sim
             // join without waiting for the physics step (the overlap that
             // corrupted Bullet; a lock test)
@@ -101,6 +104,16 @@ namespace Vita
                             c.mSettleSeconds = (float)atof(line + 7);
                         else if (strncmp(line, "fps=", 4) == 0)
                             c.mFps = (float)atof(line + 4);
+                        else if (strncmp(line, "journal=", 8) == 0)
+                        {
+                            for (const char* p = line + 8; *p;)
+                            {
+                                c.mJournal.push_back((float)atof(p));
+                                p += strcspn(p, ",");
+                                if (*p == ',')
+                                    ++p;
+                            }
+                        }
                         else if (strncmp(line, "shot=", 5) == 0)
                         {
                             for (const char* p = line + 5; *p;)
@@ -210,6 +223,7 @@ namespace Vita
             double mSettleUntil = 0; // timing starts once streaming has settled here
             double mPlacedAt = 0;
             size_t mNextShot = 0;
+            size_t mNextJournal = 0;
             std::string mCurrentCell;
             std::vector<float> mFrameMs;
             std::vector<float> mWorkMs; // frame time minus the frame cap's pacing wait
@@ -357,6 +371,13 @@ namespace Vita
                     if (!config().mShots.empty())
                         MWBase::Environment::get().getInputManager()->vitaShowTouchIntro();
                     return;
+                }
+                while (mNextJournal < config().mJournal.size()
+                    && nowSeconds() - mPlacedAt >= config().mJournal[mNextJournal])
+                {
+                    ++mNextJournal;
+                    vitaMemBreadcrumb("[Bench] journal toggle");
+                    MWBase::Environment::get().getInputManager()->executeAction(MWInput::A_Journal);
                 }
                 while (mNextShot < config().mShots.size()
                     && nowSeconds() - mPlacedAt >= config().mShots[mNextShot])

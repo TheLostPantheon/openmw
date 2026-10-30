@@ -186,6 +186,7 @@ def main():
                     "default: the most recent save")
     ap.add_argument("--race", action="store_true",
                     help="move the player without waiting for the physics step (physics lock test)")
+    ap.add_argument("--journal", help="journal toggle times in seconds after the route start is placed, e.g. 20,30")
     ap.add_argument("--shot", help="screenshot times in seconds after the route start is placed, e.g. 2,3.5; "
                     "shows the touch-zone overlay and fetches the images into the run dir")
     args = ap.parse_args()
@@ -197,6 +198,8 @@ def main():
         BENCH_OPTIONS.append(f"fps={args.fps:g}")
     if args.shot:
         BENCH_OPTIONS.append(f"shot={args.shot}")
+    if args.journal:
+        BENCH_OPTIONS.append(f"journal={args.journal}")
     if args.save:
         BENCH_OPTIONS.append(f"save={args.save}")
     if args.race:
